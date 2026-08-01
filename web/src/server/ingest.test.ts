@@ -6,6 +6,7 @@ import { ingestSnapshot } from './ingest.js'
 let hostId: string
 
 const snap = (systems: unknown[]) => ({ collectedAt: '2026-08-01T12:00:00.000Z', systems })
+const snapAt = (collectedAt: string, systems: unknown[]) => ({ collectedAt, systems })
 const sys = (key: string, over: Record<string, unknown> = {}) => ({
   key, displayName: key, health: 'healthy', containers: { total: 1, running: 1 },
   deployedSha: 'a'.repeat(40), deployedSubject: 'feat: x', deployedAt: '2026-08-01T10:00:00.000Z',
@@ -67,5 +68,65 @@ describe('ingestSnapshot', () => {
     await expect(ingestSnapshot(hostId, snap([sys('alpha', { health: 'green' })]))).rejects.toThrow()
     const after = await prisma.host.findUniqueOrThrow({ where: { id: hostId } })
     expect(after.lastSeenAt).toBeNull()
+  })
+
+  // Fix round 1 (clock-skew safety): a compromised OR merely clock-skewed
+  // agent must never be able to make its own data look fresh forever.
+  // `receivedAt` is the server's own clock and is the only timestamp a
+  // staleness calculation may trust; `observedAt` stays as the agent's
+  // unclamped claim, useful only for diagnosing skew, never for freshness.
+  describe('receivedAt (server time, immune to agent clock)', () => {
+    it('is populated on every observation and is close to real server time', async () => {
+      const before = Date.now()
+      await ingestSnapshot(hostId, snap([sys('alpha')]))
+      const after = Date.now()
+      const observation = await prisma.systemObservation.findFirstOrThrow()
+      const receivedAtMs = observation.receivedAt.getTime()
+      // Generous 5s window: this asserts "real server time", not an exact
+      // instant — flakiness from test-runner scheduling would be a false
+      // failure, but a `receivedAt` genuinely computed from the agent's
+      // claimed `collectedAt` (2026-08-01T12:00:00.000Z, far from "now")
+      // would blow well past this window and fail correctly.
+      expect(receivedAtMs).toBeGreaterThanOrEqual(before - 5000)
+      expect(receivedAtMs).toBeLessThanOrEqual(after + 5000)
+    })
+
+    it('accepts a collectedAt one hour in the future, and observedAt/receivedAt genuinely diverge', async () => {
+      const oneHourFuture = new Date(Date.now() + 60 * 60 * 1000).toISOString()
+      const before = Date.now()
+      await expect(ingestSnapshot(hostId, snapAt(oneHourFuture, [sys('alpha')]))).resolves.toEqual({ accepted: 1 })
+      const observation = await prisma.systemObservation.findFirstOrThrow()
+      // observedAt records exactly what the agent claimed, unclamped.
+      expect(observation.observedAt.toISOString()).toBe(oneHourFuture)
+      // receivedAt records real server time, not the claimed future time —
+      // the two diverge by roughly an hour, proving neither one silently
+      // overwrote or clamped the other.
+      const receivedAtMs = observation.receivedAt.getTime()
+      expect(receivedAtMs).toBeGreaterThanOrEqual(before - 5000)
+      expect(receivedAtMs).toBeLessThan(new Date(oneHourFuture).getTime() - 5000)
+    })
+
+    it('accepts a collectedAt far in the past, and observedAt/receivedAt genuinely diverge', async () => {
+      const farPast = '2020-01-01T00:00:00.000Z'
+      const before = Date.now()
+      await expect(ingestSnapshot(hostId, snapAt(farPast, [sys('alpha')]))).resolves.toEqual({ accepted: 1 })
+      const observation = await prisma.systemObservation.findFirstOrThrow()
+      expect(observation.observedAt.toISOString()).toBe(farPast)
+      const receivedAtMs = observation.receivedAt.getTime()
+      expect(receivedAtMs).toBeGreaterThanOrEqual(before - 5000)
+      expect(receivedAtMs).toBeGreaterThan(new Date(farPast).getTime() + 5000)
+    })
+
+    it('cannot be set by the caller: a receivedAt in the incoming payload does not influence what is stored', async () => {
+      const before = Date.now()
+      // This extra key is not part of SystemStateSchema at all; it must be
+      // stripped/ignored, not threaded through to the stored row.
+      await ingestSnapshot(hostId, snap([sys('alpha', { receivedAt: '1999-01-01T00:00:00.000Z' })]))
+      const after = Date.now()
+      const observation = await prisma.systemObservation.findFirstOrThrow()
+      const receivedAtMs = observation.receivedAt.getTime()
+      expect(receivedAtMs).toBeGreaterThanOrEqual(before - 5000)
+      expect(receivedAtMs).toBeLessThanOrEqual(after + 5000)
+    })
   })
 })

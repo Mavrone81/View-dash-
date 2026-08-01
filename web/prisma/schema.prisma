@@ -34,7 +34,17 @@ model SystemObservation {
   id                String    @id @default(uuid())
   systemId          String
   system            System    @relation(fields: [systemId], references: [id], onDelete: Cascade)
+  // Two timestamps exist on purpose, and they measure different things:
+  // `observedAt` is CLAIMED by the reporting agent (from its own clock, at
+  // collection time) — never trust it for staleness, a wrong or malicious
+  // agent clock can make it say anything, including a time in the future.
+  // `receivedAt` is set by the DATABASE's own `now()` and cannot be
+  // influenced by the caller under any circumstances — it is the only
+  // timestamp a staleness calculation (now - receivedAt) may trust. Do not
+  // delete either as "redundant": `observedAt` stays for diagnosing a
+  // skewed host clock; `receivedAt` is the safety-critical one.
   observedAt        DateTime  @default(now())
+  receivedAt        DateTime  @default(now())
   health            String
   containersTotal   Int
   containersRunning Int

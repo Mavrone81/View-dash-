@@ -32,6 +32,15 @@ export async function ingestSnapshot(hostId: string, raw: unknown): Promise<{ ac
         create: { hostId, key: s.key, displayName: s.displayName },
         update: { displayName: s.displayName },
       })
+      // `receivedAt` is deliberately NOT set here. `SystemStateSchema` does
+      // not even have a `receivedAt` field, so nothing in `s` could supply
+      // one, but the guarantee doesn't rest on that alone: this create()
+      // call never references any such value, so there is no code path by
+      // which a caller-controlled time could reach this column even if the
+      // schema changed. Omitting it lets the column's own DB-level
+      // `DEFAULT CURRENT_TIMESTAMP` (see schema.prisma) fill it with the
+      // database's clock — the one clock this system does not let an agent
+      // touch.
       await tx.systemObservation.create({
         data: {
           systemId: system.id,
