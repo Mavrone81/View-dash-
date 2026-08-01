@@ -3,6 +3,12 @@
   "version": "0.0.0",
   "type": "module",
   "dependencies": {
-    "@bevora-ops/shared": "0.0.0"
+    "@bevora-ops/shared": "0.0.0",
+    "dockerode": "5.0.1",
+    "ws": "8.21.1"
+  },
+  "devDependencies": {
+    "@types/dockerode": "4.0.1",
+    "@types/ws": "8.18.1"
   }
 }
