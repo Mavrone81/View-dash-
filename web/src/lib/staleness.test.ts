@@ -28,4 +28,13 @@ describe('displayState', () => {
   it('passes an unrecognised health value through as unknown', () => {
     expect(displayState(ago(1000), 'banana', now)).toBe('unknown')
   })
+
+  it('reports unknown for a receivedAt in the future, never healthy forever', () => {
+    const future = new Date(now.getTime() + 60_000)
+    expect(displayState(future, 'healthy', now)).toBe('unknown')
+  })
+
+  it('treats an observation exactly at the threshold age as fresh, not stale', () => {
+    expect(displayState(ago(90_000), 'healthy', now)).toBe('healthy')
+  })
 })
