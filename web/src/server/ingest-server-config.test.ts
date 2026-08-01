@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest'
 import { loadIngestServerConfig } from './ingest-server-config.js'
 
 describe('loadIngestServerConfig', () => {
-  it('defaults to binding every interface, since this listener is reached from a different machine', () => {
-    expect(loadIngestServerConfig({})).toMatchObject({ host: '0.0.0.0' })
+  it('defaults to loopback: exposure is a deployment decision, made explicitly via INGEST_SERVER_HOST, never a silent default', () => {
+    expect(loadIngestServerConfig({})).toMatchObject({ host: '127.0.0.1' })
   })
 
   it('defaults to a sensible port when none is configured', () => {
