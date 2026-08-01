@@ -53,7 +53,11 @@ model SystemObservation {
   deployedAt        DateTime?
   driftCommits      Int?
 
-  @@index([systemId, observedAt])
+  // Rows are selected as "latest observation per system" ordered by
+  // receivedAt (the trusted, server-set clock), never observedAt (the
+  // untrusted, agent-claimed clock) — see the comment above. The index must
+  // match that access pattern, or every query pays for a sort at read time.
+  @@index([systemId, receivedAt])
 }
 
 model AgentEnrolment {

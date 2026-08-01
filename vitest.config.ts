@@ -12,5 +12,9 @@ export default defineConfig({
     // test. Serializing file execution trades a little wall-clock time for a
     // deterministic suite against real, shared infrastructure.
     fileParallelism: false,
+    // Component tests declare `// @vitest-environment jsdom` at the top of
+    // the file to opt into a DOM; everything else keeps the default 'node'
+    // environment.
+    setupFiles: ['./vitest.setup.ts'],
   },
 })
