@@ -14,7 +14,7 @@
     "leakage": "node scripts/ci/assert-no-environment-leakage.mjs"
   },
   "devDependencies": {
-    "typescript": "^7.0.2",
+    "typescript": "5.9.3",
     "vitest": "^4.1.10"
   }
 }

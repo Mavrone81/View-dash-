@@ -28,9 +28,20 @@ jobs:
       - name: Test
         run: npm run test
 
-      - name: Environment disclosure gate
+      # Secrets are file-mounted, never env vars: this step writes the denylist
+      # secret straight to a file the gate reads, so LEAKAGE_PATTERNS itself
+      # never sits in process env for the app to accidentally log or inherit.
+      # The IPv4/IPv6 rules run regardless of this file's contents.
+      - name: Write leakage denylist to a file
         env:
           LEAKAGE_PATTERNS: ${{ secrets.LEAKAGE_PATTERNS }}
+        run: |
+          umask 077
+          printf '%s' "$LEAKAGE_PATTERNS" > "$RUNNER_TEMP/leakage-patterns.txt"
+
+      - name: Environment disclosure gate
+        env:
+          LEAKAGE_PATTERNS_FILE: ${{ runner.temp }}/leakage-patterns.txt
         run: npm run leakage
 
   secrets:
