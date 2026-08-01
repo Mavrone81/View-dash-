@@ -1,6 +1,5 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { prisma } from '../lib/db.js'
-import { seal } from '../lib/crypto/envelope.js'
 
 const TOKEN_BYTES = 32
 
@@ -8,29 +7,60 @@ const hashToken = (token: string): string => createHash('sha256').update(token, 
 
 /**
  * Mints a new agent token for `hostName` (creating the host if it does not
- * already exist) and persists only a hash of it plus an encrypted,
- * row-bound copy — never the raw token itself.
+ * already exist), returns the raw token to the caller EXACTLY ONCE, and
+ * persists only its hash. Nothing recoverable is ever written to disk:
+ * this is a show-once credential by design (human ruling, superseding an
+ * earlier spec that kept an encrypted, re-displayable copy) — the DEK that
+ * would decrypt such a copy lives in the same process as the database
+ * connection, so a single app-server compromise would otherwise yield both
+ * the database AND a live, replayable write credential into a control
+ * plane covering multiple businesses' production systems. Re-enrolling a
+ * host (one command, plus an agent restart) is strictly better than
+ * recovery: it also rotates the credential, which recovery cannot.
+ *
+ * Any of the host's existing, still-active enrolments are revoked in the
+ * SAME transaction as the new one is created — re-enrolling is how an
+ * operator rotates a credential, and a half-applied rotation (only the
+ * revoke commits, or only the create) would leave either two live tokens
+ * for one host or zero, neither of which is safe to leave partially done.
  */
-export async function enrolAgent(hostName: string, dek: Buffer): Promise<{ token: string; hostId: string }> {
+export async function enrolAgent(hostName: string): Promise<{ token: string; hostId: string }> {
   const token = randomBytes(TOKEN_BYTES).toString('base64url')
   const host = await prisma.host.upsert({
     where: { name: hostName },
     create: { name: hostName },
     update: {},
   })
-  // The id is generated here, client-side, rather than left to the
-  // database's default(uuid()) — so the row can be written in ONE create
-  // instead of a create-then-update. secretSealed's AAD binds to this same
-  // id, so the id has to exist before the seal call regardless; generating
-  // it ourselves is what lets both writes collapse into one. (A prior
-  // version created the row with a 'pending' sentinel and updated it
-  // after: a crash between the two writes left a row that authenticated
-  // successfully but whose sealed copy was the literal string 'pending'.)
-  const id = randomUUID()
-  await prisma.agentEnrolment.create({
-    data: { id, hostId: host.id, tokenHash: hashToken(token), secretSealed: seal(token, `agent_enrolment:${id}:secret`, dek) },
-  })
+  await prisma.$transaction([
+    prisma.agentEnrolment.updateMany({
+      where: { hostId: host.id, revokedAt: null },
+      data: { revokedAt: new Date() },
+    }),
+    prisma.agentEnrolment.create({
+      data: { hostId: host.id, tokenHash: hashToken(token) },
+    }),
+  ])
   return { token, hostId: host.id }
+}
+
+/**
+ * Revokes every currently-active enrolment for `hostName`. Idempotent:
+ * revoking an already-revoked host, or a host name that was never
+ * enrolled, is a no-op rather than an error — an operator re-running a
+ * revoke command (e.g. because the first attempt's response was lost)
+ * must not get a failure for something that already happened.
+ *
+ * Scoped to this one host's enrolments via `hostId` — it must never
+ * become a global kill switch that blocks every other host's live token
+ * as a side effect of revoking one.
+ */
+export async function revokeAgent(hostName: string): Promise<void> {
+  const host = await prisma.host.findUnique({ where: { name: hostName } })
+  if (!host) return
+  await prisma.agentEnrolment.updateMany({
+    where: { hostId: host.id, revokedAt: null },
+    data: { revokedAt: new Date() },
+  })
 }
 
 /**
@@ -38,19 +68,22 @@ export async function enrolAgent(hostName: string, dek: Buffer): Promise<{ token
  * the token is not a non-empty string, was never issued, or belongs to a
  * revoked enrolment.
  *
- * Does not throw for malformed input: `token` is typed `unknown` rather
- * than `string` on purpose, because the real caller (Task 10's ingest
- * endpoint) reads this from an HTTP header, which Node types as
- * `string | string[] | undefined` and which nothing stops from being
- * anything else once it has crossed the wire — a duplicated header, a
- * missing one, a client that sends JSON instead. TypeScript's protection
- * stops at this repo's boundary; a runtime check is what actually holds at
- * the network boundary. Getting this wrong would surface as a 500 for
- * certain malformed inputs only, which is exactly the kind of probe oracle
- * an attacker uses to map a system, so the failure mode for "not a string"
- * must be the same `null` as "not a match" — not an exception.
- * (It can still throw for reasons unrelated to the input's shape — e.g. if
- * the database itself is unreachable, Prisma throws and that propagates.)
+ * `token` is typed `unknown`, not `string`, and kept that way deliberately
+ * (not narrowed back after review): this value arrives from an HTTP
+ * header, and TypeScript's compile-time guarantee does not survive the
+ * network — a caller that relied on `string` here would be trusting a type
+ * annotation for data it never actually checked. Widening the parameter
+ * type makes that boundary explicit instead of implicit.
+ *
+ * Does not throw for malformed input: hashing accepts any string, and the
+ * only value passed to Prisma is the fixed-length (64 hex char) hash,
+ * never the raw token, so an oversized, wrongly-typed, or oddly-shaped
+ * input cannot blow up the query. (It can still throw for reasons
+ * unrelated to the input's shape — e.g. if the database itself is
+ * unreachable, Prisma throws and that propagates.) A thrown 500 that only
+ * happens for certain malformed shapes would be a probe oracle an attacker
+ * could use to map the system, so the failure mode for "not a string" must
+ * be the same `null` as "not a match."
  *
  * No secret-vs-secret comparison happens here (and so no `===`-timing
  * concern applies): identity is established purely by an indexed database

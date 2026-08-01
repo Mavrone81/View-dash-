@@ -47,11 +47,10 @@ model SystemObservation {
 }
 
 model AgentEnrolment {
-  id           String    @id @default(uuid())
-  hostId       String
-  host         Host      @relation(fields: [hostId], references: [id], onDelete: Cascade)
-  tokenHash    String    @unique
-  secretSealed String
-  createdAt    DateTime  @default(now())
-  revokedAt    DateTime?
+  id        String    @id @default(uuid())
+  hostId    String
+  host      Host      @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  createdAt DateTime  @default(now())
+  revokedAt DateTime?
 }

@@ -1,9 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { randomBytes } from 'node:crypto'
 import { prisma } from '../lib/db.js'
-import { enrolAgent, authenticateAgent } from './auth-agent.js'
-
-const dek = randomBytes(32)
+import { enrolAgent, authenticateAgent, revokeAgent } from './auth-agent.js'
 
 beforeEach(async () => {
   await prisma.agentEnrolment.deleteMany()
@@ -13,23 +10,23 @@ beforeEach(async () => {
 
 describe('agent auth', () => {
   it('accepts the token it issued', async () => {
-    const { token, hostId } = await enrolAgent('host-a', dek)
+    const { token, hostId } = await enrolAgent('host-a')
     expect(await authenticateAgent(token)).toEqual({ hostId })
   })
 
   it('rejects a token it never issued', async () => {
-    await enrolAgent('host-b', dek)
+    await enrolAgent('host-b')
     expect(await authenticateAgent('not-a-real-token')).toBeNull()
   })
 
   it('rejects a revoked token', async () => {
-    const { token } = await enrolAgent('host-c', dek)
-    await prisma.agentEnrolment.updateMany({ data: { revokedAt: new Date() } })
+    const { token } = await enrolAgent('host-c')
+    await revokeAgent('host-c')
     expect(await authenticateAgent(token)).toBeNull()
   })
 
   it('never stores the token in plaintext', async () => {
-    const { token } = await enrolAgent('host-d', dek)
+    const { token } = await enrolAgent('host-d')
     const rows = await prisma.agentEnrolment.findMany()
     const dump = JSON.stringify(rows)
     expect(dump).not.toContain(token)
@@ -65,7 +62,7 @@ describe('agent auth', () => {
   })
 
   it('rejects a single-bit-flipped copy of a real, issued token', async () => {
-    const { token } = await enrolAgent('host-e', dek)
+    const { token } = await enrolAgent('host-e')
     // Non-null: token[0] always exists (it is a freshly generated,
     // non-empty base64url string), only its type is widened by
     // noUncheckedIndexedAccess.
@@ -74,15 +71,32 @@ describe('agent auth', () => {
     expect(await authenticateAgent(flipped)).toBeNull()
   })
 
-  it('revoking one enrolment does not invalidate a different, still-active one', async () => {
-    const first = await enrolAgent('host-f', dek)
-    const second = await enrolAgent('host-g', dek)
-    await prisma.agentEnrolment.updateMany({
-      where: { hostId: first.hostId },
-      data: { revokedAt: new Date() },
-    })
+  it("revoking one host's enrolment does not affect another host's", async () => {
+    const first = await enrolAgent('host-f')
+    const second = await enrolAgent('host-g')
+    await revokeAgent('host-f')
     expect(await authenticateAgent(first.token)).toBeNull()
     expect(await authenticateAgent(second.token)).toEqual({ hostId: second.hostId })
+  })
+
+  it('after re-enrolling a host, the old token no longer authenticates and the new one does', async () => {
+    const first = await enrolAgent('host-h')
+    const second = await enrolAgent('host-h')
+    // Re-enrolling the same host name reuses the host, not a new one.
+    expect(second.hostId).toBe(first.hostId)
+    expect(await authenticateAgent(first.token)).toBeNull()
+    expect(await authenticateAgent(second.token)).toEqual({ hostId: second.hostId })
+  })
+
+  it('revokeAgent is idempotent: revoking twice does not throw and stays revoked', async () => {
+    const { token } = await enrolAgent('host-i')
+    await revokeAgent('host-i')
+    await expect(revokeAgent('host-i')).resolves.toBeUndefined()
+    expect(await authenticateAgent(token)).toBeNull()
+  })
+
+  it('revoking a host that was never enrolled does not throw', async () => {
+    await expect(revokeAgent('host-never-enrolled')).resolves.toBeUndefined()
   })
 
   // The `\0`s here are deliberate, not incidental: Postgres text columns
