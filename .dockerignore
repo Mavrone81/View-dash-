@@ -1,0 +1,20 @@
+# Keeps the build context small AND stops anything that must never reach
+# the image (real secrets, local dev env values, git history) from ever
+# being COPYable in the first place -- deploy/Dockerfile's build stage
+# also explicitly deletes any web/.env* it finds after `COPY . .`, as a
+# second, independent guard against the same mistake (see that file's
+# comment on why: Next's standalone output copies `.env*` files verbatim).
+.git
+.superpowers
+node_modules
+**/node_modules
+dist
+**/dist
+.next
+**/.next
+coverage
+**/coverage
+secrets
+.env
+.env.*
+*.tsbuildinfo

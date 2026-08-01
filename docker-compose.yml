@@ -5,14 +5,14 @@
 # reports INTO `ingest` runs on each MONITORED host instead, as a systemd
 # unit -- see deploy/agent.service.
 #
-# `web` and `ingest` run the SAME image (built from this monorepo) and
-# differ only in which command each runs: `web` uses the image's own
-# default CMD (its production Next.js start command, unset here); `ingest`
-# overrides `command:` to run the bundled standalone WebSocket listener
-# instead (`npm run build:ingest` -> web/dist/ingest-server.mjs -- see
-# scripts/build/bundle-ingest.mjs for why that needs its own build step,
-# and web/src/server/ingest-server.ts for why it cannot be a Next.js
-# route).
+# `web` and `ingest` run the SAME image (built from deploy/Dockerfile) and
+# differ only in `command:`: `web` runs the image's production Next.js
+# server (`node web/server.js`, spelled out explicitly below -- see that
+# service's own comment for why); `ingest` runs the bundled standalone
+# WebSocket listener instead (`npm run build:ingest` ->
+# web/dist/ingest-server.mjs -- see scripts/build/bundle-ingest.mjs for
+# why that needs its own build step, and web/src/server/ingest-server.ts
+# for why it cannot be a Next.js route).
 #
 # Set GHCR_OWNER and (optionally) TAG in the shell environment, or in a
 # `.env.deploy` file sourced before `docker compose up`, to select the
@@ -66,10 +66,20 @@ services:
     # `with-database-url.sh` constructs it at container start from the
     # `postgres_password` secret file's contents and execs the real
     # command as a child that inherits it. See that script for the full
-    # mechanism. Overriding `entrypoint:` (not `command:`) and leaving
-    # `command:` unset means this service still runs the image's own
-    # default CMD -- only the entrypoint gains a setup step.
+    # mechanism.
+    #
+    # `command:` is spelled out explicitly (matching deploy/Dockerfile's
+    # own CMD) even though it duplicates the image's default -- overriding
+    # `entrypoint:` WITHOUT also setting `command:` does not fall back to
+    # the image's CMD the way it might look like it should: Docker clears
+    # CMD to empty whenever entrypoint is overridden and no command is
+    # given, so `with-database-url.sh`'s `exec "$@"` would run with no
+    # arguments at all. Confirmed the hard way: an earlier version of this
+    # file left `command:` unset here, and the container exited 0 with no
+    # output the instant `exec "$@"` no-op'd on an empty argument list --
+    # `restart: unless-stopped` then looped it forever, silently.
     entrypoint: ["/bin/sh", "/deploy/with-database-url.sh"]
+    command: ["node", "web/server.js"]
     # Loopback ONLY, for the whole of slice 1: authentication does not ship
     # until slice 3 (see this slice's self-review), so this UI must never
     # be reachable from the internet -- only from an operator's own
@@ -97,30 +107,24 @@ services:
     # web/src/server/ingest-server-config.ts defaults INGEST_SERVER_HOST to
     # 127.0.0.1 DELIBERATELY, so that binding every interface is always a
     # decision made HERE, in a reviewable deployment file, never a silent
-    # code default (see that file's own comment). This deployment's
-    # DEFAULT topology keeps that default unchanged: `ingest` publishes to
-    # loopback only, exactly like `web`, and this host's OWN reverse proxy
-    # -- running directly on the host, not as a sibling container; see
-    # deploy/nginx-ingest.conf -- reaches it at 127.0.0.1:4100, which a
-    # loopback-published Docker port makes reachable from any process in
-    # the host's own network namespace.
-    #
-    # If your topology instead runs the reverse proxy as a SIBLING
-    # CONTAINER on a shared Docker network (no host networking for the
-    # proxy), loopback inside `ingest`'s own network namespace is
-    # genuinely unreachable from that proxy container. In that case, make
-    # BOTH of these changes together, not just one:
-    #   1. Uncomment the two lines below to bind every interface WITHIN
-    #      this container. This is still not published to the host or the
-    #      internet unless a `ports:` entry says so -- it only changes
-    #      what other CONTAINERS on a shared network can reach.
-    #   2. Remove (or comment out) the `ports:` entry below and instead put
-    #      this service and the proxy container on a shared network, so
-    #      the proxy reaches it by compose DNS name (`ingest:4100`) rather
-    #      than through a published host port.
-    #
-    # environment:
-    #   INGEST_SERVER_HOST: "0.0.0.0"  # scoped to the shared compose network only; see comment above
+    # code default (see that file's own comment). This is that decision,
+    # and it is NOT optional the way an earlier version of this file
+    # framed it ("only needed for a sibling-container proxy topology"):
+    # confirmed the hard way, by actually publishing this port and curling
+    # it. Docker's `ports:` publishing always forwards to the CONTAINER'S
+    # OWN routable (bridge-network) address, never to its loopback --
+    # `docker exec`ing in and hitting 127.0.0.1:4100 worked fine while the
+    # HOST-published port below got "empty reply from server" the entire
+    # time this was left at the code default. So `0.0.0.0` here is
+    # required for this listener to be reachable through ANY Docker
+    # networking path at all -- host-published port (this file's
+    # topology) or a sibling container on a shared network alike -- not
+    # just the sibling-container case. This is still not the same as being
+    # reachable from the internet: that is controlled entirely by the
+    # `ports:` line below (loopback-only) and by there being no other
+    # network attached to this service that a public-facing proxy sits on.
+    environment:
+      INGEST_SERVER_HOST: "0.0.0.0"
     ports:
       - "127.0.0.1:4100:4100"
 

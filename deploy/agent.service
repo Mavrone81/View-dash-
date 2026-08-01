@@ -18,15 +18,66 @@ ExecStart=/usr/bin/node /opt/bevora-agent/agent-bundle.cjs
 Restart=always
 RestartSec=5
 
+# --- Identity ----------------------------------------------------------
+# ROOT is this unit's default AS SHIPPED -- it requires no setup beyond
+# installing this file, and it is an explicit choice, not a silent
+# default: see deploy/README.md's note on this trade-off before enabling
+# the unit. The commented-out alternative below is equally valid and adds
+# real defense-in-depth; uncomment it (and create the account first) if
+# you want it instead.
+#
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin bevora-agent
+#
+# User=bevora-agent
+# Group=bevora-agent
+# SupplementaryGroups=docker
+#
+# BE HONEST ABOUT WHAT THIS DOES AND DOES NOT BUY YOU: the Docker socket
+# grants root-equivalent access to whoever can reach it, full stop -- a
+# member of the `docker` group can run a container with `-v /:/host` and
+# read or write anything on this machine as root, exactly as if they were
+# root already. Running as a `docker`-group user INSTEAD of literally
+# `root` does not contain a compromised agent process from that one
+# avenue -- it narrows what OTHER, UNRELATED bugs in this process (now or
+# in some future change to it) could reach, e.g. it could not read some
+# other service's root-owned secrets file that this one has no business
+# touching, where literal root could. That is real, worthwhile
+# defense-in-depth against unrelated bugs. It is not a way to sandbox the
+# one thing this daemon actually needs.
+
 # --- Hardening -----------------------------------------------------------
 # This daemon reaches the Docker socket, which is root-equivalent access by
-# design (anyone who can talk to it can run an arbitrary container with an
-# arbitrary bind-mount, including the host root filesystem) -- see
-# deploy/README.md for that trade-off and the choice of which user runs
-# this unit. Because that one avenue cannot be sandboxed away, everything
-# ELSE is locked down tightly instead: if this process is ever compromised
-# through some other path (a malformed deploy log, a bad glob match), it
-# should not gain any capability the agent's own code does not already use.
+# design (see the Identity note above) -- because that one avenue cannot be
+# sandboxed away, everything ELSE is locked down tightly instead: if this
+# process is ever compromised through some other path (a malformed deploy
+# log, a bad glob match), it should not gain any capability the agent's own
+# code does not already use.
+#
+# HONESTY CHECK, per this repo's own review process: everything below was
+# reasoned through against agent/src/*.ts's actual behavior (it only ever
+# READS -- Docker's API, deploy-log files, repo checkouts -- and never
+# writes to the filesystem; see agent/src/main.ts, collect.ts, docker.ts,
+# deploy-log.ts, git.ts) and against systemd.exec(5)'s documented
+# semantics, NOT measured on a real systemd host -- none was available in
+# this development environment (macOS has no systemd; `systemd-analyze
+# verify` could not be run). On that reasoning: `ProtectSystem=strict`
+# makes the filesystem READ-ONLY, not inaccessible, so an agent that never
+# writes anywhere should be unaffected by it, and connecting to an
+# existing Unix socket (the Docker socket) does not require its mount to
+# be writable. But "should be unaffected" is a claim, not a measurement.
+# deploy/README.md's enrolment step now says explicitly: smoke-test this
+# unit for real on the actual monitored host before trusting it -- a
+# service that looks hardened but silently can't reach Docker or its
+# configured paths tends to get "fixed" by someone deleting the hardening
+# wholesale, which is worse than never having shipped it.
+#
+# If your AGENT_REPO_ROOT or AGENT_DEPLOY_LOG_GLOB (see agent.env) live
+# somewhere ProtectHome=read-only does not cover -- not under /home,
+# /root, or /run/user -- and the smoke test above shows a permission
+# error reading them, add that one path here rather than loosening
+# ProtectSystem/ProtectHome wholesale:
+#
+# ReadOnlyPaths=/srv/bevora-monitored-repos
 NoNewPrivileges=true
 ProtectSystem=strict
 # `read-only`, not `true`: AGENT_REPO_ROOT and AGENT_DEPLOY_LOG_GLOB (set in

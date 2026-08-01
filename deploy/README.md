@@ -20,22 +20,41 @@ type into a runbook, ticket, or chat while following these steps.)
 ## 1. Prerequisites on the dashboard host
 
 - Docker and the Docker Compose plugin installed.
-- A container image for this app published somewhere `docker compose` can
-  pull it from, referenced by `docker-compose.yml` as
-  `ghcr.io/${GHCR_OWNER}/bevora-ops:${TAG:-latest}`. **Building and
-  publishing that image is not part of this task** -- there is no
-  `Dockerfile` in this repo yet. Before the first real deploy, someone
-  needs to: write one that builds this monorepo's `web` workspace
-  (producing whatever `next start` needs) AND runs
-  `npm run build:ingest` / `npm run build:enrol` as part of the image
-  build, so `web/dist/ingest-server.mjs` and `web/dist/enrol-cli.mjs`
-  exist inside it; then decide where it gets published, and set
-  `GHCR_OWNER` (and optionally `TAG`) accordingly. Until then, treat
-  `docker-compose.yml`'s `web`/`ingest` service definitions as reviewed
-  and ready, not yet runnable.
+- A container image for this app, published to GHCR. `.github/workflows/ci.yml`'s
+  `publish` job builds `deploy/Dockerfile` and pushes it automatically on
+  every push to `main`, tagged with the commit sha (and `latest`) --
+  `docker-compose.yml`'s `image: ghcr.io/${GHCR_OWNER}/bevora-ops:${TAG:-latest}`
+  is exactly that tag. Set `GHCR_OWNER` to this repository's (lowercased)
+  `owner/repo` path and, if you want a specific commit rather than
+  whatever `main` last published, `TAG` to that commit's sha. You can also
+  build it yourself, from the repo root, without pushing anywhere:
+  `docker build -f deploy/Dockerfile -t <local-tag> .` -- useful for
+  testing a change to the Dockerfile itself before it reaches CI.
 - This host's own reverse proxy (nginx or equivalent) already installed
   and serving other TLS vhosts, so `deploy/nginx-ingest.conf` can be added
   as one more site.
+
+Everything from `docker build` through a live fleet board was run
+end-to-end, locally, before this file was written: the image builds,
+migrations apply, `web` renders real data, and `ingest` answers on its
+published port. Two things about `deploy/Dockerfile` and
+`docker-compose.yml` are NOT obvious from reading the source and are
+worth knowing before you touch either file:
+
+- `next build`'s default bundler (Turbopack, in this Next version) cannot
+  resolve this codebase's NodeNext-style relative imports (`from
+  './foo.js'` pointing at a sibling `foo.ts`) -- confirmed by actually
+  running it. `deploy/Dockerfile` builds with `--webpack` instead, which
+  can, via `web/next.config.ts`'s `resolve.extensionAlias` hook. Don't
+  drop `--webpack` from that build step without re-verifying this.
+- Overriding a Compose service's `entrypoint:` WITHOUT also giving it a
+  `command:` does not fall back to the image's own default CMD the way it
+  looks like it should -- Docker clears the effective command to empty in
+  that case. `docker-compose.yml`'s `web` and `ingest` services both set
+  `command:` explicitly for exactly this reason (see that file's comment
+  on the `web` service, which documents the exact failure this caused --
+  a silent restart loop, exit code 0, no log output -- before it was
+  fixed).
 
 ## 2. Generate secrets (dashboard host)
 
@@ -58,10 +77,35 @@ script's own comment for the full mechanism if you need to change it.
 read it in a later slice) -- it is generated now so the file-mounted
 convention is already in place when that lands.
 
-## 3. Bring up the dashboard stack
+## 3. Bring up Postgres, then apply migrations, then bring up the rest
 
 ```bash
-GHCR_OWNER=<your-org> TAG=<image-tag> docker compose up -d
+export GHCR_OWNER=<your-org> TAG=<image-tag>
+docker compose up -d db
+```
+
+Wait for it to report healthy (`docker compose ps db`), then run
+migrations as their own, separate, one-off command -- **never** as part of
+`web` or `ingest`'s startup:
+
+```bash
+docker compose run --rm web /deploy/with-database-url.sh \
+  npx prisma migrate deploy --schema web/prisma/schema.prisma
+```
+
+This has to be a separate step rather than something in
+`deploy/with-database-url.sh` itself: that script is the shared
+`entrypoint:` for BOTH `web` and `ingest`, which start at the same time --
+if it ran `prisma migrate deploy` on every container start, both
+services' containers would race to apply the same migration
+simultaneously, with no lock coordination between them. Running it once,
+by hand (or from a deploy pipeline step that runs before `docker compose
+up`), avoids that entirely.
+
+Now bring up the rest:
+
+```bash
+docker compose up -d
 ```
 
 `web` and `ingest` will not start (and `depends_on: db: condition:
@@ -192,13 +236,39 @@ systemctl status bevora-agent
 Docker socket to discover this host's systems, and that access is
 root-equivalent by design (Docker's own, well-known caveat: anyone who can
 talk to the socket can run a container with an arbitrary bind mount,
-including the host root filesystem). Running the unit as `root`, or as a
-dedicated user added to the `docker` group, are both common choices and
-neither one avoids this trade-off -- `deploy/agent.service`'s hardening
-directives lock down everything else (filesystem, capabilities, kernel
-access, namespaces) precisely because this one avenue cannot be sandboxed
-away. This is a decision for whoever owns the monitored host, not
-something this file should make silently.
+including the host root filesystem). `deploy/agent.service` ships with
+`root` as its default (no `User=`/`Group=` set) because that requires no
+extra setup -- but the file also contains a commented-out, ready-to-use
+alternative (`User=bevora-agent` / `Group=bevora-agent` /
+`SupplementaryGroups=docker`, plus the one `useradd` command it needs
+first) if you'd rather run it as a dedicated non-root user in the `docker`
+group. Read that file's own "Identity" comment before choosing -- it is
+honest that this choice buys defense-in-depth against unrelated bugs in
+this process, not containment of the Docker-socket access itself, which
+is root-equivalent either way.
+
+**Smoke-test the hardening block for real before trusting it.** The
+directives in `deploy/agent.service` (`ProtectSystem=strict`,
+`ProtectHome=read-only`, the capability/namespace/syscall restrictions)
+were reasoned through against this agent's actual code and against
+`systemd.exec(5)`'s documented behavior, but could not be measured on a
+real systemd host while writing this file (no systemd on the development
+machine used). That file's own comment says so. So, the first time you
+enable this unit on any given host:
+
+```bash
+sudo systemctl start bevora-agent
+systemctl status bevora-agent          # should be "active (running)", not failing/restarting
+sudo journalctl -u bevora-agent -n 50  # look for permission-denied errors reading
+                                        # AGENT_REPO_ROOT, AGENT_DEPLOY_LOG_GLOB, or the
+                                        # Docker socket -- ProtectSystem=strict is the
+                                        # first thing to suspect if you see one
+```
+
+If something the agent legitimately needs to read is denied, add exactly
+that one path via `ReadOnlyPaths=` in the unit (an example is commented
+in the file) rather than loosening `ProtectSystem`/`ProtectHome`
+wholesale or deleting the hardening block outright.
 
 Confirm it:
 
@@ -207,7 +277,10 @@ bash deploy/verify.sh   # the "agent unit is active" line, run on this host
 ```
 
 Then, on the dashboard host, open the tunnel from step 4 and confirm this
-host's row appears on the fleet board.
+host's row appears on the fleet board -- a real row with real data is
+also, in effect, the rest of the smoke test: it means the agent could
+reach Docker, read this host's deploy logs and git checkouts, AND dial
+out to the dashboard, all under the hardening block above.
 
 ## 10. Prove the staleness rule (recommended before calling a host "live")
 
