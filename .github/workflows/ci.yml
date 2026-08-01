@@ -146,11 +146,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # GHCR image paths must be lowercase; github.repository (owner/repo)
-      # is not guaranteed to be.
-      - name: Compute lowercase image name
+      # GHCR image paths must be lowercase, and a path component may NOT end
+      # in a separator. Deriving the name from `github.repository` produced an
+      # invalid reference here, because this repository's name ends in a
+      # hyphen — the very first publish failed on exactly that.
+      #
+      # The image name is therefore FIXED to `bevora-ops`, which is also what
+      # docker-compose.yml pulls. Deriving it from the repository name would
+      # publish an image that nothing deploys: compose and CI were each
+      # choosing a name independently, and they did not agree.
+      - name: Compute image name
         id: image
-        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+        run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/bevora-ops" >> "$GITHUB_OUTPUT"
 
       - name: Build (and push only on the default branch)
         uses: docker/build-push-action@v6
