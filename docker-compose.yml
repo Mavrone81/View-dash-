@@ -136,8 +136,26 @@ services:
     # network attached to this service that a public-facing proxy sits on.
     environment:
       INGEST_SERVER_HOST: "0.0.0.0"
+    # WHICH HOST INTERFACE this port is published on is a deployment
+    # decision, so it comes from the environment rather than a literal.
+    #
+    # The default is loopback, which is the safe answer and the right one
+    # when nothing else needs to reach the listener.
+    #
+    # When the monitored host and the dashboard sit on the same private
+    # network -- the same cloud VPC, say -- set INGEST_BIND_ADDR to this
+    # host's PRIVATE address. The agent then reaches the dashboard without
+    # the connection ever leaving that network, which means no public
+    # listener, no reverse proxy, no certificate, and nothing on the
+    # internet to attack. That is strictly better than exposing an
+    # authenticated endpoint publicly, so prefer it whenever the topology
+    # allows.
+    #
+    # Do NOT set this to 0.0.0.0. That publishes on every interface
+    # including the public one, and the only thing standing between the
+    # internet and this listener would be a cloud firewall rule.
     ports:
-      - "127.0.0.1:4100:4100"
+      - "${INGEST_BIND_ADDR:-127.0.0.1}:4100:4100"
 
 secrets:
   # Both files are created by the operator before `docker compose up` --
