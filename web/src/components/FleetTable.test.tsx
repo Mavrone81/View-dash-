@@ -38,4 +38,22 @@ describe('FleetTable', () => {
     render(<FleetTable rows={[]} />)
     expect(screen.getByText(/no systems reported/i)).toBeTruthy()
   })
+
+  it('shows an em dash for container counts on a system that has never reported', () => {
+    render(<FleetTable rows={[row({ containersRunning: null, containersTotal: null })]} />)
+    // Singular getByText: every other field in this fixture is non-null, so
+    // this dash can only be coming from the Containers column — if the
+    // fabricated-`0/0` bug were present, this dash would not exist at all.
+    expect(screen.getByText('—')).toBeTruthy()
+    expect(screen.queryByText('0/0')).toBeNull()
+  })
+
+  it('renders 0/0 for a system that genuinely reports zero containers, distinct from never having reported', () => {
+    render(<FleetTable rows={[row({ containersRunning: 0, containersTotal: 0 })]} />)
+    expect(screen.getByText('0/0')).toBeTruthy()
+    // Every other field in this fixture is non-null, so a dash appearing
+    // here would mean the zero-container case is being confused with the
+    // never-reported case rather than kept distinct from it.
+    expect(screen.queryByText('—')).toBeNull()
+  })
 })

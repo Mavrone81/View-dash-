@@ -4,8 +4,16 @@ export type FleetRow = {
   key: string
   displayName: string
   state: DisplayState
-  containersRunning: number
-  containersTotal: number
+  // Nullable, like every other "we may not know this" field on this row: a
+  // system that has never reported must render the same em dash as an
+  // unknown sha or unknown drift, NOT `0/0`. `0/0` is a real, checked fact
+  // about a system that IS reporting and genuinely runs zero containers —
+  // collapsing "never heard from" into that same text would let a system
+  // that has been silent since it was enrolled look identical to one that
+  // is live and simply empty, on the one page whose job is telling an
+  // operator which of those is true.
+  containersRunning: number | null
+  containersTotal: number | null
   deployedSha: string | null
   deployedSubject: string | null
   deployedAt: Date | null
@@ -35,7 +43,7 @@ export function FleetTable({ rows }: { rows: FleetRow[] }) {
           <tr key={r.key} data-state={r.state}>
             <td>{r.displayName}</td>
             <td>{r.state}</td>
-            <td>{r.containersRunning}/{r.containersTotal}</td>
+            <td>{r.containersRunning === null || r.containersTotal === null ? DASH : `${r.containersRunning}/${r.containersTotal}`}</td>
             <td>{r.deployedSha ? r.deployedSha.slice(0, 7) : DASH}</td>
             <td>{r.deployedAt ? r.deployedAt.toISOString() : DASH}</td>
             <td>{r.deployedSubject ?? DASH}</td>
