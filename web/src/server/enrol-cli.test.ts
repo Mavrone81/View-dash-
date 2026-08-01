@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { prisma } from '../lib/db.js'
 import { authenticateAgent } from './auth-agent.js'
-import { main } from './enrol-cli.js'
+import { main, USAGE } from './enrol-cli.js'
 
 beforeEach(async () => {
   await prisma.agentEnrolment.deleteMany()
@@ -23,7 +23,7 @@ describe('enrol-cli main()', () => {
     const out = fakeOut()
     const code = await main(['node', 'enrol-cli.mjs'], out)
     expect(code).toBe(1)
-    expect(out.error).toHaveBeenCalledWith('usage: node enrol-cli.mjs <host-name>')
+    expect(out.error).toHaveBeenCalledWith(USAGE)
     expect(out.log).not.toHaveBeenCalled()
   })
 
@@ -34,7 +34,11 @@ describe('enrol-cli main()', () => {
     const out = fakeOut()
     const code = await main(['node', 'enrol-cli.mjs', ''], out)
     expect(code).toBe(1)
-    expect(out.error).toHaveBeenCalledWith('usage: node enrol-cli.mjs <host-name>')
+    expect(out.error).toHaveBeenCalledWith(USAGE)
+  })
+
+  it('documents the revoke path in its own usage text, so decommissioning is discoverable', () => {
+    expect(USAGE).toContain('--revoke')
   })
 
   it('on a valid enrolment, prints the token on stdout exactly once, and it authenticates', async () => {
@@ -73,5 +77,88 @@ describe('enrol-cli main()', () => {
     // call the CLI forgot to make.
     expect(await authenticateAgent(firstToken)).toBeNull()
     expect(await authenticateAgent(secondToken)).not.toBeNull()
+  })
+})
+
+// `revokeAgent` was implemented and unit-tested from the start, but nothing
+// an operator could actually RUN ever called it. A host therefore could not
+// be decommissioned without re-enrolling it -- minting a fresh working
+// credential for a machine you are trying to take away.
+describe('enrol-cli main() --revoke', () => {
+  it('kills a live token: the agent that holds it can no longer authenticate', async () => {
+    const enrolled = fakeOut()
+    await main(['node', 'enrol-cli.mjs', 'cli-host-revoke'], enrolled)
+    const token = enrolled.log.mock.calls[0]?.[0] as string
+    expect(await authenticateAgent(token)).not.toBeNull()
+
+    const out = fakeOut()
+    const code = await main(['node', 'enrol-cli.mjs', '--revoke', 'cli-host-revoke'], out)
+
+    expect(code).toBe(0)
+    expect(await authenticateAgent(token)).toBeNull()
+  })
+
+  it('mints nothing: revoking must never hand back a fresh working credential', async () => {
+    // The entire point of having this separately from re-enrolment.
+    const enrolled = fakeOut()
+    await main(['node', 'enrol-cli.mjs', 'cli-host-nomint'], enrolled)
+
+    const out = fakeOut()
+    await main(['node', 'enrol-cli.mjs', '--revoke', 'cli-host-nomint'], out)
+
+    expect(out.log).not.toHaveBeenCalled()
+  })
+
+  it('is idempotent for a host whose tokens are already revoked, so a lost response is safe to retry', async () => {
+    const enrolled = fakeOut()
+    await main(['node', 'enrol-cli.mjs', 'cli-host-twice'], enrolled)
+    await main(['node', 'enrol-cli.mjs', '--revoke', 'cli-host-twice'], fakeOut())
+
+    const out = fakeOut()
+    const code = await main(['node', 'enrol-cli.mjs', '--revoke', 'cli-host-twice'], out)
+    expect(code).toBe(0)
+  })
+
+  it('fails rather than claiming success for a host name that does not exist', async () => {
+    // A typo must not report "revoked". Believing a credential is dead
+    // while it is still live is the one outcome this command must never
+    // produce.
+    const out = fakeOut()
+    const code = await main(['node', 'enrol-cli.mjs', '--revoke', 'no-such-host-anywhere'], out)
+    expect(code).toBe(1)
+    const said = out.error.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(said).toMatch(/no such host/i)
+  })
+
+  it('fails with usage when --revoke is given no host name', async () => {
+    const out = fakeOut()
+    const code = await main(['node', 'enrol-cli.mjs', '--revoke'], out)
+    expect(code).toBe(1)
+    expect(out.error).toHaveBeenCalledWith(USAGE)
+  })
+
+  it('revokes only the named host, never every host at once', async () => {
+    // A decommission command that doubles as a fleet-wide kill switch would
+    // take nine businesses' monitoring offline in one keystroke.
+    const outA = fakeOut()
+    const outB = fakeOut()
+    await main(['node', 'enrol-cli.mjs', 'cli-host-keep'], outA)
+    await main(['node', 'enrol-cli.mjs', 'cli-host-drop'], outB)
+    const keepToken = outA.log.mock.calls[0]?.[0] as string
+    const dropToken = outB.log.mock.calls[0]?.[0] as string
+
+    await main(['node', 'enrol-cli.mjs', '--revoke', 'cli-host-drop'], fakeOut())
+
+    expect(await authenticateAgent(dropToken)).toBeNull()
+    expect(await authenticateAgent(keepToken)).not.toBeNull()
+  })
+
+  it('does not treat a host literally named --revoke as a flag in the host-name position', async () => {
+    // `argv[2] === '--revoke'` with nothing after it is a usage error, not
+    // an attempt to enrol a host called "--revoke".
+    const out = fakeOut()
+    const code = await main(['node', 'enrol-cli.mjs', '--revoke', ''], out)
+    expect(code).toBe(1)
+    expect(out.log).not.toHaveBeenCalled()
   })
 })

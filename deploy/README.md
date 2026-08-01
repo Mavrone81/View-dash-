@@ -81,8 +81,17 @@ convention is already in place when that lands.
 
 ```bash
 export GHCR_OWNER=<your-org> TAG=<image-tag>
+docker compose config >/dev/null   # pre-flight: the file resolves cleanly
 docker compose up -d db
 ```
+
+`docker compose config` is worth running first because it fails fast on
+anything wrong with the file itself before any container starts. It needs
+no `.env` file: this repo's compose file deliberately has no `env_file:`
+directive, because nothing the containers run reads one (`DATABASE_URL` is
+built at container start by `deploy/with-database-url.sh`, `NODE_ENV` comes
+from the image, and `INGEST_SERVER_HOST` is set inline on the `ingest`
+service). Do not add one back.
 
 Wait for it to report healthy (`docker compose ps db`), then run
 migrations as their own, separate, one-off command -- **never** as part of
@@ -111,11 +120,20 @@ docker compose up -d
 `web` and `ingest` will not start (and `depends_on: db: condition:
 service_healthy` will hold them back) until Postgres reports healthy.
 
-Confirm the four dashboard-side checks pass:
+Confirm the dashboard-side checks pass:
 
 ```bash
 bash deploy/verify.sh
 ```
+
+Two of those checks probe this host's **public** address to confirm `web`
+and `ingest` are NOT reachable on it. That address is resolved by
+`deploy/detect-public-ip.sh`, which deliberately fails rather than falling
+back to a private NIC's address — probing a private address, finding
+nothing, and reporting PASS would certify the exact exposure the check
+exists to catch. If this host is behind NAT and has no globally-routable
+address of its own, set `BEVORA_PUBLIC_IP` to the address the internet
+reaches it on and re-run.
 
 (The fifth check, `agent unit is active`, is checked separately in the
 next section -- it runs on a monitored host, not necessarily this one.)
@@ -168,6 +186,32 @@ revokes that host's current token and mints a new one -- use this to
 rotate a credential you suspect is compromised, then repeat step 7 on that
 host with the new token.
 
+### Decommissioning a host (revoke without re-enrolling)
+
+To take a host off the fleet permanently -- or to kill a leaked credential
+without handing out a working replacement -- revoke it:
+
+```bash
+docker compose exec web /deploy/with-database-url.sh \
+  node web/dist/enrol-cli.mjs --revoke <host-name>
+```
+
+This invalidates every active enrolment for that host and mints nothing.
+Use it, not a re-enrolment, when the goal is to REMOVE a machine:
+re-enrolling would create a fresh working token for a host you are trying
+to retire.
+
+It is scoped to the one host named and never touches any other host's
+token. It is safe to re-run (a host whose tokens are already revoked
+succeeds silently), but a host name that does not exist FAILS rather than
+reporting success -- so a typo cannot leave you believing a live
+credential is dead.
+
+Afterwards, that host's agent keeps dialling in and keeps being rejected;
+its rows go `stale` and then `unknown` on the board rather than
+disappearing. Stop and disable `bevora-agent` on the host itself to finish
+the job.
+
 ## 7. Install the token on the monitored host
 
 On the monitored host (not the dashboard host):
@@ -210,13 +254,46 @@ authoritative list -- every one of these is required except
 `AGENT_INTERVAL_MS`):
 
 ```ini
-AGENT_HOST_NAME=<same host-name you used in step 6>
+AGENT_HOST_NAME=<the host-name you used in step 6>
 AGENT_DASHBOARD_URL=wss://<dashboard-hostname>/agent/ingest
 AGENT_TOKEN_FILE=/etc/bevora-agent/token
 AGENT_DEPLOY_LOG_GLOB=<glob matching this host's deploy-log files>
 AGENT_REPO_ROOT=<root directory this host's system checkouts live under>
 # AGENT_INTERVAL_MS=30000   # optional; default shown
+# AGENT_SYSTEM_URLS=<key>=https://...,<key>=https://...   # optional; see below
+# AGENT_PROBE_TIMEOUT_MS=5000                             # optional; default shown
 ```
+
+**`AGENT_HOST_NAME` does not identify this agent, and cannot.** Identity
+comes entirely from the token: the dashboard hashes it, finds the
+enrolment, and files everything this agent reports under THAT host, no
+matter what this variable says. (An earlier version of this runbook said it
+"must match the name used at enrolment", which would have sent someone
+debugging a mismatch that cannot exist.) What it is actually for: the agent
+states it once when it connects, and the dashboard logs a warning if it
+disagrees with the token's host. That catches one host's token being
+installed on a different host -- which otherwise silently files this
+machine's systems under someone else's row. Set it to the enrolment name so
+that check is meaningful; a mismatch is logged, never enforced, so a typo
+here cannot take this host off the board.
+
+**`AGENT_SYSTEM_URLS` (optional) turns on the HTTP health probe.** Comma
+separated `key=url` pairs, where `key` is the system's compose-project name
+as it appears on the board:
+
+```ini
+AGENT_SYSTEM_URLS=alpha=https://alpha.example.test/,beta=https://beta.example.test/health
+```
+
+Health is then the **worst of** the system's container state and this
+probe, which is what stops a stack whose containers all read `Up` from
+rendering green while the app returns 502 to every real visitor. A system
+with no entry here is simply not probed and is reported exactly as its
+containers describe it -- never downgraded for the absence of a URL. Note
+that a malformed entry makes the agent refuse to start, deliberately:
+silently skipping it would leave a system unprobed while you believed it
+was covered. 4xx reads as `degraded` and 5xx (or no answer at all) as
+`down`, so point this at a URL that returns 2xx when the app is well.
 
 `AGENT_DASHBOARD_URL`'s path (`/agent/ingest` above) must match whatever
 `location` you configured in `deploy/nginx-ingest.conf` -- the listener
@@ -299,9 +376,24 @@ the one most worth re-proving live rather than trusting from tests alone.
 
 | Variable | Meaning |
 |---|---|
-| `AGENT_HOST_NAME` | This host's display name on the fleet board (must match the name used at enrolment). |
+| `AGENT_HOST_NAME` | What this host believes it is called. **Advisory only — it does not identify this agent; the token does.** Sent once at connect so the dashboard can log a mismatch with the token's host (see §9). |
 | `AGENT_DASHBOARD_URL` | `wss://` URL of the dashboard's ingest listener, including the proxy path you configured. |
 | `AGENT_TOKEN_FILE` | Path to the file-mounted bearer token from step 7. Never set the token itself as an env var. |
 | `AGENT_DEPLOY_LOG_GLOB` | Glob the agent reads per-system deploy logs from. |
 | `AGENT_REPO_ROOT` | Root directory this host's system checkouts live under. |
 | `AGENT_INTERVAL_MS` | Optional. Poll interval in milliseconds (default `30000`). |
+| `AGENT_SYSTEM_URLS` | Optional. `key=url` pairs, comma separated, enabling the HTTP health probe per system (see §9). Unset ⇒ nothing is probed and nothing is downgraded. |
+| `AGENT_PROBE_TIMEOUT_MS` | Optional. Per-probe timeout in milliseconds (default `5000`). |
+
+## Reference: dashboard-side environment variables
+
+Both are optional and both have safe defaults; set them only if you have a
+reason to.
+
+| Variable | Meaning |
+|---|---|
+| `INGEST_SERVER_HOST` | Interface the ingest listener binds. Defaults to loopback; `docker-compose.yml` sets `0.0.0.0` explicitly, and that file's comment explains why that is required under Docker networking and why it is still not internet exposure. |
+| `INGEST_SERVER_PORT` | Port for the same listener (default `4100`). |
+| `INGEST_MAX_PAYLOAD_BYTES` | Largest accepted WebSocket message (default 1 MiB). `ws`'s own default is 100 MB, which on a 1 GB droplet is an out-of-memory condition anyone can request. |
+| `INGEST_MAX_CONNECTIONS` | Simultaneous connection ceiling (default `64`). Connections over the cap are closed *before* authentication, so an unauthenticated peer cannot drive a database round trip per connection. |
+| `BEVORA_PUBLIC_IP` | Read by `deploy/verify.sh` only. Set this if the dashboard host is behind NAT and has no globally-routable address on any of its own interfaces — otherwise the exposure checks fail rather than guess. |

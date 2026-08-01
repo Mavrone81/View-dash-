@@ -10,6 +10,44 @@ jobs:
   gate:
     name: gate
     runs-on: ubuntu-latest
+
+    # Seven of this repo's test files talk to a REAL Postgres (they call
+    # prisma.$queryRaw, exercise DISTINCT ON, and reset shared tables in
+    # their own beforeEach -- see vitest.config.ts's fileParallelism note).
+    # Without this service container the whole `gate` job failed on the
+    # first database test, which meant `publish` (needs: [gate, secrets])
+    # never ran, which meant the image docker-compose.yml references was
+    # never built or pushed. Spec section 10 always required "tests against
+    # a Postgres service container"; this is it.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: bevops
+          POSTGRES_PASSWORD: bevops
+          POSTGRES_DB: bevops
+        # 5432 on both sides: the developer's own machine uses 5434 for the
+        # local dev database (5433 is occupied there), but a GitHub runner
+        # has no such collision, so the default port is used here and the
+        # DATABASE_URL below is the single place that says so.
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bevops -d bevops"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    # The tests read DATABASE_URL from the process environment. A local
+    # checkout also has a git-ignored `web/.env` that Prisma would read,
+    # but a real process env var takes precedence over it (verified
+    # directly: setting a bogus DATABASE_URL made the database tests fail
+    # against the bad address rather than silently using web/.env's) -- and
+    # `web/.env` is git-ignored, so it does not exist on a runner at all.
+    # Either way, the value below is the one the tests actually use.
+    env:
+      DATABASE_URL: postgresql://bevops:bevops@127.0.0.1:5432/bevops?schema=public
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,6 +59,15 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # The schema has to exist before any test runs: every database-backed
+      # test assumes the tables are already there and does not create them.
+      # `migrate deploy` (not `migrate dev`) is deliberate -- it applies the
+      # committed migrations exactly as the deployment runbook does, so CI
+      # is also a continuous check that those migrations still apply to an
+      # empty database.
+      - name: Apply migrations
+        run: npx prisma migrate deploy --schema web/prisma/schema.prisma
 
       - name: Typecheck
         run: npm run typecheck
@@ -62,19 +109,25 @@ jobs:
       - name: Scan full history with gitleaks
         run: ./gitleaks detect --redact --no-banner --verbose --exit-code 1
 
-  # Builds deploy/Dockerfile ONCE and pushes it to GHCR, tagged with the
+  # Builds deploy/Dockerfile ONCE, and pushes it to GHCR tagged with the
   # commit sha -- the same tag docker-compose.yml's `${TAG:-latest}`
   # expects an operator to set (see deploy/README.md §1 and §3). This is
   # the piece that was missing entirely before: docker-compose.yml
-  # referenced an image nothing built or published. Runs only on pushes to
-  # `main` (this repo's default branch), and only after `gate` and
-  # `secrets` both pass -- never publish an image whose tests, typecheck,
-  # leakage gate, or secret scan didn't already pass.
+  # referenced an image nothing built or published.
+  #
+  # The BUILD runs on every branch push and every pull request; only the
+  # PUSH to the registry is gated on the default branch. Building only on
+  # `main` meant a Dockerfile that no longer builds could be merged and
+  # only discovered afterwards, on the branch that is supposed to be
+  # releasable -- so the build now runs where it can still block a merge,
+  # and `push: false` keeps unreviewed branches out of the registry.
+  # Either way it runs only after `gate` and `secrets` both pass: never
+  # publish an image whose tests, typecheck, leakage gate, or secret scan
+  # didn't already pass.
   publish:
     name: publish
     runs-on: ubuntu-latest
     needs: [gate, secrets]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
@@ -82,7 +135,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Only when the image is actually going to be pushed. A build-only
+      # run needs no registry credentials at all, and asking for none is
+      # also what makes this job safe to run on a pull request.
       - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -95,12 +152,12 @@ jobs:
         id: image
         run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Build (and push only on the default branch)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/Dockerfile
-          push: true
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: |
             ${{ steps.image.outputs.name }}:${{ github.sha }}
             ${{ steps.image.outputs.name }}:latest

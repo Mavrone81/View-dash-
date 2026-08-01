@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { PrismaClient, type Prisma } from '@prisma/client'
 import { prisma } from './db.js'
-import { latestPerSystem } from './fleet-query.js'
+import { latestPerSystem, NO_SYSTEMS_LABEL } from './fleet-query.js'
 
 beforeEach(async () => {
   await prisma.systemObservation.deleteMany()
@@ -245,5 +245,116 @@ describe('latestPerSystem', () => {
     } finally {
       await logging.$disconnect()
     }
+  })
+
+  // The board is a FLEET board -- it shows every enrolled host -- but the
+  // query used to select from `System` alone, with no host anywhere in the
+  // result. Two consequences, both wrong, both fixed here.
+  describe('host scoping', () => {
+    it('keeps two hosts running a same-named system as two distinguishable rows', async () => {
+      // `System.key` is unique PER HOST by design (`@@unique([hostId,
+      // key])`), precisely so this is legal. It has to survive onto the
+      // board.
+      const hostA = await prisma.host.create({ data: { name: 'host-alpha' } })
+      const hostB = await prisma.host.create({ data: { name: 'host-bravo' } })
+      for (const h of [hostA, hostB]) {
+        await prisma.system.create({ data: { hostId: h.id, key: 'web', displayName: 'web' } })
+      }
+
+      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+
+      expect(rows).toHaveLength(2)
+      expect(rows.map((r) => r.hostName).sort()).toEqual(['host-alpha', 'host-bravo'])
+      // The identity React keys rows on. Duplicated ids are the actual bug:
+      // two rows sharing a key render as one confused row.
+      expect(new Set(rows.map((r) => r.id)).size).toBe(2)
+      // ...and it must not be the system key, which IS the same for both.
+      expect(new Set(rows.map((r) => r.key)).size).toBe(1)
+    })
+
+    it('renders a host whose agent has never started as an explicit unknown row, not as no row at all', async () => {
+      // This is the rule that unknown must never be silently absent. An
+      // enrolled host with no observations used to produce nothing
+      // whatsoever, so a mistyped token looked exactly like a healthy
+      // fleet.
+      await prisma.host.create({ data: { name: 'host-silent' } })
+
+      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.hostName).toBe('host-silent')
+      expect(rows[0]!.state).toBe('unknown')
+      expect(rows[0]!.displayName).toBe(NO_SYSTEMS_LABEL)
+      // Never `down`: we are not claiming this host is broken, only that we
+      // have not heard from it.
+      expect(rows[0]!.state).not.toBe('down')
+    })
+
+    it('shows a silent host alongside a reporting one rather than only the reporting one', async () => {
+      const live = await prisma.host.create({ data: { name: 'host-live' } })
+      await prisma.host.create({ data: { name: 'host-silent' } })
+      const system = await prisma.system.create({
+        data: { hostId: live.id, key: 'web', displayName: 'web' },
+      })
+      const now = new Date('2026-08-01T12:00:00Z')
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: new Date(now.getTime() - 5_000),
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+        },
+      })
+
+      const rows = await latestPerSystem(now)
+
+      expect(rows.map((r) => r.hostName).sort()).toEqual(['host-live', 'host-silent'])
+      expect(rows.find((r) => r.hostName === 'host-silent')!.state).toBe('unknown')
+      expect(rows.find((r) => r.hostName === 'host-live')!.state).toBe('healthy')
+    })
+
+    it('surfaces the host last-seen time, which was written on every ingest and read by nothing', async () => {
+      // Spec §9 requires a row that cannot be vouched for to say WHEN it
+      // last could be -- "agent unreachable, last seen HH:MM". Nothing
+      // could render that while `Host.lastSeenAt` never left the database.
+      const lastSeen = new Date('2026-08-01T10:07:00Z')
+      await prisma.host.create({ data: { name: 'host-quiet', lastSeenAt: lastSeen } })
+
+      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+
+      expect(rows[0]!.lastSeenAt).toEqual(lastSeen)
+    })
+
+    it('carries the host last-seen time onto ordinary SYSTEM rows too, not just the placeholder row', async () => {
+      // Caught by mutation: the previous test only exercised the
+      // never-reported-host path, so blanking `lastSeenAt` on the system-row
+      // path passed the whole suite. A stale system row is exactly where
+      // spec §9's "last seen HH:MM" has to come from when that system's own
+      // observation is missing.
+      const lastSeen = new Date('2026-08-01T11:45:00Z')
+      const host = await prisma.host.create({ data: { name: 'host-tracked', lastSeenAt: lastSeen } })
+      await prisma.system.create({ data: { hostId: host.id, key: 'web', displayName: 'web' } })
+
+      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.key).toBe('web')
+      expect(rows[0]!.receivedAt).toBeNull()
+      expect(rows[0]!.lastSeenAt).toEqual(lastSeen)
+    })
+
+    it('orders rows by host, so one machine\'s systems stay together', async () => {
+      const hostB = await prisma.host.create({ data: { name: 'host-bravo' } })
+      const hostA = await prisma.host.create({ data: { name: 'host-alpha' } })
+      await prisma.system.create({ data: { hostId: hostB.id, key: 'aaa', displayName: 'aaa' } })
+      await prisma.system.create({ data: { hostId: hostA.id, key: 'zzz', displayName: 'zzz' } })
+
+      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+
+      // Host-major: alpha's `zzz` precedes bravo's `aaa`. A system-key sort
+      // would put them the other way round and interleave the machines.
+      expect(rows.map((r) => r.hostName)).toEqual(['host-alpha', 'host-bravo'])
+    })
   })
 })

@@ -4,6 +4,8 @@ import { loadConfig } from './config.js'
 import { collectSnapshot } from './collect.js'
 import { toSummary } from './docker.js'
 import { AgentTransport } from './transport.js'
+import { createTickRunner } from './loop.js'
+import { probeUrl } from './probe.js'
 import { resolveDeployLogPath, resolveRepoDir } from './paths.js'
 
 const cfg = loadConfig()
@@ -26,6 +28,12 @@ async function tick(): Promise<void> {
     readDeployLog: async (key) => readFile(resolveDeployLogPath(cfg.deployLogGlob, key), 'utf8').catch(() => null),
     repoDirFor: (key) => resolveRepoDir(cfg.repoRoot, key),
     now: () => new Date(),
+    // Spec §4.1's HTTP probe. `systemUrls` is empty unless an operator sets
+    // AGENT_SYSTEM_URLS, and a system with no entry is simply not probed --
+    // never downgraded for it. See agent/src/config.ts for why that map is
+    // empty in every deployment today.
+    urlFor: (key) => cfg.systemUrls[key] ?? null,
+    probe: (url) => probeUrl(url, fetch, cfg.probeTimeoutMs),
   })
   // A failed send never throws (see AgentTransport.send): losing the
   // dashboard must never stop this loop from continuing to collect and
@@ -33,7 +41,16 @@ async function tick(): Promise<void> {
   await transport.send(snapshot)
 }
 
+// NOT `void tick()` directly. `createTickRunner` (see agent/src/loop.ts for
+// the full reasoning) contains two failure modes that matter a great deal
+// on a host carrying nine businesses' production: a rejected tick is caught
+// and logged instead of becoming an unhandled rejection that terminates the
+// process (previously masked by deploy/agent.service's `Restart=always`),
+// and a tick that outlives the interval causes the next one to be skipped
+// instead of stacking concurrent collections onto an already-slow host.
+const run = createTickRunner(tick)
+
 setInterval(() => {
-  void tick()
+  void run()
 }, cfg.intervalMs)
-void tick()
+void run()

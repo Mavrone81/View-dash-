@@ -1,7 +1,13 @@
-import { enrolAgent } from './auth-agent.js'
+import { enrolAgent, revokeAgent } from './auth-agent.js'
 import { prisma } from '../lib/db.js'
 
-const USAGE = 'usage: node enrol-cli.mjs <host-name>'
+export const USAGE = [
+  'usage:',
+  '  node enrol-cli.mjs <host-name>            enrol a host and mint its token (revokes any previous one)',
+  '  node enrol-cli.mjs --revoke <host-name>   revoke this host\'s token, minting nothing',
+].join('\n')
+
+const REVOKE_FLAG = '--revoke'
 
 /**
  * Operator entrypoint for minting an agent token, per `enrolAgent`'s own
@@ -32,6 +38,38 @@ export async function main(
   argv: readonly string[] = process.argv,
   out: { log: (s: string) => void; error: (s: string) => void } = console,
 ): Promise<number> {
+  // Decommissioning a host. `revokeAgent` was implemented and tested from
+  // the start but had NO operator-facing entry point, which meant the only
+  // way to invalidate a host's credential was to re-enrol it -- i.e. to
+  // mint a replacement token for a machine you are trying to take away.
+  // This is that entry point.
+  if (argv[2] === REVOKE_FLAG) {
+    const hostName = argv[3]
+    if (!hostName) {
+      out.error(USAGE)
+      return 1
+    }
+    // Checked explicitly rather than relying on `revokeAgent`'s silent
+    // no-op for an unknown host. `revokeAgent` is deliberately idempotent
+    // so that re-running it is safe -- but an operator who MISTYPES a host
+    // name must not be told "revoked" about a machine that was never
+    // touched. Believing a credential is dead when it is still live is the
+    // one outcome this command must never produce.
+    const host = await prisma.host.findUnique({ where: { name: hostName } })
+    if (!host) {
+      out.error(`no such host: ${hostName} -- nothing was revoked`)
+      return 1
+    }
+    // Still a no-op-and-succeed for a host whose tokens are ALREADY
+    // revoked: that is the case idempotency is actually for (a first
+    // attempt whose output was lost), and failing it would push an
+    // operator toward re-enrolling instead.
+    await revokeAgent(hostName)
+    out.error(`revoked every active enrolment for host: ${hostName} (id: ${host.id})`)
+    out.error('that host\'s agent can no longer report; its rows will go stale, then unknown.')
+    return 0
+  }
+
   const hostName = argv[2]
   if (!hostName) {
     out.error(USAGE)

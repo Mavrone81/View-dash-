@@ -1,5 +1,6 @@
 import { WebSocketServer, type WebSocket, type RawData } from 'ws'
 import type { IncomingMessage } from 'node:http'
+import { AgentHelloSchema } from '@bevora-ops/shared'
 import { authenticateAgent } from './auth-agent.js'
 import { handleSnapshotMessage } from './agent-socket.js'
 import { prisma } from '../lib/db.js'
@@ -14,6 +15,13 @@ const BEARER_PREFIX = 'Bearer '
 // and must never hint at *why* the token failed.
 const UNAUTHORIZED_CLOSE_CODE = 4001
 const UNAUTHORIZED_REASON = 'unauthorized'
+
+// Distinct from UNAUTHORIZED so an operator (and a test) can tell a
+// capacity rejection apart from a credential rejection. Like the code
+// above it says nothing an unauthenticated peer could learn from: that the
+// listener is at capacity is already evident from being disconnected.
+const AT_CAPACITY_CLOSE_CODE = 4002
+const AT_CAPACITY_REASON = 'at capacity'
 
 const MALFORMED_MESSAGE = 'malformed message'
 
@@ -52,8 +60,39 @@ function extractPayload(parsed: unknown): unknown {
  * Every connection is authenticated before anything it sends is acted on.
  */
 export function startIngestServer(config: IngestServerConfig = loadIngestServerConfig()): WebSocketServer {
-  const wss = new WebSocketServer({ host: config.host, port: config.port })
+  const wss = new WebSocketServer({
+    host: config.host,
+    port: config.port,
+    // Explicit, never `ws`'s 100 MB default -- see IngestServerConfig's own
+    // comment. `ws` enforces this itself: an oversized frame is closed with
+    // 1009 rather than buffered, so the limit costs nothing per message.
+    maxPayload: config.maxPayloadBytes,
+  })
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+    // MUST come before anything else on this socket. `ws` reports protocol
+    // violations by EMITTING an 'error' event on the connection -- and a
+    // Node EventEmitter with no 'error' listener THROWS instead, which for
+    // this process means the whole listener dies and every other agent's
+    // connection dies with it. The `maxPayload` limit above is itself a
+    // trigger for exactly that: an oversized frame raises
+    // WS_ERR_UNSUPPORTED_MESSAGE_LENGTH here. Found by the oversized-frame
+    // test below, which crashed the test run before this listener existed
+    // -- i.e. adding a payload cap without this would have converted a
+    // memory-exhaustion attempt into a remote crash, which is worse.
+    ws.on('error', (err: unknown) => {
+      console.error('[ingest-server] connection error:', err)
+    })
+
+    // The capacity check comes FIRST, before `handleConnection` and
+    // therefore before `authenticateAgent`'s database round trip. That
+    // ordering is the point of it: without a cap, any peer could make this
+    // listener issue a database query per connection, for free, without
+    // ever holding a credential. `wss.clients` already includes this
+    // connection, hence `>`.
+    if (wss.clients.size > config.maxConnections) {
+      ws.close(AT_CAPACITY_CLOSE_CODE, AT_CAPACITY_REASON)
+      return
+    }
     void handleConnection(ws, req)
   })
   return wss
@@ -76,12 +115,13 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage): Promise<vo
   // to `handleMessage`/`handleSnapshotMessage`, regardless of timing.
   const queued: RawData[] = []
   let authorizedHostId: string | null = null
+  let authorizedHostName: string | null = null
   let rejected = false
 
   ws.on('message', (data: RawData) => {
     if (rejected) return
     if (authorizedHostId !== null) {
-      void handleMessage(ws, authorizedHostId, data)
+      void handleMessage(ws, authorizedHostId, authorizedHostName, data)
       return
     }
     if (queued.length < MAX_QUEUED_DURING_AUTH) queued.push(data)
@@ -98,14 +138,22 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage): Promise<vo
   // Never the token -- only the host's own name (falling back to its
   // opaque, non-secret id if the row vanished between auth and this
   // lookup), logged purely so an operator can see which agents are live.
+  // This same lookup supplies the name the agent's `hello` is checked
+  // against below, so the check costs no extra query.
   const host = await prisma.host.findUnique({ where: { id: auth.hostId } })
   console.log(`[ingest-server] agent connected: ${host?.name ?? auth.hostId}`)
 
   authorizedHostId = auth.hostId
-  for (const data of queued.splice(0)) void handleMessage(ws, auth.hostId, data)
+  authorizedHostName = host?.name ?? null
+  for (const data of queued.splice(0)) void handleMessage(ws, auth.hostId, authorizedHostName, data)
 }
 
-async function handleMessage(ws: WebSocket, hostId: string, data: RawData): Promise<void> {
+async function handleMessage(
+  ws: WebSocket,
+  hostId: string,
+  hostName: string | null,
+  data: RawData,
+): Promise<void> {
   try {
     let parsed: unknown
     try {
@@ -116,6 +164,32 @@ async function handleMessage(ws: WebSocket, hostId: string, data: RawData): Prom
       ws.send(JSON.stringify({ type: 'error', message: MALFORMED_MESSAGE }))
       return
     }
+
+    // The agent's one-shot `hello` (see AgentHelloSchema). Handled before
+    // the snapshot path because it is not a snapshot and would otherwise
+    // be rejected by it.
+    //
+    // This is ADVISORY ONLY. `hostId` above came from the bearer token and
+    // remains the sole basis for what this connection may write; nothing
+    // the peer says here changes it. All a mismatch does is produce a log
+    // line -- which is the entire reason AGENT_HOST_NAME still exists. The
+    // failure it catches is real and otherwise silent: one host's token
+    // installed on a different host files that machine's systems under
+    // someone else's row, forever, with the board looking perfectly
+    // normal. Rejecting instead of logging was considered and refused: a
+    // typo in an env var must not be able to take a production host off
+    // the fleet board, which would be a worse outcome than the
+    // mislabelling being detected.
+    const hello = AgentHelloSchema.safeParse(parsed)
+    if (hello.success) {
+      if (hostName !== null && hello.data.hostName !== hostName) {
+        console.warn(
+          `[ingest-server] host-name mismatch: an agent presenting host "${hostName}"'s token reports its own AGENT_HOST_NAME as "${hello.data.hostName}". The token is authoritative and this connection is being accepted as "${hostName}" -- but one of the two hosts is misconfigured, and this host's systems may be filing under the wrong row.`,
+        )
+      }
+      return
+    }
+
     const response = await handleSnapshotMessage(hostId, extractPayload(parsed))
     ws.send(JSON.stringify(response))
   } catch (err) {

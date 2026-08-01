@@ -53,7 +53,18 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    env_file: .env
+    # NO `env_file:`. There was one (`env_file: .env`), and it made
+    # `docker compose config` -- the runbook's own first command -- exit 1
+    # on a clean checkout, because `.env` is git-ignored and nothing in
+    # this repo creates it. It only ever appeared to work because a stray
+    # local file happened to exist during testing. Nothing in it was
+    # consumed either way: every environment variable these containers
+    # actually read is accounted for elsewhere -- DATABASE_URL is built at
+    # container start by deploy/with-database-url.sh from the mounted
+    # secret, NODE_ENV is set in deploy/Dockerfile, and `ingest`'s
+    # INGEST_SERVER_HOST is set inline on that service below. Adding an
+    # `.env.example` to copy would have re-introduced a file whose only
+    # purpose is to satisfy a directive that reads nothing.
     secrets: [postgres_password, kek]
     volumes:
       # Read-only: this container only ever needs to RUN the script, never
@@ -95,7 +106,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    env_file: .env
+    # No `env_file:` here either -- see the `web` service above for why.
     secrets: [postgres_password]
     volumes:
       - ./deploy/with-database-url.sh:/deploy/with-database-url.sh:ro

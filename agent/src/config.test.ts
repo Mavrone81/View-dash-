@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { loadConfig } from './config.js'
+import { loadConfig, parseSystemUrls } from './config.js'
 
 function validEnv(over: Partial<NodeJS.ProcessEnv> = {}): NodeJS.ProcessEnv {
   const dir = mkdtempSync(join(tmpdir(), 'agent-config-'))
@@ -78,5 +78,61 @@ describe('loadConfig', () => {
     // empty or undefined token.
     const env = validEnv({ AGENT_TOKEN_FILE: join(tmpdir(), 'does-not-exist-token-file') })
     expect(() => loadConfig(env)).toThrow()
+  })
+
+  it('defaults to probing nothing, so an unconfigured agent never downgrades a row it cannot check', () => {
+    const cfg = loadConfig(validEnv())
+    expect(cfg.systemUrls).toEqual({})
+    expect(cfg.probeTimeoutMs).toBeGreaterThan(0)
+  })
+
+  it('loads configured system URLs and a custom probe timeout', () => {
+    const cfg = loadConfig(
+      validEnv({
+        AGENT_SYSTEM_URLS: 'alpha=https://alpha.example.test/,beta=https://beta.example.test/health',
+        AGENT_PROBE_TIMEOUT_MS: '1500',
+      }),
+    )
+    expect(cfg.systemUrls).toEqual({
+      alpha: 'https://alpha.example.test/',
+      beta: 'https://beta.example.test/health',
+    })
+    expect(cfg.probeTimeoutMs).toBe(1500)
+  })
+})
+
+describe('parseSystemUrls', () => {
+  it('treats absent or blank configuration as "no URLs", not as an error', () => {
+    expect(parseSystemUrls(undefined)).toEqual({})
+    expect(parseSystemUrls('')).toEqual({})
+    expect(parseSystemUrls('   ')).toEqual({})
+  })
+
+  it('trims surrounding whitespace around both key and url', () => {
+    expect(parseSystemUrls('  alpha = https://alpha.example.test/  ')).toEqual({
+      alpha: 'https://alpha.example.test/',
+    })
+  })
+
+  it('keeps a query string intact by splitting on the first = only', () => {
+    // Splitting on every `=` would truncate this URL at `?probe`, and the
+    // agent would then probe a different path than the operator configured.
+    expect(parseSystemUrls('alpha=https://alpha.example.test/health?probe=1&deep=2')).toEqual({
+      alpha: 'https://alpha.example.test/health?probe=1&deep=2',
+    })
+  })
+
+  it('throws on a malformed entry rather than silently leaving that system unprobed', () => {
+    // Skipping it would leave the operator believing a system is checked
+    // when it is not -- the exact failure the probe exists to remove.
+    expect(() => parseSystemUrls('alpha')).toThrow(/AGENT_SYSTEM_URLS/)
+    expect(() => parseSystemUrls('alpha=')).toThrow(/AGENT_SYSTEM_URLS/)
+    expect(() => parseSystemUrls('=https://alpha.example.test/')).toThrow(/AGENT_SYSTEM_URLS/)
+  })
+
+  it('tolerates a trailing comma, which is a typo that changes nothing', () => {
+    expect(parseSystemUrls('alpha=https://alpha.example.test/,')).toEqual({
+      alpha: 'https://alpha.example.test/',
+    })
   })
 })
