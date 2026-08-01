@@ -1,0 +1,137 @@
+# Bevora Ops dashboard -- deployment topology for the dashboard droplet.
+# See deploy/README.md for the full operator runbook (secrets, agent
+# enrolment, the SSH tunnel to reach `web`). This file only covers what
+# runs ON the dashboard host: `db`, `web`, and `ingest`. The `agent` that
+# reports INTO `ingest` runs on each MONITORED host instead, as a systemd
+# unit -- see deploy/agent.service.
+#
+# `web` and `ingest` run the SAME image (built from this monorepo) and
+# differ only in which command each runs: `web` uses the image's own
+# default CMD (its production Next.js start command, unset here); `ingest`
+# overrides `command:` to run the bundled standalone WebSocket listener
+# instead (`npm run build:ingest` -> web/dist/ingest-server.mjs -- see
+# scripts/build/bundle-ingest.mjs for why that needs its own build step,
+# and web/src/server/ingest-server.ts for why it cannot be a Next.js
+# route).
+#
+# Set GHCR_OWNER and (optionally) TAG in the shell environment, or in a
+# `.env.deploy` file sourced before `docker compose up`, to select the
+# image -- see deploy/README.md.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: bevops-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bevops
+      POSTGRES_DB: bevops
+      # File-mounted, never a plaintext value: Postgres reads the password
+      # from the path this points at (a Docker secret, declared below) --
+      # never from an env literal, which would sit in `docker inspect`
+      # output and in this file's own history if it were written here
+      # directly.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - bevops_pgdata:/var/lib/postgresql/data
+    # NO host port, at all: a database needs none. `web` and `ingest` reach
+    # it at `db:5432` over this compose stack's own internal network, which
+    # is never published to the host or the internet. Debug with
+    # `docker compose exec db psql -U bevops -d bevops` -- never by opening
+    # a port to make a GUI client's life easier.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bevops -d bevops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    image: ghcr.io/${GHCR_OWNER}/bevora-ops:${TAG:-latest}
+    container_name: bevops-web
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    secrets: [postgres_password, kek]
+    volumes:
+      # Read-only: this container only ever needs to RUN the script, never
+      # write to it.
+      - ./deploy/with-database-url.sh:/deploy/with-database-url.sh:ro
+    # Prisma's schema (web/prisma/schema.prisma) reads its connection
+    # string via `env("DATABASE_URL")`, so a real process environment
+    # variable is unavoidable at that one point -- but it is never a
+    # plaintext value in `.env`, this file, or any `environment:` block.
+    # `with-database-url.sh` constructs it at container start from the
+    # `postgres_password` secret file's contents and execs the real
+    # command as a child that inherits it. See that script for the full
+    # mechanism. Overriding `entrypoint:` (not `command:`) and leaving
+    # `command:` unset means this service still runs the image's own
+    # default CMD -- only the entrypoint gains a setup step.
+    entrypoint: ["/bin/sh", "/deploy/with-database-url.sh"]
+    # Loopback ONLY, for the whole of slice 1: authentication does not ship
+    # until slice 3 (see this slice's self-review), so this UI must never
+    # be reachable from the internet -- only from an operator's own
+    # machine, over `ssh -L 3000:127.0.0.1:3000 <host>`. See
+    # deploy/README.md.
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  ingest:
+    image: ghcr.io/${GHCR_OWNER}/bevora-ops:${TAG:-latest}
+    container_name: bevops-ingest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    secrets: [postgres_password]
+    volumes:
+      - ./deploy/with-database-url.sh:/deploy/with-database-url.sh:ro
+    entrypoint: ["/bin/sh", "/deploy/with-database-url.sh"]
+    # The one respect in which this service differs from `web`: it runs
+    # the bundled standalone WebSocket listener instead of the image's
+    # default Next.js command. Same image, different command.
+    command: ["node", "web/dist/ingest-server.mjs"]
+    # web/src/server/ingest-server-config.ts defaults INGEST_SERVER_HOST to
+    # 127.0.0.1 DELIBERATELY, so that binding every interface is always a
+    # decision made HERE, in a reviewable deployment file, never a silent
+    # code default (see that file's own comment). This deployment's
+    # DEFAULT topology keeps that default unchanged: `ingest` publishes to
+    # loopback only, exactly like `web`, and this host's OWN reverse proxy
+    # -- running directly on the host, not as a sibling container; see
+    # deploy/nginx-ingest.conf -- reaches it at 127.0.0.1:4100, which a
+    # loopback-published Docker port makes reachable from any process in
+    # the host's own network namespace.
+    #
+    # If your topology instead runs the reverse proxy as a SIBLING
+    # CONTAINER on a shared Docker network (no host networking for the
+    # proxy), loopback inside `ingest`'s own network namespace is
+    # genuinely unreachable from that proxy container. In that case, make
+    # BOTH of these changes together, not just one:
+    #   1. Uncomment the two lines below to bind every interface WITHIN
+    #      this container. This is still not published to the host or the
+    #      internet unless a `ports:` entry says so -- it only changes
+    #      what other CONTAINERS on a shared network can reach.
+    #   2. Remove (or comment out) the `ports:` entry below and instead put
+    #      this service and the proxy container on a shared network, so
+    #      the proxy reaches it by compose DNS name (`ingest:4100`) rather
+    #      than through a published host port.
+    #
+    # environment:
+    #   INGEST_SERVER_HOST: "0.0.0.0"  # scoped to the shared compose network only; see comment above
+    ports:
+      - "127.0.0.1:4100:4100"
+
+secrets:
+  # Both files are created by the operator before `docker compose up` --
+  # see deploy/README.md -- and are git-ignored (see .gitignore); nothing
+  # under ./secrets/ is ever committed to this repo.
+  postgres_password:
+    file: ./secrets/postgres_password
+  kek:
+    file: ./secrets/kek
+
+volumes:
+  bevops_pgdata:

@@ -1,0 +1,60 @@
+[Unit]
+Description=Bevora Ops agent
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs on the MONITORED host (not the dashboard droplet). Reads the local
+# container runtime (via the Docker socket), deploy logs, and repo
+# checkouts on this host; opens exactly one OUTBOUND connection to the
+# dashboard's `ingest` listener and never binds a port of its own -- see
+# agent/src/transport.ts and agent/src/main.ts's own comments on this.
+# `bevora-agent` is the unit name this file must be installed as
+# (`/etc/systemd/system/bevora-agent.service`) -- deploy/verify.sh and
+# this file's own [Install] section both assume it.
+EnvironmentFile=/etc/bevora-agent/agent.env
+ExecStart=/usr/bin/node /opt/bevora-agent/agent-bundle.cjs
+Restart=always
+RestartSec=5
+
+# --- Hardening -----------------------------------------------------------
+# This daemon reaches the Docker socket, which is root-equivalent access by
+# design (anyone who can talk to it can run an arbitrary container with an
+# arbitrary bind-mount, including the host root filesystem) -- see
+# deploy/README.md for that trade-off and the choice of which user runs
+# this unit. Because that one avenue cannot be sandboxed away, everything
+# ELSE is locked down tightly instead: if this process is ever compromised
+# through some other path (a malformed deploy log, a bad glob match), it
+# should not gain any capability the agent's own code does not already use.
+NoNewPrivileges=true
+ProtectSystem=strict
+# `read-only`, not `true`: AGENT_REPO_ROOT and AGENT_DEPLOY_LOG_GLOB (set in
+# agent.env) commonly point under a home directory on a small droplet
+# (e.g. /home/deploy/apps/...). `ProtectHome=true` would hide /home
+# entirely and break both reads; `read-only` still denies this unit any
+# write access there.
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# AF_UNIX for the Docker socket; AF_INET/AF_INET6 for the outbound
+# WebSocket connection to the dashboard. Nothing else this agent does
+# needs any other address family.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
