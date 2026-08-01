@@ -38,4 +38,52 @@ describe('FleetSnapshotSchema', () => {
       systems: [{ ...system, deployedSha: 'abc' }] })
     expect(r.success).toBe(false)
   })
+
+  it('rejects empty key', () => {
+    const r = FleetSnapshotSchema.safeParse({ collectedAt: '2026-08-01T10:00:00.000Z',
+      systems: [{ ...system, key: '' }] })
+    expect(r.success).toBe(false)
+  })
+
+  it('rejects empty displayName', () => {
+    const r = FleetSnapshotSchema.safeParse({ collectedAt: '2026-08-01T10:00:00.000Z',
+      systems: [{ ...system, displayName: '' }] })
+    expect(r.success).toBe(false)
+  })
+
+  it('rejects negative containers.total', () => {
+    const r = FleetSnapshotSchema.safeParse({ collectedAt: '2026-08-01T10:00:00.000Z',
+      systems: [{ ...system, containers: { total: -1, running: 3 } }] })
+    expect(r.success).toBe(false)
+  })
+
+  it('rejects negative containers.running', () => {
+    const r = FleetSnapshotSchema.safeParse({ collectedAt: '2026-08-01T10:00:00.000Z',
+      systems: [{ ...system, containers: { total: 3, running: -1 } }] })
+    expect(r.success).toBe(false)
+  })
+
+  it('rejects negative driftCommits', () => {
+    const r = FleetSnapshotSchema.safeParse({ collectedAt: '2026-08-01T10:00:00.000Z',
+      systems: [{ ...system, driftCommits: -1 }] })
+    expect(r.success).toBe(false)
+  })
+
+  it('rejects invalid deployedAt datetime', () => {
+    const r = FleetSnapshotSchema.safeParse({ collectedAt: '2026-08-01T10:00:00.000Z',
+      systems: [{ ...system, deployedAt: 'not-a-datetime' }] })
+    expect(r.success).toBe(false)
+  })
+
+  it('rejects invalid collectedAt datetime', () => {
+    const r = FleetSnapshotSchema.safeParse({ collectedAt: 'not-a-datetime',
+      systems: [system] })
+    expect(r.success).toBe(false)
+  })
+
+  it('rejects over-long deployedSha', () => {
+    const r = FleetSnapshotSchema.safeParse({ collectedAt: '2026-08-01T10:00:00.000Z',
+      systems: [{ ...system, deployedSha: 'a'.repeat(41) }] })
+    expect(r.success).toBe(false)
+  })
 })
