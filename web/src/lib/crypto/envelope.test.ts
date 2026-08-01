@@ -117,4 +117,52 @@ describe('envelope', () => {
     const wrapped = wrapDek(rawDek, 7, kek)
     expect(unwrapDek(wrapped, 7, kek)).toEqual(rawDek)
   })
+
+  // Carried forward from an earlier round: dekAad happily stringified any
+  // number into the AAD, so a negative, fractional, NaN, or Infinity
+  // generation produced a syntactically fine but semantically meaningless
+  // AAD instead of failing loudly. Guarded centrally in dekAad so both
+  // wrapDek and unwrapDek inherit the check from their one shared source.
+  it('refuses to wrap a DEK under a negative generation', () => {
+    const kek = randomBytes(32)
+    expect(() => wrapDek(randomBytes(32), -1, kek)).toThrow()
+  })
+
+  it('refuses to wrap a DEK under a fractional generation', () => {
+    const kek = randomBytes(32)
+    expect(() => wrapDek(randomBytes(32), 1.5, kek)).toThrow()
+  })
+
+  it('refuses to wrap a DEK under a NaN generation', () => {
+    const kek = randomBytes(32)
+    expect(() => wrapDek(randomBytes(32), NaN, kek)).toThrow()
+  })
+
+  it('refuses to wrap a DEK under an Infinity generation', () => {
+    const kek = randomBytes(32)
+    expect(() => wrapDek(randomBytes(32), Infinity, kek)).toThrow()
+  })
+
+  // These two fabricate the wrapped value with `seal` directly, using the
+  // EXACT AAD unwrapDek would derive for the same bad generation, rather
+  // than going through wrapDek(..., 1, ...) and requesting a different
+  // generation. That distinction matters: wrapDek(dek, 1, kek) vs.
+  // unwrapDek(wrapped, -1, kek) would already throw on ordinary AAD
+  // mismatch (generation 1 was never validated, it's just a different
+  // string from generation -1) whether or not the new guard exists, so it
+  // would not prove anything. Matching the AAD isolates the guard: if it
+  // did not exist, `open` would succeed outright (same key, same AAD).
+  it('refuses to unwrap a DEK requested at a negative generation', () => {
+    const kek = randomBytes(32)
+    const rawDek = randomBytes(32)
+    const fabricated = seal(rawDek.toString('base64'), 'dek:-1:wrapped', kek)
+    expect(() => unwrapDek(fabricated, -1, kek)).toThrow()
+  })
+
+  it('refuses to unwrap a DEK requested at a fractional generation', () => {
+    const kek = randomBytes(32)
+    const rawDek = randomBytes(32)
+    const fabricated = seal(rawDek.toString('base64'), 'dek:1.5:wrapped', kek)
+    expect(() => unwrapDek(fabricated, 1.5, kek)).toThrow()
+  })
 })

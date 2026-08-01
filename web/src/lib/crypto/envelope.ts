@@ -58,7 +58,19 @@ export function open(sealed: string, aad: string, dek: Buffer): string {
 // could silently roll the system back to a retired key generation, and
 // nothing would signal it because the ciphertext would authenticate
 // perfectly against the wrong generation.
+// Validated here, once, so wrapDek and unwrapDek both inherit the check
+// from their one shared AAD-building expression. Without it, a negative,
+// fractional, NaN, or Infinity generation would still stringify into a
+// syntactically fine AAD (e.g. `dek:-1:wrapped`) and be silently accepted —
+// not a forgery risk by itself (the number is never attacker-controlled),
+// but this is the single place a real generation counter gets persisted and
+// compared, so a caller's bug here (an off-by-something producing -1, or a
+// NaN from a bad parse) should fail loudly instead of quietly minting a
+// well-formed-looking but meaningless key generation.
 function dekAad(generation: number): string {
+  if (!Number.isInteger(generation) || generation < 0) {
+    throw new Error('invalid key generation: expected a non-negative integer')
+  }
   return `dek:${generation}:wrapped`
 }
 
