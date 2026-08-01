@@ -4,14 +4,16 @@ export type DeployOutcome = {
   at: Date | null
 }
 
-const TS = /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)/
+// ISO 8601 timestamp pattern, shared between TS and OK to prevent drift
+const TS_PATTERN = '\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z'
+const TS = new RegExp(`(${TS_PATTERN})`)
 // Success banner must occupy the whole line (apart from optional timestamp and whitespace).
-// Anchored both ends to prevent false positives from logs quoting or echoing other scripts.
-const OK = /^\s*(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\s+)?===\s*Deploy OK:\s*([0-9a-f]{7,40})\s*===\s*$/i
-// Failure patterns anchor at start (optional timestamp + keyword) but not end, as real emitters have trailing text.
-// Word boundary after sha ensures it stops at transitions between word/non-word characters,
-// preventing the greedy match from running into the next word when delimiters are present.
-const FAILED = /(?:BUILD FAILED|HEALTH CHECK FAILED)\s+for\s+([0-9a-f]{7,40})\b/i
+// Both ends anchored to prevent false positives from logs quoting or echoing other scripts.
+const OK = new RegExp(`^\\s*(?:${TS_PATTERN}\\s+)?===\\s*Deploy OK:\\s*([0-9a-f]{7,40})\\s*===\\s*$`, 'i')
+// Failure pattern: match the keyword and sha. Do not anchor end-of-line (real emitters have trailing text).
+// Do not use regex lookahead/boundary to determine sha validity; instead check at runtime
+// to distinguish between certain failures (keyword matches) and ambiguous shas (runs into word chars).
+const FAILED = /(?:BUILD FAILED|HEALTH CHECK FAILED)\s+for\s+([0-9a-f]{7,40})/i
 
 export function parseDeployLog(text: string): DeployOutcome | null {
   const lines = text.split('\n').filter((l) => l.trim().length > 0)
@@ -38,10 +40,20 @@ export function parseDeployLog(text: string): DeployOutcome | null {
       // Capture group [1] is guaranteed to exist if the regex matches (has exactly one group)
       return { status: 'ok', sha: ok[1]!, at }
     }
-    const failed = FAILED.exec(line)
-    if (failed) {
-      // Capture group [1] is guaranteed to exist if the regex matches (has exactly one group)
-      return { status: 'failed', sha: failed[1]!, at }
+    const failedMatch = FAILED.exec(line)
+    if (failedMatch) {
+      // We are certain the deploy failed (keywords are unambiguous).
+      // But the sha might be ambiguous if it runs directly into another word.
+      // Check what character comes immediately after the captured sha.
+      const capturedSha = failedMatch[1]!
+      const endIndex = failedMatch.index + failedMatch[0].length
+      const nextChar = endIndex < line.length ? line[endIndex] : undefined
+      // If the next character is a word character (letter/digit/underscore), the sha boundary is ambiguous:
+      // we cannot tell if it's the end of a 7-char sha followed by a word, or part of a longer sha.
+      // Report the certain fact (failed) and admit the uncertain fact (sha: null).
+      const isAmbiguous = nextChar !== undefined && /[a-zA-Z0-9_]/.test(nextChar)
+      const sha = isAmbiguous ? null : capturedSha
+      return { status: 'failed', sha, at }
     }
   }
   // Non-empty but in no dialect we know. Say so rather than assume health.

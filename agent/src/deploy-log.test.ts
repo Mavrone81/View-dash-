@@ -54,14 +54,33 @@ describe('parseDeployLog', () => {
     expect(r).toMatchObject({ status: 'ok', sha: 'abc1234', at: null })
   })
 
-  // Defect 3: Failure sha capture must have word boundary to stop at proper delimiters.
-  it('does not over-capture when followed by hex-valid word prefix (with space)', () => {
-    // Real deployment logs have spaces/punctuation after the sha. When a word like 'deployed'
-    // (starting with hex letters 'de') follows the sha, the word boundary \b ensures we
-    // capture only the sha portion before the boundary, not including hex letters from the next word.
-    const r = parseDeployLog('2026-08-01T10:00:00Z  BUILD FAILED for abc1234 deployed; last-deployed stays at def5678')
-    // The space after 'abc1234' creates a word boundary, so \b matches there and prevents
-    // the capture from including 'deployed'. The sha is 'abc1234'.
+  // Defect 3: Failure sha capture must distinguish certain failures from ambiguous shas.
+  // Design principle: we are certain the deploy failed (keywords unambiguous).
+  // But the sha is ambiguous if it runs directly into word characters (could be bleed from next word).
+  // Return status: 'failed' in both cases, but sha: null when ambiguous.
+
+  it('returns failed with null sha when sha is ambiguously followed by word characters', () => {
+    // Input: 'abc1234deployed' — is it sha 'abc1234' + word 'deployed', or sha 'abc1234de' + word 'ployed'?
+    // No regex can determine this. Report the certain fact (failed) and admit the uncertainty (sha: null).
+    const r = parseDeployLog('BUILD FAILED for abc1234deployed')
+    expect(r).toMatchObject({ status: 'failed', sha: null })
+  })
+
+  it('returns failed with sha when sha is cleanly delimited by punctuation', () => {
+    // Unambiguous: semicolon clearly marks the sha boundary.
+    const r = parseDeployLog('2026-08-01T10:00:00Z  BUILD FAILED for abc1234; retry next tick')
+    expect(r).toMatchObject({ status: 'failed', sha: 'abc1234' })
+  })
+
+  it('returns failed with sha when sha is cleanly delimited by space', () => {
+    // Unambiguous: space clearly marks where the sha ends and the next word begins.
+    const r = parseDeployLog('BUILD FAILED for abc1234 deployed')
+    expect(r).toMatchObject({ status: 'failed', sha: 'abc1234' })
+  })
+
+  it('returns failed with sha for health check failure with clear delimiter', () => {
+    // Real-world format with clear boundaries.
+    const r = parseDeployLog('2026-08-01T10:00:00Z  HEALTH CHECK FAILED for abc1234 after 10 attempts; retry next tick')
     expect(r).toMatchObject({ status: 'failed', sha: 'abc1234' })
   })
 })
