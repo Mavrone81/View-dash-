@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { discoverSystems } from './docker.js'
+import { discoverSystems, toSummary } from './docker.js'
 
 const c = (project: string | null, state: string, health: string | null = null) =>
   ({ names: ['/x'], project, state, health })
@@ -29,5 +29,78 @@ describe('discoverSystems', () => {
 
   it('ignores containers with no compose project rather than inventing one', () => {
     expect(discoverSystems([c(null, 'running')])).toEqual([])
+  })
+
+  it('is degraded, not healthy, when a container is still starting its healthcheck', () => {
+    expect(discoverSystems([c('a', 'running', 'starting')])[0]!.health).toBe('degraded')
+  })
+
+  it('is degraded, not healthy, when a container health string is unrecognised', () => {
+    expect(discoverSystems([c('a', 'running', 'unknown')])[0]!.health).toBe('degraded')
+  })
+
+  it('treats non-running states (restarting/paused/created) the same as any other non-running container', () => {
+    expect(discoverSystems([c('a', 'running'), c('a', 'restarting')])[0]!.health).toBe('degraded')
+    expect(discoverSystems([c('a', 'paused'), c('a', 'paused')])[0]!.health).toBe('down')
+    expect(discoverSystems([c('a', 'created'), c('a', 'created')])[0]!.health).toBe('down')
+  })
+
+  it('returns systems sorted by key regardless of input order', () => {
+    const out = discoverSystems([c('zeta', 'running'), c('alpha', 'running'), c('mid', 'running')])
+    expect(out.map((s) => s.key)).toEqual(['alpha', 'mid', 'zeta'])
+  })
+})
+
+describe('toSummary', () => {
+  // `labels: null` means "omit the Labels key entirely" (a container with no compose
+  // labels at all), distinct from the default (a container labelled into 'alpha').
+  // Built conditionally because `exactOptionalPropertyTypes` forbids assigning
+  // `undefined` to an optional key -- the key must be absent, not present-as-undefined.
+  const raw = (status: string | undefined, labels: Record<string, string> | null = { 'com.docker.compose.project': 'alpha' }) => {
+    const out: { Names: string[]; State: string; Labels?: Record<string, string>; Status?: string } = {
+      Names: ['/x'],
+      State: 'running',
+    }
+    if (labels !== null) out.Labels = labels
+    if (status !== undefined) out.Status = status
+    return out
+  }
+
+  it('reports no healthcheck (null) when the Status has no parenthetical', () => {
+    expect(toSummary(raw('Up 2 hours')).health).toBeNull()
+  })
+
+  it('reports healthy when the Status says (healthy)', () => {
+    expect(toSummary(raw('Up 2 hours (healthy)')).health).toBe('healthy')
+  })
+
+  it('reports unhealthy when the Status says (unhealthy)', () => {
+    expect(toSummary(raw('Up 2 hours (unhealthy)')).health).toBe('unhealthy')
+  })
+
+  it('reports starting -- not null, not healthy -- when the Status says (health: starting)', () => {
+    expect(toSummary(raw('Up 2 hours (health: starting)')).health).toBe('starting')
+  })
+
+  it('reports unknown -- never null -- for a parenthetical it does not recognise', () => {
+    expect(toSummary(raw('Up 2 hours (some future docker phrasing)')).health).toBe('unknown')
+  })
+
+  it('reports null when Status is absent entirely', () => {
+    expect(toSummary(raw(undefined)).health).toBeNull()
+  })
+
+  it('reports project null when the compose project label is absent', () => {
+    expect(toSummary(raw('Up 2 hours', null)).project).toBeNull()
+  })
+
+  it('reports the compose project label when present', () => {
+    expect(toSummary(raw('Up 2 hours', { 'com.docker.compose.project': 'beta' })).project).toBe('beta')
+  })
+
+  it('passes Names and State through unchanged', () => {
+    const out = toSummary({ Names: ['/beta-web-1'], State: 'exited', Status: 'Exited (0) 3 minutes ago' })
+    expect(out.names).toEqual(['/beta-web-1'])
+    expect(out.state).toBe('exited')
   })
 })

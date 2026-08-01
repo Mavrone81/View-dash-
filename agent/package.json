@@ -1,5 +1,8 @@
 {
   "name": "@bevora-ops/agent",
   "version": "0.0.0",
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "@bevora-ops/shared": "0.0.0"
+  }
 }
