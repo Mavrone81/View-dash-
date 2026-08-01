@@ -49,8 +49,32 @@ export function open(sealed: string, aad: string, dek: Buffer): string {
   return Buffer.concat([d.update(Buffer.from(ct, 'base64')), d.final()]).toString('utf8')
 }
 
-export function unwrapDek(wrapped: string, kek: Buffer): Buffer {
-  const dek = Buffer.from(open(wrapped, 'dek:0:wrapped', kek), 'base64')
+// The single source of truth for the DEK-wrapping AAD. wrapDek and unwrapDek
+// both derive it from this one expression so they can never drift apart — if
+// they ever disagreed, every wrapped key would become permanently
+// undecryptable. Binding the generation into the AAD (rather than a constant
+// like `dek:0:wrapped`) means a DEK wrapped under generation N cannot be
+// mistaken for generation N-1's: without this, an attacker or a bad restore
+// could silently roll the system back to a retired key generation, and
+// nothing would signal it because the ciphertext would authenticate
+// perfectly against the wrong generation.
+function dekAad(generation: number): string {
+  return `dek:${generation}:wrapped`
+}
+
+/** Wraps a 32-byte DEK under the KEK, binding it to its key generation. */
+export function wrapDek(dek: Buffer, generation: number, kek: Buffer): string {
+  if (dek.length !== DEK_LENGTH) throw new Error('invalid DEK: expected 32 bytes')
+  return seal(dek.toString('base64'), dekAad(generation), kek)
+}
+
+/**
+ * Unwraps a DEK sealed under `generation`. Throws if the wrapped value was
+ * sealed under a different generation, the wrong KEK, or is not 32 bytes once
+ * unwrapped — see the rollback-protection note on `dekAad` above.
+ */
+export function unwrapDek(wrapped: string, generation: number, kek: Buffer): Buffer {
+  const dek = Buffer.from(open(wrapped, dekAad(generation), kek), 'base64')
   if (dek.length !== DEK_LENGTH) throw new Error('invalid unwrapped key: expected a 32-byte DEK')
   return dek
 }

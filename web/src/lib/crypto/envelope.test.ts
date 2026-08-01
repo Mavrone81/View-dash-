@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { randomBytes } from 'node:crypto'
-import { seal, open, unwrapDek } from './envelope.js'
+import { seal, open, wrapDek, unwrapDek } from './envelope.js'
 
 const dek = randomBytes(32)
 
@@ -69,23 +69,52 @@ describe('envelope', () => {
     expect(() => open('', 'a:1:b', dek)).toThrow()
   })
 
-  it('unwraps a DEK sealed by the KEK', () => {
+  it('unwraps a DEK sealed by the KEK at the expected generation', () => {
     const kek = randomBytes(32)
     const rawDek = randomBytes(32)
-    const wrapped = seal(rawDek.toString('base64'), 'dek:0:wrapped', kek)
-    expect(unwrapDek(wrapped, kek)).toEqual(rawDek)
+    const wrapped = wrapDek(rawDek, 1, kek)
+    expect(unwrapDek(wrapped, 1, kek)).toEqual(rawDek)
   })
 
   it('refuses to unwrap a DEK with the wrong KEK', () => {
     const kek = randomBytes(32)
     const rawDek = randomBytes(32)
-    const wrapped = seal(rawDek.toString('base64'), 'dek:0:wrapped', kek)
-    expect(() => unwrapDek(wrapped, randomBytes(32))).toThrow()
+    const wrapped = wrapDek(rawDek, 1, kek)
+    expect(() => unwrapDek(wrapped, 1, randomBytes(32))).toThrow()
   })
 
   it('refuses to unwrap a value that is not a 32-byte key', () => {
     const kek = randomBytes(32)
-    const wrapped = seal('too-short', 'dek:0:wrapped', kek)
-    expect(() => unwrapDek(wrapped, kek)).toThrow()
+    const wrapped = seal('too-short', 'dek:1:wrapped', kek)
+    expect(() => unwrapDek(wrapped, 1, kek)).toThrow()
+  })
+
+  it('refuses a DEK wrapped at generation 1 when generation 2 is expected (rollback protection)', () => {
+    const kek = randomBytes(32)
+    const rawDek = randomBytes(32)
+    const wrapped = wrapDek(rawDek, 1, kek)
+    // This is the case that matters: without generation binding, a stale or
+    // rolled-back wrapped key would authenticate perfectly and silently roll
+    // the system back to a retired key generation.
+    expect(() => unwrapDek(wrapped, 2, kek)).toThrow()
+  })
+
+  it('refuses a DEK wrapped at generation 2 when generation 1 is expected', () => {
+    const kek = randomBytes(32)
+    const rawDek = randomBytes(32)
+    const wrapped = wrapDek(rawDek, 2, kek)
+    expect(() => unwrapDek(wrapped, 1, kek)).toThrow()
+  })
+
+  it('refuses to wrap a key that is not 32 bytes', () => {
+    const kek = randomBytes(32)
+    expect(() => wrapDek(randomBytes(16), 1, kek)).toThrow()
+  })
+
+  it('round-trips a key through wrapDek/unwrapDek unchanged', () => {
+    const kek = randomBytes(32)
+    const rawDek = randomBytes(32)
+    const wrapped = wrapDek(rawDek, 7, kek)
+    expect(unwrapDek(wrapped, 7, kek)).toEqual(rawDek)
   })
 })
