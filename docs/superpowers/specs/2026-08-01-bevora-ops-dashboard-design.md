@@ -3,7 +3,9 @@
 **Date:** 2026-08-01
 **Status:** Approved in brainstorming — pending implementation plan
 
-> **Repo hygiene (binding constraint).** This repository is **public**. It must contain **no IP addresses, no hostnames or domains, and no names of the systems it monitors** — those belong to several different businesses and are not ours to disclose. Every environment-specific value is configuration supplied at runtime, never a literal in code, tests, fixtures or docs. §10 makes this a CI gate rather than a good intention. Real inventory lives in the operator's private notes and in the deployed database.
+> **Repo hygiene (binding constraint).** This repository is **public** (or will be). It must contain **no IP addresses, no hostnames or domains, and no names of the systems it monitors** — those belong to several different businesses and are not ours to disclose. Every environment-specific value is configuration supplied at runtime, never a literal in code, tests, fixtures or docs. §10 makes this a CI gate rather than a good intention. Real inventory lives in the operator's private notes and in the deployed database.
+>
+> **The constraint holds from commit #1, not from the day the repo flips public.** Git history is permanent: an address committed while private is still readable after the repo opens, and the only remedy is rewriting history on a repo others may already have cloned. "Sanitise it later" is not available.
 
 ## 1 · Problem
 
@@ -25,6 +27,24 @@ Three gaps follow. **17 of 19 stacks have no backup.** There is **no alerting wh
 One authenticated page answering, for every system on the host: **is it up, what version is live, when did it deploy, what changed, and is it protected** — plus an audited control plane to act on the answer.
 
 **Non-goals (YAGNI):** log search/aggregation, APM/tracing, metric history beyond ~7 days, per-container sparklines, per-tenant logins for other developers.
+
+## 2.1 · Design principles — robust and expandable
+
+The system exists to watch a portfolio that **keeps growing**. These are binding constraints, not aspirations; where they conflict with a quicker build, they win.
+
+**Expandable**
+
+- **Discovery, not enumeration.** Systems are *discovered* — from container-runtime project labels, a deploy-log path glob, the proxy config, the ACME client's inventory. Adding the 20th stack requires **no code change and no config edit**; it simply appears. Any design that needs a hand-maintained list of systems is rejected.
+- **Hosts are data, not code.** A host is a first-class row. Enrolling another one is a runtime operation — mint a token, start the agent — never a deploy. Nothing special-cases the first host.
+- **Adapters at every external boundary.** Forge (GitHub today, GitLab later), notifier (email / chat), and deploy-log dialects each sit behind one interface with swappable implementations.
+- **Scale target: the architecture must not change between 19 systems and ~200.** Bounded probe concurrency, indexed queries, paginated feeds, no per-row N+1.
+
+**Robust**
+
+- **Every external input is untrusted.** 18 deployers means up to 18 log dialects, written by different hands at different times. Each gets a parser config with a generic fallback, and an explicit `unknown format` state. **A confident wrong answer is worse than an admitted gap.**
+- **Partial failure is contained.** One unreachable host, one unparseable log, one forge outage degrades *that row* — the page always renders.
+- **`unknown` is a first-class state, never rendered as healthy** (see §9).
+- **Disposable by design.** The droplet is rebuildable from repo + secrets alone; the only durable state is Postgres, which is backed up. Agents re-enrol. Nothing is hand-configured on a box in a way that does not exist in code — so any node can be destroyed and recreated rather than nursed.
 
 ## 3 · Decisions locked (2026-08-01)
 
@@ -64,7 +84,7 @@ Load vs core count, RAM available, disk, swap, uptime, containers up/total. At s
 
 - **Live deploy feed** across all 18 deployers: timestamp, system, sha, outcome (deploy OK / build failed / health-check failed / self-healed), duration.
 - **Stuck-deploy detection** — a failure sentinel present, or local HEAD ahead of the last-deployed sha beyond a threshold. This generalises the detector for the four-hour outage to all 18 deployers, most of which have no self-heal logic at all.
-- **CI runs** from the forge API: status, conclusion, duration, run link. ("Forge" is GitHub or GitLab — deliberately unfixed, because the repo host is still to be supplied (§13), and both are behind one adapter interface either way.)
+- **CI runs** from the forge API: status, conclusion, duration, run link. The first implementation is GitHub; GitLab is live elsewhere in the estate, so both sit behind one adapter interface (§2.1).
 
 ### 4.4 Supporting panels
 
@@ -139,8 +159,8 @@ Two rules held throughout, both learned here: **every authz rule gets a test ass
 
 ## 13 · Needed from the operator
 
-1. **DigitalOcean API token** — `doctl` is installed but unauthenticated; no droplet can be created without it.
-2. **The repo URL.**
+1. **DigitalOcean API token** — `doctl` is installed but unauthenticated; no droplet can be created without it. **This is the hard blocker.**
+2. ~~The repo URL~~ — supplied 2026-08-01.
 3. **DNS:** the dashboard hostname must point at the **new droplet**, not the monitored host.
 4. **Notification channel** for alerts.
 
