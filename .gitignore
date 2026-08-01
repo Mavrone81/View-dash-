@@ -1,0 +1,12 @@
+.superpowers/
+node_modules
+dist
+*.tsbuildinfo
+.next
+.env
+coverage
+
+# Real secret material for the deployment in docker-compose.yml
+# (secrets/postgres_password, secrets/kek) -- generated per-deployment by
+# an operator (see deploy/README.md), never committed.
+/secrets/

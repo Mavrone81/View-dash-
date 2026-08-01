@@ -1,0 +1,152 @@
+# Bevora Ops dashboard -- deployment topology for the dashboard droplet.
+# See deploy/README.md for the full operator runbook (secrets, agent
+# enrolment, the SSH tunnel to reach `web`). This file only covers what
+# runs ON the dashboard host: `db`, `web`, and `ingest`. The `agent` that
+# reports INTO `ingest` runs on each MONITORED host instead, as a systemd
+# unit -- see deploy/agent.service.
+#
+# `web` and `ingest` run the SAME image (built from deploy/Dockerfile) and
+# differ only in `command:`: `web` runs the image's production Next.js
+# server (`node web/server.js`, spelled out explicitly below -- see that
+# service's own comment for why); `ingest` runs the bundled standalone
+# WebSocket listener instead (`npm run build:ingest` ->
+# web/dist/ingest-server.mjs -- see scripts/build/bundle-ingest.mjs for
+# why that needs its own build step, and web/src/server/ingest-server.ts
+# for why it cannot be a Next.js route).
+#
+# Set GHCR_OWNER and (optionally) TAG in the shell environment, or in a
+# `.env.deploy` file sourced before `docker compose up`, to select the
+# image -- see deploy/README.md.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: bevops-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bevops
+      POSTGRES_DB: bevops
+      # File-mounted, never a plaintext value: Postgres reads the password
+      # from the path this points at (a Docker secret, declared below) --
+      # never from an env literal, which would sit in `docker inspect`
+      # output and in this file's own history if it were written here
+      # directly.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - bevops_pgdata:/var/lib/postgresql/data
+    # NO host port, at all: a database needs none. `web` and `ingest` reach
+    # it at `db:5432` over this compose stack's own internal network, which
+    # is never published to the host or the internet. Debug with
+    # `docker compose exec db psql -U bevops -d bevops` -- never by opening
+    # a port to make a GUI client's life easier.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bevops -d bevops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    image: ghcr.io/${GHCR_OWNER}/bevora-ops:${TAG:-latest}
+    container_name: bevops-web
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    # NO `env_file:`. There was one (`env_file: .env`), and it made
+    # `docker compose config` -- the runbook's own first command -- exit 1
+    # on a clean checkout, because `.env` is git-ignored and nothing in
+    # this repo creates it. It only ever appeared to work because a stray
+    # local file happened to exist during testing. Nothing in it was
+    # consumed either way: every environment variable these containers
+    # actually read is accounted for elsewhere -- DATABASE_URL is built at
+    # container start by deploy/with-database-url.sh from the mounted
+    # secret, NODE_ENV is set in deploy/Dockerfile, and `ingest`'s
+    # INGEST_SERVER_HOST is set inline on that service below. Adding an
+    # `.env.example` to copy would have re-introduced a file whose only
+    # purpose is to satisfy a directive that reads nothing.
+    secrets: [postgres_password, kek]
+    volumes:
+      # Read-only: this container only ever needs to RUN the script, never
+      # write to it.
+      - ./deploy/with-database-url.sh:/deploy/with-database-url.sh:ro
+    # Prisma's schema (web/prisma/schema.prisma) reads its connection
+    # string via `env("DATABASE_URL")`, so a real process environment
+    # variable is unavoidable at that one point -- but it is never a
+    # plaintext value in `.env`, this file, or any `environment:` block.
+    # `with-database-url.sh` constructs it at container start from the
+    # `postgres_password` secret file's contents and execs the real
+    # command as a child that inherits it. See that script for the full
+    # mechanism.
+    #
+    # `command:` is spelled out explicitly (matching deploy/Dockerfile's
+    # own CMD) even though it duplicates the image's default -- overriding
+    # `entrypoint:` WITHOUT also setting `command:` does not fall back to
+    # the image's CMD the way it might look like it should: Docker clears
+    # CMD to empty whenever entrypoint is overridden and no command is
+    # given, so `with-database-url.sh`'s `exec "$@"` would run with no
+    # arguments at all. Confirmed the hard way: an earlier version of this
+    # file left `command:` unset here, and the container exited 0 with no
+    # output the instant `exec "$@"` no-op'd on an empty argument list --
+    # `restart: unless-stopped` then looped it forever, silently.
+    entrypoint: ["/bin/sh", "/deploy/with-database-url.sh"]
+    command: ["node", "web/server.js"]
+    # Loopback ONLY, for the whole of slice 1: authentication does not ship
+    # until slice 3 (see this slice's self-review), so this UI must never
+    # be reachable from the internet -- only from an operator's own
+    # machine, over `ssh -L 3000:127.0.0.1:3000 <host>`. See
+    # deploy/README.md.
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  ingest:
+    image: ghcr.io/${GHCR_OWNER}/bevora-ops:${TAG:-latest}
+    container_name: bevops-ingest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    # No `env_file:` here either -- see the `web` service above for why.
+    secrets: [postgres_password]
+    volumes:
+      - ./deploy/with-database-url.sh:/deploy/with-database-url.sh:ro
+    entrypoint: ["/bin/sh", "/deploy/with-database-url.sh"]
+    # The one respect in which this service differs from `web`: it runs
+    # the bundled standalone WebSocket listener instead of the image's
+    # default Next.js command. Same image, different command.
+    command: ["node", "web/dist/ingest-server.mjs"]
+    # web/src/server/ingest-server-config.ts defaults INGEST_SERVER_HOST to
+    # 127.0.0.1 DELIBERATELY, so that binding every interface is always a
+    # decision made HERE, in a reviewable deployment file, never a silent
+    # code default (see that file's own comment). This is that decision,
+    # and it is NOT optional the way an earlier version of this file
+    # framed it ("only needed for a sibling-container proxy topology"):
+    # confirmed the hard way, by actually publishing this port and curling
+    # it. Docker's `ports:` publishing always forwards to the CONTAINER'S
+    # OWN routable (bridge-network) address, never to its loopback --
+    # `docker exec`ing in and hitting 127.0.0.1:4100 worked fine while the
+    # HOST-published port below got "empty reply from server" the entire
+    # time this was left at the code default. So `0.0.0.0` here is
+    # required for this listener to be reachable through ANY Docker
+    # networking path at all -- host-published port (this file's
+    # topology) or a sibling container on a shared network alike -- not
+    # just the sibling-container case. This is still not the same as being
+    # reachable from the internet: that is controlled entirely by the
+    # `ports:` line below (loopback-only) and by there being no other
+    # network attached to this service that a public-facing proxy sits on.
+    environment:
+      INGEST_SERVER_HOST: "0.0.0.0"
+    ports:
+      - "127.0.0.1:4100:4100"
+
+secrets:
+  # Both files are created by the operator before `docker compose up` --
+  # see deploy/README.md -- and are git-ignored (see .gitignore); nothing
+  # under ./secrets/ is ever committed to this repo.
+  postgres_password:
+    file: ./secrets/postgres_password
+  kek:
+    file: ./secrets/kek
+
+volumes:
+  bevops_pgdata:

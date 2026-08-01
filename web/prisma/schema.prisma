@@ -1,0 +1,70 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Host {
+  id         String           @id @default(uuid())
+  name       String           @unique
+  lastSeenAt DateTime?
+  createdAt  DateTime         @default(now())
+  systems    System[]
+  enrolments AgentEnrolment[]
+}
+
+model System {
+  id           String               @id @default(uuid())
+  hostId       String
+  host         Host                 @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  key          String
+  displayName  String
+  firstSeenAt  DateTime             @default(now())
+  observations SystemObservation[]
+
+  // Unique per host, not globally: two hosts may each run a system of the
+  // same name, and enrolling the second must not collide with the first.
+  @@unique([hostId, key])
+}
+
+model SystemObservation {
+  id                String    @id @default(uuid())
+  systemId          String
+  system            System    @relation(fields: [systemId], references: [id], onDelete: Cascade)
+  // Two timestamps exist on purpose, and they measure different things:
+  // `observedAt` is CLAIMED by the reporting agent (from its own clock, at
+  // collection time) — never trust it for staleness, a wrong or malicious
+  // agent clock can make it say anything, including a time in the future.
+  // `receivedAt` is set by the DATABASE's own `now()` and cannot be
+  // influenced by the caller under any circumstances — it is the only
+  // timestamp a staleness calculation (now - receivedAt) may trust. Do not
+  // delete either as "redundant": `observedAt` stays for diagnosing a
+  // skewed host clock; `receivedAt` is the safety-critical one.
+  observedAt        DateTime  @default(now())
+  receivedAt        DateTime  @default(now())
+  health            String
+  containersTotal   Int
+  containersRunning Int
+  deployedSha       String?
+  deployedSubject   String?
+  deployedAt        DateTime?
+  driftCommits      Int?
+
+  // Rows are selected as "latest observation per system" ordered by
+  // receivedAt (the trusted, server-set clock), never observedAt (the
+  // untrusted, agent-claimed clock) — see the comment above. The index must
+  // match that access pattern, or every query pays for a sort at read time.
+  @@index([systemId, receivedAt])
+}
+
+model AgentEnrolment {
+  id        String    @id @default(uuid())
+  hostId    String
+  host      Host      @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  createdAt DateTime  @default(now())
+  revokedAt DateTime?
+}

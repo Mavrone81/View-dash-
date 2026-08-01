@@ -1,0 +1,25 @@
+{
+  "name": "bevora-ops",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "agent",
+    "web"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -b",
+    "leakage": "node scripts/ci/assert-no-environment-leakage.mjs",
+    "build:agent": "node scripts/build/bundle-agent.mjs",
+    "build:ingest": "node scripts/build/bundle-ingest.mjs",
+    "build:enrol": "node scripts/build/bundle-enrol.mjs",
+    "enrol": "npm run build:enrol --silent && node web/dist/enrol-cli.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3",
+    "vitest": "^4.1.10"
+  }
+}
