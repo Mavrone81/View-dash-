@@ -1,0 +1,57 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Host {
+  id         String           @id @default(uuid())
+  name       String           @unique
+  lastSeenAt DateTime?
+  createdAt  DateTime         @default(now())
+  systems    System[]
+  enrolments AgentEnrolment[]
+}
+
+model System {
+  id           String               @id @default(uuid())
+  hostId       String
+  host         Host                 @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  key          String
+  displayName  String
+  firstSeenAt  DateTime             @default(now())
+  observations SystemObservation[]
+
+  // Unique per host, not globally: two hosts may each run a system of the
+  // same name, and enrolling the second must not collide with the first.
+  @@unique([hostId, key])
+}
+
+model SystemObservation {
+  id                String    @id @default(uuid())
+  systemId          String
+  system            System    @relation(fields: [systemId], references: [id], onDelete: Cascade)
+  observedAt        DateTime  @default(now())
+  health            String
+  containersTotal   Int
+  containersRunning Int
+  deployedSha       String?
+  deployedSubject   String?
+  deployedAt        DateTime?
+  driftCommits      Int?
+
+  @@index([systemId, observedAt])
+}
+
+model AgentEnrolment {
+  id           String    @id @default(uuid())
+  hostId       String
+  host         Host      @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  tokenHash    String    @unique
+  secretSealed String
+  createdAt    DateTime  @default(now())
+  revokedAt    DateTime?
+}

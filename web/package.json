@@ -2,7 +2,14 @@
   "name": "@bevora-ops/web",
   "version": "0.0.0",
   "type": "module",
+  "scripts": {
+    "postinstall": "prisma generate"
+  },
   "devDependencies": {
-    "@types/node": "22.20.1"
+    "@types/node": "22.20.1",
+    "prisma": "6.19.3"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3"
   }
 }
