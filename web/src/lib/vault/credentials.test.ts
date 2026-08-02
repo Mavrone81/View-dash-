@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { Prisma } from '@prisma/client'
 import { prisma } from '../db.js'
 import { lockSession } from './session.js'
 import { createVault, unlockWithPassphrase } from './vault.js'
@@ -192,6 +193,78 @@ describe('credentials', () => {
     await removeCredential(id)
     expect(await prisma.credential.count()).toBe(0)
     expect(await prisma.credentialAccess.count()).toBe(0)
+  })
+
+  // --- Task 10 / finding I4: a credential and its 'create' audit row are
+  // written atomically. Before the fix the audit write was a second,
+  // unguarded statement AFTER the credential row had already committed, so a
+  // database blip during it made addCredential throw while the credential
+  // existed. The operator is told the save failed, retypes the production
+  // password, submits again -- and two rows now hold it, one of them invisible
+  // to their mental model, with no audit record of either creation. ---
+  describe('the credential and its create-audit row are written atomically (I4)', () => {
+    it('writes exactly one create audit row for a successful add', async () => {
+      const id = await addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
+      const audit = await prisma.credentialAccess.findMany({ where: { credentialId: id } })
+      expect(audit).toHaveLength(1)
+      expect(audit[0]?.action).toBe('create')
+    })
+
+    it('persists NO credential when the create audit write fails', async () => {
+      // The injection runs the REAL transaction and fails only the audit
+      // write inside it, so the rollback under test is Postgres's own, not a
+      // simulation of one. `realTransaction` is captured before the spy
+      // replaces the property, so the mock implementation can still reach the
+      // genuine implementation.
+      const realTransaction = prisma.$transaction.bind(prisma)
+      // The SAME failure, injected at the top level too, so that a
+      // non-transactional implementation reproduces the original defect
+      // exactly rather than merely leaving this spy unused: the audit write
+      // rejects, addCredential throws, and the credential row survives. With
+      // the fix in place this spy is never reached (the audit write goes
+      // through `tx`), and the proxy below is what fails instead.
+      const flatAuditSpy = vi.spyOn(prisma.credentialAccess, 'create').mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError("Can't reach database server", {
+          code: 'P1001',
+          clientVersion: 'test',
+        }),
+      )
+      const spy = vi
+        .spyOn(prisma, '$transaction')
+        .mockImplementationOnce((run: unknown) =>
+          realTransaction(async (tx) => {
+            const failingAudit = new Proxy(tx, {
+              get(target, prop, receiver) {
+                if (prop === 'credentialAccess') {
+                  return {
+                    create: () =>
+                      Promise.reject(
+                        new Prisma.PrismaClientKnownRequestError("Can't reach database server", {
+                          code: 'P1001',
+                          clientVersion: 'test',
+                        }),
+                      ),
+                  }
+                }
+                return Reflect.get(target, prop, receiver)
+              },
+            })
+            return (run as (tx: unknown) => Promise<unknown>)(failingAudit)
+          }),
+        )
+      try {
+        await expect(
+          addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' }),
+        ).rejects.toThrow()
+      } finally {
+        spy.mockRestore()
+        flatAuditSpy.mockRestore()
+      }
+      // The whole point: the failure the caller was told about is TRUE. A
+      // retry therefore cannot produce a second row holding the same secret.
+      expect(await prisma.credential.count()).toBe(0)
+      expect(await prisma.credentialAccess.count()).toBe(0)
+    })
   })
 
   it('never persists a credential row without its sealed secret', async () => {

@@ -63,19 +63,41 @@ export async function addCredential(input: {
   // on every reveal forever, since there is no plaintext to recover it from.
   const id = randomUUID()
   const sealed = seal(input.secret, aadFor(id), key)
-  await prisma.credential.create({
-    data: {
-      id,
-      label: input.label,
-      username: input.username,
-      secretSealed: sealed,
-      notes: input.notes ?? null,
-      hostId: input.hostId ?? null,
-      systemKey: input.systemKey ?? null,
-    },
-    select: { id: true },
+  // ONE transaction, deliberately -- and deliberately NOT the swallow that
+  // revealCredential uses for its own audit writes. The two situations look
+  // alike and are not:
+  //
+  // In revealCredential the fact is already established and outside this
+  // code's gift: the vault IS locked, the ciphertext DID fail to
+  // authenticate. A failed audit write cannot make those untrue, so
+  // swallowing it and reporting the real fact is the only honest option --
+  // replacing it with an unrelated database error would misreport a security
+  // event.
+  //
+  // Here the fact is still ours to decide. Nothing is established until this
+  // function says so, and the caller is holding the plaintext they just
+  // typed, so a genuine rollback costs them one retry and nothing else.
+  // Swallowing instead would leave an UNAUDITED credential in an audited
+  // vault -- design spec section 7 makes CredentialAccess the record of
+  // every 'create' -- and, worse, would report success for a row whose
+  // creation nothing witnessed. Rolling back makes the failure the operator
+  // is shown TRUE, which is what stops the retry from silently storing a
+  // second copy of the same production password.
+  await prisma.$transaction(async (tx) => {
+    await tx.credential.create({
+      data: {
+        id,
+        label: input.label,
+        username: input.username,
+        secretSealed: sealed,
+        notes: input.notes ?? null,
+        hostId: input.hostId ?? null,
+        systemKey: input.systemKey ?? null,
+      },
+      select: { id: true },
+    })
+    await tx.credentialAccess.create({ data: { credentialId: id, action: 'create' } })
   })
-  await prisma.credentialAccess.create({ data: { credentialId: id, action: 'create' } })
   return id
 }
 
