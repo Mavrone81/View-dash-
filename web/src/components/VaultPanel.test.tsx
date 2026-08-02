@@ -925,6 +925,15 @@ describe('VaultPanel', () => {
       expect(screen.queryByTestId('recreate-vault')).toBeNull()
     })
 
+    // HONEST LABEL, because the distinction matters to whoever reads this
+    // next: this test survived every mutation tried against the warning's
+    // conditions, because the uninitialised branch returns before the warning
+    // is ever reached -- so it does NOT discriminate on that logic. It is
+    // kept, rather than deleted as a test that cannot fail, because it does
+    // guard a plausible and specific regression: moving the warning ABOVE the
+    // uninitialised early return, which would tell an operator with no vault
+    // at all that their non-existent recovery key was never confirmed. That
+    // is a branch-ordering claim, not a behavioural one.
     it('says nothing when there is no vault yet -- there is nothing to have acknowledged', () => {
       render(<VaultPanel initialised={false} unlocked={false} credentials={[]} />)
       expect(screen.queryByText(/nobody ever confirmed storing/i)).toBeNull()
@@ -1039,6 +1048,64 @@ describe('VaultPanel', () => {
         expect(screen.getByText(/no longer possible/i)).toBeTruthy()
         expect(screen.queryByTestId('recreate-vault')).toBeNull()
       })
+    })
+  })
+
+  // --- Round 3: the page must offer exactly what the server allows -- zero
+  // credentials AND (unacknowledged OR unlocked) -- neither offering what
+  // would be refused nor hiding what is permitted. The refusal itself lives
+  // in `recreateVault`'s transaction; these only check the page agrees with
+  // it. ---
+  describe('the recreate offer follows the server rule (C1 round 3)', () => {
+    it('offers key replacement on an ACKNOWLEDGED, empty, UNLOCKED vault -- the way back for a mis-click', () => {
+      render(<VaultPanel initialised unlocked credentials={[]} recoveryKeyAcknowledged />)
+      // No warning: nothing is wrong with this vault.
+      expect(screen.queryByText(/nobody ever confirmed storing/i)).toBeNull()
+      // But the allowance is reachable, because a control nobody can see is
+      // not an escape hatch.
+      expect(screen.getByTestId('recreate-vault')).toBeTruthy()
+    })
+
+    it('does NOT offer it on an acknowledged, empty, LOCKED vault -- the server would refuse', () => {
+      render(<VaultPanel initialised unlocked={false} credentials={[]} recoveryKeyAcknowledged />)
+      expect(screen.queryByTestId('recreate-vault')).toBeNull()
+    })
+
+    it('does NOT offer it on an acknowledged vault that holds a credential, even unlocked', () => {
+      render(<VaultPanel initialised unlocked credentials={[cred()]} recoveryKeyAcknowledged />)
+      expect(screen.queryByTestId('recreate-vault')).toBeNull()
+    })
+
+    it('still offers it on an UNACKNOWLEDGED, empty, locked vault -- no proof is demanded on the remedy path', () => {
+      render(<VaultPanel initialised unlocked={false} credentials={[]} recoveryKeyAcknowledged={false} />)
+      expect(screen.getByTestId('recreate-vault')).toBeTruthy()
+    })
+
+    it('the acknowledged offer is the SAME two-step control, not a one-click one', () => {
+      render(<VaultPanel initialised unlocked credentials={[]} recoveryKeyAcknowledged />)
+
+      fireEvent.click(screen.getByTestId('recreate-vault'))
+
+      expect(recreateVaultAction).not.toHaveBeenCalled()
+      expect(screen.getByTestId('confirm-recreate')).toBeTruthy()
+      expect(screen.getByText(/no undo/i)).toBeTruthy()
+    })
+
+    it('shows the server’s refusal when it disagrees, rather than swallowing it', async () => {
+      vi.mocked(recreateVaultAction).mockResolvedValue({
+        ok: false,
+        message:
+          'This vault’s recovery key was confirmed as stored, so recreating it would silently invalidate a copy that may be sitting in a drawer. Unlock the vault first if you really mean to replace it.',
+      })
+      render(<VaultPanel initialised unlocked credentials={[]} recoveryKeyAcknowledged />)
+
+      fireEvent.click(screen.getByTestId('recreate-vault'))
+      fireEvent.change(screen.getByLabelText(/^new vault passphrase$/i), {
+        target: { value: 'a brand new passphrase' },
+      })
+      fireEvent.click(screen.getByTestId('confirm-recreate'))
+
+      expect(await screen.findByText(/unlock the vault first/i)).toBeTruthy()
     })
   })
 

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { prisma } from '../db.js'
-import { lockSession, isUnlocked, currentVaultKey } from './session.js'
+import { lockSession, unlockSession, isUnlocked, currentVaultKey } from './session.js'
 import {
   createVault,
   isInitialised,
@@ -11,6 +11,7 @@ import {
   acknowledgeRecoveryKey,
   recreateVault,
   VaultNotEmptyError,
+  RecoveryKeyStillValidError,
 } from './vault.js'
 import { addCredential, revealCredential } from './credentials.js'
 
@@ -187,6 +188,82 @@ describe('recreating a vault whose recovery key was never stored', () => {
     await createVault('right passphrase')
     await addCredential({ label: 'orphan', username: 'operator', secret: 'hunter2' })
     await expect(recreateVault('a different passphrase')).rejects.toBeInstanceOf(VaultNotEmptyError)
+  })
+
+  // --- Task 10 round 3. Emptiness alone was not enough. An empty vault has
+  // nothing to destroy EXCEPT the thing recreation always destroys: the vault
+  // key, and with it a recovery key the operator may already have printed and
+  // filed. Create, print, acknowledge, get called away before storing
+  // anything, and the vault is acknowledged, empty and correct -- at which
+  // point anything that could reach these unauthenticated server actions
+  // could have replaced the vault key and left the printed copy silently
+  // dead, to be discovered on the day it was needed. That is the exact
+  // failure the acknowledgement exists to remove, so leaving an
+  // unauthenticated way to undo it would have been building the mitigation
+  // and shipping its own bypass.
+  //
+  // Rule: zero credentials AND (unacknowledged OR unlocked).
+  describe('who may recreate an empty vault', () => {
+    it('ALLOWS it while the recovery key was never acknowledged, even with the vault locked', async () => {
+      await createVault('right passphrase')
+      lockSession()
+      // No passphrase proof demanded, on purpose: this is the remedy path,
+      // and the operator has a passphrase -- what they lack is a recovery
+      // key, so gating on the passphrase would gate on the wrong thing.
+      await expect(recreateVault('a different passphrase')).resolves.toBeDefined()
+    })
+
+    it('ALLOWS it when the key IS acknowledged but the session is unlocked', async () => {
+      await createVault('right passphrase')
+      await acknowledgeRecoveryKey()
+      // createVault leaves the session unlocked; assert that rather than
+      // assume it, since the whole case turns on it.
+      expect(isUnlocked()).toBe(true)
+      await expect(recreateVault('a different passphrase')).resolves.toBeDefined()
+    })
+
+    it('REFUSES when the key is acknowledged and the vault is locked, and changes nothing', async () => {
+      const { recoveryKey } = await createVault('right passphrase')
+      await acknowledgeRecoveryKey()
+      const before = await prisma.vaultConfig.findFirstOrThrow()
+      lockSession()
+
+      await expect(recreateVault('a different passphrase')).rejects.toBeInstanceOf(
+        RecoveryKeyStillValidError,
+      )
+
+      // The row is byte-for-byte the one that was there, and -- the fact that
+      // actually matters to the operator -- the recovery key in their drawer
+      // still works.
+      const after = await prisma.vaultConfig.findFirstOrThrow()
+      expect(after.wrappedByRecovery).toBe(before.wrappedByRecovery)
+      expect(after.wrappedByPassphrase).toBe(before.wrappedByPassphrase)
+      expect(await unlockWithRecoveryKey(recoveryKey)).toBe(true)
+    })
+
+    it('refuses on a session whose deadline has passed, not merely on an explicit lock', async () => {
+      await createVault('right passphrase')
+      await acknowledgeRecoveryKey()
+      // An expired session is locked, and `isUnlocked()` applies that expiry
+      // itself -- so this must be refused for the same reason an explicit
+      // lock is, without recreateVault knowing anything about deadlines.
+      unlockSession(Buffer.alloc(32), () => new Date(Date.now() - 60_000), 1)
+      expect(isUnlocked()).toBe(false)
+      await expect(recreateVault('a different passphrase')).rejects.toBeInstanceOf(
+        RecoveryKeyStillValidError,
+      )
+    })
+
+    it('reports the not-empty refusal, not the acknowledgement one, when BOTH would apply', async () => {
+      await createVault('right passphrase')
+      await addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
+      await acknowledgeRecoveryKey()
+      lockSession()
+      // Stored credentials are the graver fact and the one with no way
+      // around it; reporting "unlock and retry" here would send the operator
+      // to unlock and hit a different wall.
+      await expect(recreateVault('a different passphrase')).rejects.toBeInstanceOf(VaultNotEmptyError)
+    })
   })
 
   it('allows recreation again once the last credential is gone', async () => {

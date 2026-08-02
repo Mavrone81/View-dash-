@@ -468,6 +468,46 @@ describe('vault actions', () => {
       }
     })
 
+    // --- Round 3: emptiness alone was not authorization. Full rule: zero
+    // credentials AND (unacknowledged OR unlocked). All three cases at the
+    // ACTION layer, since that is the callable HTTP endpoint -- nothing here
+    // renders a component, so nothing here can be satisfied by a hidden
+    // button. ---
+
+    it('ALLOWS recreation while the recovery key was never acknowledged, even with the vault locked', async () => {
+      await createVaultAction('right passphrase')
+      lockSession()
+      expect((await recreateVaultAction('a different passphrase')).ok).toBe(true)
+    })
+
+    it('ALLOWS recreation when the key is acknowledged but the session is unlocked', async () => {
+      await createVaultAction('right passphrase')
+      expect((await acknowledgeRecoveryKeyAction()).ok).toBe(true)
+      expect((await recreateVaultAction('a different passphrase')).ok).toBe(true)
+    })
+
+    it('REFUSES when the key is acknowledged and the vault is locked, and the printed key still works', async () => {
+      const created = await createVaultAction('right passphrase')
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      await acknowledgeRecoveryKeyAction()
+      lockSession()
+
+      const r = await recreateVaultAction('a different passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        // Names the remedy: this is the one refusal of the three the
+        // operator can clear themselves.
+        expect(r.message.toLowerCase()).toContain('unlock the vault first')
+        // ...and is not confused with the not-empty refusal, which has no
+        // way around it at all.
+        expect(r.message.toLowerCase()).not.toContain('holds stored credentials')
+      }
+
+      // The whole point of the guard: the key in the drawer is still good.
+      expect((await unlockWithRecoveryAction(created.recoveryKey)).ok).toBe(true)
+    })
+
     it('never leaks the new recovery key into a failure message', async () => {
       await createVaultAction('right passphrase')
       await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })

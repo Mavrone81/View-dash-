@@ -11,6 +11,7 @@ import {
   isInitialised,
   VaultAlreadyExistsError,
   VaultNotEmptyError,
+  RecoveryKeyStillValidError,
 } from '../../lib/vault/vault.js'
 import { KdfParamsError } from '../../lib/vault/kdf.js'
 import { lockSession, remainingSessionMs, DEFAULT_TTL_MS } from '../../lib/vault/session.js'
@@ -346,6 +347,11 @@ export async function changePassphraseAction(
 
 const ACKNOWLEDGE_FAILED_MESSAGE = 'Could not record that the recovery key was stored. It is still shown above — do not dismiss it; try again in a moment.'
 const VAULT_NOT_EMPTY_MESSAGE = 'This vault already holds stored credentials. Recreating it would destroy them, so it is refused. The passphrase is now the only way in.'
+// Deliberately names the remedy. This refusal is the ONLY one of the three
+// the operator can clear themselves, and the thing being protected — a
+// recovery key someone confirmed holding — is exactly what they would lose
+// without being told why.
+const RECOVERY_KEY_STILL_VALID_MESSAGE = 'This vault’s recovery key was confirmed as stored, so recreating it would silently invalidate a copy that may be sitting in a drawer. Unlock the vault first if you really mean to replace it.'
 const RECREATE_FAILED_MESSAGE = 'The vault could not be recreated right now. Nothing was changed — try again in a moment.'
 
 /**
@@ -375,13 +381,14 @@ export async function acknowledgeRecoveryKeyAction(): Promise<{ ok: true } | Err
  * Replaces a vault whose one-time recovery key was displayed and never
  * stored. Destructive: the old vault key is gone afterwards.
  *
- * The zero-credential condition is enforced HERE — well, in `recreateVault`,
- * inside the same transaction that does the replacing — and not by the UI
- * hiding the control. This is a server action, which means a callable HTTP
- * endpoint; a control that is merely hidden is not a control. There is
- * deliberately no `count()` in this function either: taking it here and
- * passing the result down would rebuild the check-then-act window the
- * transaction exists to close.
+ * The whole rule — zero credentials AND (unacknowledged OR unlocked) — is
+ * enforced in `recreateVault`, inside the same transaction that does the
+ * replacing, and not by the UI hiding the control. This is a server action,
+ * which means a callable HTTP endpoint; a control that is merely hidden is
+ * not a control. There is deliberately no `count()` and no acknowledgement
+ * read in this function either: taking either here and passing the result
+ * down would rebuild the check-then-act window the transaction exists to
+ * close.
  */
 export async function recreateVaultAction(
   passphrase: string,
@@ -398,6 +405,10 @@ export async function recreateVaultAction(
     // is not a problem to retry, it is a statement that the operator's data
     // was protected from the thing they just asked for.
     if (err instanceof VaultNotEmptyError) return failed(VAULT_NOT_EMPTY_MESSAGE)
+    // Distinct from the not-empty refusal, and from each other's advice: one
+    // says "your data was protected and there is nothing you can do", this
+    // says "prove you know the passphrase and you may proceed".
+    if (err instanceof RecoveryKeyStillValidError) return failed(RECOVERY_KEY_STILL_VALID_MESSAGE)
     if (isDatabaseConnectivityError(err)) return failed(DATABASE_UNAVAILABLE_MESSAGE)
     // Same discipline as everywhere else here: the caught error's own text is
     // discarded rather than surfaced. A rejected write can echo back a

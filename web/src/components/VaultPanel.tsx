@@ -635,6 +635,99 @@ export function VaultPanel({
    * because at that point telling the operator to recreate would be telling
    * them to delete their own data.
    */
+  /**
+   * The two-step recreate control, shared by the standing warning and the
+   * empty-acknowledged-vault block below, so both offer exactly the same
+   * thing and neither can drift from the other.
+   */
+  function renderRecreateControl() {
+    return (
+      <>
+        {recreateArmed ? (
+          <form onSubmit={handleRecreate}>
+            <p className="vault-remove-warning">
+              This replaces the vault key. The current passphrase and any recovery key issued for
+              this vault both stop working. There is no undo.
+            </p>
+            <label className="vault-field">
+              New vault passphrase
+              <input
+                type="password"
+                value={recreatePassphrase}
+                onChange={(e) => setRecreatePassphrase(e.target.value)}
+                required
+                autoComplete="new-password"
+              />
+            </label>
+            <button
+              type="submit"
+              className="vault-button vault-button-danger"
+              data-testid="confirm-recreate"
+              disabled={recreatePending}
+            >
+              {recreatePending ? 'Recreating...' : 'Yes, recreate the vault'}
+            </button>
+            <button
+              type="button"
+              className="vault-button"
+              data-testid="cancel-recreate"
+              onClick={() => {
+                setRecreateArmed(false)
+                setRecreatePassphrase('')
+                setRecreateError(null)
+              }}
+            >
+              Cancel
+            </button>
+          </form>
+        ) : (
+          // Two steps, like the delete control: arming this reveals what it
+          // destroys and asks for the new passphrase before anything happens.
+          <button
+            type="button"
+            className="vault-button vault-button-danger"
+            data-testid="recreate-vault"
+            onClick={() => setRecreateArmed(true)}
+          >
+            Recreate the vault
+          </button>
+        )}
+        {recreateError && (
+          <p className="vault-error" role="alert">
+            {recreateError}
+          </p>
+        )}
+      </>
+    )
+  }
+
+  /**
+   * An empty vault whose recovery key IS acknowledged can still be recreated,
+   * but only from an unlocked session — the server's rule, mirrored here so
+   * the page neither offers what would be refused nor hides what is allowed.
+   *
+   * This is the way out for an operator who clicked "I have stored it" by
+   * mistake. Without a control for it the allowance would exist only for
+   * something calling the action directly, which is not an escape hatch a
+   * person can use. It is deliberately NOT dressed as a warning: nothing is
+   * wrong with this vault. It disappears the moment a credential is stored.
+   */
+  function renderEmptyVaultKeyReplacement() {
+    if (!localInitialised || !localAcknowledged || !localUnlocked) return null
+    if (credentialsState.length > 0) return null
+    return (
+      <div className="vault-focus-add">
+        <h3 className="vault-group-heading">Replace this vault&rsquo;s keys</h3>
+        <p className="vault-hint">
+          This vault is empty, so its keys can still be replaced -- issuing a new passphrase and a
+          new recovery key, and retiring the current ones. Once a credential is stored this is no
+          longer possible, because it would destroy what is stored.
+        </p>
+        {renderRecreateControl()}
+      </div>
+    )
+  }
+
   function renderRecoveryWarning() {
     if (!localInitialised || localAcknowledged) return null
     const held = credentialsState.length
@@ -653,61 +746,7 @@ export function VaultPanel({
               be recreated before anything is stored in it. It holds no credentials, so recreating it
               destroys nothing.
             </p>
-            {recreateArmed ? (
-              <form onSubmit={handleRecreate}>
-                <p className="vault-remove-warning">
-                  This replaces the vault key. The current passphrase and the recovery key you cannot
-                  find both stop working. There is no undo.
-                </p>
-                <label className="vault-field">
-                  New vault passphrase
-                  <input
-                    type="password"
-                    value={recreatePassphrase}
-                    onChange={(e) => setRecreatePassphrase(e.target.value)}
-                    required
-                    autoComplete="new-password"
-                  />
-                </label>
-                <button
-                  type="submit"
-                  className="vault-button vault-button-danger"
-                  data-testid="confirm-recreate"
-                  disabled={recreatePending}
-                >
-                  {recreatePending ? 'Recreating...' : 'Yes, recreate the vault'}
-                </button>
-                <button
-                  type="button"
-                  className="vault-button"
-                  data-testid="cancel-recreate"
-                  onClick={() => {
-                    setRecreateArmed(false)
-                    setRecreatePassphrase('')
-                    setRecreateError(null)
-                  }}
-                >
-                  Cancel
-                </button>
-              </form>
-            ) : (
-              // Two steps, like the delete control: arming this reveals what
-              // it destroys and asks for the new passphrase before anything
-              // happens.
-              <button
-                type="button"
-                className="vault-button vault-button-danger"
-                data-testid="recreate-vault"
-                onClick={() => setRecreateArmed(true)}
-              >
-                Recreate the vault
-              </button>
-            )}
-            {recreateError && (
-              <p className="vault-error" role="alert">
-                {recreateError}
-              </p>
-            )}
+            {renderRecreateControl()}
           </>
         ) : (
           <p>
@@ -831,6 +870,12 @@ export function VaultPanel({
           {LOCKED_LABEL}
         </p>
         {renderRecoveryWarning()}
+        {/* Called here as well as in the unlocked view ON PURPOSE. It returns
+            null while locked, and that must be the GUARD's doing, not an
+            accident of which branch happens to call it -- a rule enforced by
+            call-site placement is a rule no test can hold onto, and the
+            server refuses this case regardless. */}
+        {renderEmptyVaultKeyReplacement()}
         <form onSubmit={handleUnlock}>
           <label className="vault-field">
             Passphrase
@@ -1004,6 +1049,7 @@ export function VaultPanel({
         Lock now
       </button>
       {renderRecoveryWarning()}
+      {renderEmptyVaultKeyReplacement()}
 
       {credentialsState.length === 0 && <p>{EMPTY_MESSAGE}</p>}
 

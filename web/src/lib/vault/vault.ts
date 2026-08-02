@@ -2,7 +2,7 @@ import { Prisma } from '@prisma/client'
 import { prisma } from '../db.js'
 import { newKdfParams, deriveWrappingKey, makeVerifier, checkVerifier, type KdfParams } from './kdf.js'
 import { newVaultKey, newRecoveryKey, wrapVaultKey, unwrapVaultKey, recoveryKeyFromDisplay } from './keyring.js'
-import { unlockSession } from './session.js'
+import { unlockSession, isUnlocked } from './session.js'
 
 const SINGLETON = 'singleton'
 
@@ -27,6 +27,26 @@ export class VaultAlreadyExistsError extends Error {}
  * `instanceof` and never by message text.
  */
 export class VaultNotEmptyError extends Error {}
+
+/**
+ * Refuses to recreate a vault whose recovery key is still good, when the
+ * caller has not proved they know the passphrase.
+ *
+ * An empty vault has nothing to destroy except the one thing recreation
+ * always destroys: the vault key, and with it any recovery key already
+ * printed and filed. The ordinary sequence is enough to see why that matters
+ * — create the vault, print the key, acknowledge it, get called away before
+ * storing anything. The vault is now acknowledged, empty and correct, and
+ * without this guard anything that can reach the app (these are
+ * unauthenticated server actions — see the note at the top of actions.ts)
+ * could replace the vault key and leave the printed copy silently dead. The
+ * operator would find out the day they needed it, which is precisely the
+ * discovery-at-the-worst-moment failure the acknowledgement exists to remove.
+ *
+ * An unlocked session is accepted as that proof: it can only exist because
+ * someone supplied the passphrase or the recovery key.
+ */
+export class RecoveryKeyStillValidError extends Error {}
 
 async function config() {
   return prisma.vaultConfig.findUnique({ where: { id: SINGLETON } })
@@ -122,6 +142,37 @@ export async function createVault(passphrase: string): Promise<{ recoveryKey: st
  * proceed against a vault that is no longer empty; this file has already been
  * bitten by that shape twice around `createVault`'s own existence check.
  *
+ * Emptiness is necessary and not sufficient. The full rule, enforced here and
+ * not by any control the interface does or does not draw:
+ *
+ *   zero credentials AND (the recovery key was never acknowledged
+ *                         OR the session is unlocked)
+ *
+ *  - **Unacknowledged.** The recovery key is already worthless — nobody ever
+ *    confirmed holding a copy — so there is nothing of value to destroy. This
+ *    is the remedy path and demands no proof: the operator has a passphrase,
+ *    what they lack is a recovery key, so asking for the passphrase would
+ *    gate the remedy on the one thing that is not missing.
+ *  - **Acknowledged but unlocked.** An unlocked session can only exist
+ *    because someone supplied the passphrase or the recovery key, so this is
+ *    proof enough. It is also the way out for an operator who acknowledged by
+ *    mistake — without it, one wrong click traps them with no recovery key
+ *    and no route to a new one.
+ *  - **Acknowledged and locked.** Refused. A caller who cannot prove
+ *    passphrase knowledge must not be able to invalidate a recovery key that
+ *    is currently good.
+ *
+ * The acknowledgement is read inside the transaction for the same reason as
+ * the count: read outside, a concurrent acknowledgement lands between the
+ * check and the replacement. The lock state is process memory rather than a
+ * row, so it is read at the same instant instead — and through `isUnlocked()`,
+ * which applies the session's own expiry, so a session past its deadline
+ * reads as locked here exactly as it does everywhere else.
+ *
+ * When no VaultConfig row exists at all there is nothing to protect and
+ * nothing to acknowledge, so this reduces to creating one. That is the same
+ * outcome `createVault` would produce, not a way around its guard.
+ *
  * The transaction runs at SERIALIZABLE, which is what makes the count
  * meaningful rather than decorative: a plain `count()` under READ COMMITTED
  * does not lock the rows it did not find, so a concurrent INSERT could still
@@ -140,6 +191,13 @@ export async function recreateVault(passphrase: string): Promise<{ recoveryKey: 
     async (tx) => {
       const held = await tx.credential.count()
       if (held > 0) throw new VaultNotEmptyError('vault holds credentials')
+      const existing = await tx.vaultConfig.findUnique({
+        where: { id: SINGLETON },
+        select: { recoveryKeyAcknowledgedAt: true },
+      })
+      if (existing !== null && existing.recoveryKeyAcknowledgedAt !== null && !isUnlocked()) {
+        throw new RecoveryKeyStillValidError('recovery key is acknowledged and the vault is locked')
+      }
       // deleteMany, not delete: a row with an unexpected id cannot be left
       // behind to collide with the create below. The CHECK constraint makes
       // 'singleton' the only possible id, so this removes exactly the one row.
