@@ -6,8 +6,11 @@ import {
   unlockWithPassphrase,
   unlockWithRecoveryKey,
   changePassphrase,
+  acknowledgeRecoveryKey,
+  recreateVault,
   isInitialised,
   VaultAlreadyExistsError,
+  VaultNotEmptyError,
 } from '../../lib/vault/vault.js'
 import { KdfParamsError } from '../../lib/vault/kdf.js'
 import { lockSession, remainingSessionMs, DEFAULT_TTL_MS } from '../../lib/vault/session.js'
@@ -339,6 +342,68 @@ export async function changePassphraseAction(
   if (!ok) return failed(PASSPHRASE_CHANGE_REJECTED_MESSAGE)
   revalidatePath('/vault')
   return { ok: true }
+}
+
+const ACKNOWLEDGE_FAILED_MESSAGE = 'Could not record that the recovery key was stored. It is still shown above — do not dismiss it; try again in a moment.'
+const VAULT_NOT_EMPTY_MESSAGE = 'This vault already holds stored credentials. Recreating it would destroy them, so it is refused. The passphrase is now the only way in.'
+const RECREATE_FAILED_MESSAGE = 'The vault could not be recreated right now. Nothing was changed — try again in a moment.'
+
+/**
+ * Records that the operator confirmed storing the recovery key, at the moment
+ * they dismiss it.
+ *
+ * The failure branch matters more than it looks. `VaultPanel` only clears the
+ * key from the screen when this returns ok, so a failed write leaves the key
+ * displayed and retryable rather than dismissing it and quietly leaving the
+ * vault marked unacknowledged forever — which is the exact silent-absence
+ * this whole mechanism exists to prevent.
+ */
+export async function acknowledgeRecoveryKeyAction(): Promise<{ ok: true } | Err> {
+  let recorded: boolean
+  try {
+    recorded = await acknowledgeRecoveryKey()
+  } catch (err) {
+    if (isDatabaseConnectivityError(err)) return failed(DATABASE_UNAVAILABLE_MESSAGE)
+    return failed(ACKNOWLEDGE_FAILED_MESSAGE)
+  }
+  if (!recorded) return failed(NOT_INITIALISED_MESSAGE)
+  revalidatePath('/vault')
+  return { ok: true }
+}
+
+/**
+ * Replaces a vault whose one-time recovery key was displayed and never
+ * stored. Destructive: the old vault key is gone afterwards.
+ *
+ * The zero-credential condition is enforced HERE — well, in `recreateVault`,
+ * inside the same transaction that does the replacing — and not by the UI
+ * hiding the control. This is a server action, which means a callable HTTP
+ * endpoint; a control that is merely hidden is not a control. There is
+ * deliberately no `count()` in this function either: taking it here and
+ * passing the result down would rebuild the check-then-act window the
+ * transaction exists to close.
+ */
+export async function recreateVaultAction(
+  passphrase: string,
+): Promise<{ ok: true; recoveryKey: string; sessionRemainingMs: number } | Err> {
+  if (passphrase.length < MIN_PASSPHRASE_LENGTH) {
+    return failed(`Passphrase must be at least ${MIN_PASSPHRASE_LENGTH} characters.`)
+  }
+  try {
+    const { recoveryKey } = await recreateVault(passphrase)
+    revalidatePath('/vault')
+    return { ok: true, recoveryKey, sessionRemainingMs: sessionDurationForClient() }
+  } catch (err) {
+    // The one refusal this action must never blur into a generic failure: it
+    // is not a problem to retry, it is a statement that the operator's data
+    // was protected from the thing they just asked for.
+    if (err instanceof VaultNotEmptyError) return failed(VAULT_NOT_EMPTY_MESSAGE)
+    if (isDatabaseConnectivityError(err)) return failed(DATABASE_UNAVAILABLE_MESSAGE)
+    // Same discipline as everywhere else here: the caught error's own text is
+    // discarded rather than surfaced. A rejected write can echo back a
+    // fragment of the wrapped key material it tried to store.
+    return failed(RECREATE_FAILED_MESSAGE)
+  }
 }
 
 export async function lockAction(): Promise<{ ok: true }> {

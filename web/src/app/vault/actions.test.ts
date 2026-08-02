@@ -20,6 +20,8 @@ import {
   revealAction,
   removeCredentialAction,
   changePassphraseAction,
+  acknowledgeRecoveryKeyAction,
+  recreateVaultAction,
 } from './actions.js'
 
 beforeEach(async () => {
@@ -309,6 +311,171 @@ describe('vault actions', () => {
       await expect(changePassphraseAction('right passphrase', 'a different passphrase')).resolves.toMatchObject({
         ok: false,
       })
+    })
+  })
+
+  // --- Task 10 round 2: the recovery key is displayed once and persisted
+  // nowhere, so an unacknowledged vault looked identical to a healthy one and
+  // stayed that way until a forgotten passphrase made every credential
+  // unrecoverable. ---
+
+  describe('acknowledgeRecoveryKeyAction', () => {
+    it('records the acknowledgement', async () => {
+      await createVaultAction('right passphrase')
+      expect((await acknowledgeRecoveryKeyAction()).ok).toBe(true)
+      const row = await prisma.vaultConfig.findFirstOrThrow()
+      expect(row.recoveryKeyAcknowledgedAt).not.toBeNull()
+    })
+
+    it('reports a failure, not a silent success, when there is no vault to acknowledge', async () => {
+      const r = await acknowledgeRecoveryKeyAction()
+      expect(r.ok).toBe(false)
+    })
+
+    // The panel only clears the key from the screen on ok. If a failed write
+    // ever reported success, the key would be dismissed and the vault left
+    // marked unacknowledged for good -- the exact silent absence this whole
+    // mechanism exists to prevent.
+    it('reports a database problem, not a success, when the write itself fails', async () => {
+      await createVaultAction('right passphrase')
+      const spy = vi.spyOn(prisma.vaultConfig, 'updateMany').mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError("Can't reach database server", { code: 'P1001', clientVersion: 'test' }),
+      )
+      try {
+        const r = await acknowledgeRecoveryKeyAction()
+        expect(r.ok).toBe(false)
+        if (!r.ok) expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+      } finally {
+        spy.mockRestore()
+      }
+      expect((await prisma.vaultConfig.findFirstOrThrow()).recoveryKeyAcknowledgedAt).toBeNull()
+    })
+
+    it('never throws to the client, and never echoes the caught error', async () => {
+      await createVaultAction('right passphrase')
+      const spy = vi
+        .spyOn(prisma.vaultConfig, 'updateMany')
+        .mockRejectedValueOnce(new Error('connection refused'))
+      try {
+        const r = await acknowledgeRecoveryKeyAction()
+        expect(r.ok).toBe(false)
+        if (!r.ok) expect(r.message).not.toContain('connection refused')
+      } finally {
+        spy.mockRestore()
+      }
+    })
+  })
+
+  describe('recreateVaultAction', () => {
+    it('issues a new, working recovery key and leaves the vault unlocked', async () => {
+      const first = await createVaultAction('right passphrase')
+      expect(first.ok).toBe(true)
+      if (!first.ok) return
+      const r = await recreateVaultAction('a different passphrase')
+      expect(r.ok).toBe(true)
+      if (!r.ok) return
+      expect(r.recoveryKey).not.toBe(first.recoveryKey)
+      expect(r.sessionRemainingMs).toBeGreaterThan(DEFAULT_TTL_MS - 5000)
+
+      lockSession()
+      expect((await unlockWithRecoveryAction(r.recoveryKey)).ok).toBe(true)
+      lockSession()
+      expect((await unlockWithRecoveryAction(first.recoveryKey)).ok).toBe(false)
+    })
+
+    it('leaves the new vault unacknowledged -- its key has been shown and not yet stored', async () => {
+      await createVaultAction('right passphrase')
+      await acknowledgeRecoveryKeyAction()
+      expect((await recreateVaultAction('a different passphrase')).ok).toBe(true)
+      expect((await prisma.vaultConfig.findFirstOrThrow()).recoveryKeyAcknowledgedAt).toBeNull()
+    })
+
+    // THE denial the coordinator asked to be proven at this layer: the
+    // refusal must come from the CODE, not from the UI having hidden the
+    // control. Nothing here touches the UI -- this calls the server action
+    // directly, exactly as a network caller could.
+    it('REFUSES to recreate a vault that holds a credential, and destroys nothing', async () => {
+      await createVaultAction('right passphrase')
+      const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+      expect(add.ok).toBe(true)
+      if (!add.ok) return
+
+      const r = await recreateVaultAction('a different passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toContain('would destroy them')
+        // Not a "try again" failure: retrying will never help, and must not
+        // read as though it might.
+        expect(r.message.toLowerCase()).not.toContain('try again')
+      }
+
+      // And the credential is not merely still present -- it is still
+      // READABLE, which is the property recreation would have destroyed.
+      expect(await prisma.credential.count()).toBe(1)
+      const revealed = await revealAction(add.id)
+      expect(revealed.ok).toBe(true)
+      if (revealed.ok) expect(revealed.secret).toBe('hunter2')
+    })
+
+    it('REFUSES a passphrase shorter than 12 characters, and changes nothing', async () => {
+      const first = await createVaultAction('right passphrase')
+      expect(first.ok).toBe(true)
+      if (!first.ok) return
+      const r = await recreateVaultAction('eleven-char')
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.message.toLowerCase()).toContain('12')
+      lockSession()
+      expect((await unlockWithRecoveryAction(first.recoveryKey)).ok).toBe(true)
+    })
+
+    it('reports a database problem distinctly from the not-empty refusal', async () => {
+      await createVaultAction('right passphrase')
+      // Injected at `$transaction`, not at a model method: every destructive
+      // step lives INSIDE the interactive transaction and runs against its
+      // own `tx` client, which a spy on `prisma.vaultConfig` never sees. A
+      // connectivity failure opening or committing the transaction rejects
+      // here, which is the real shape of this failure.
+      const spy = vi.spyOn(prisma, '$transaction').mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError("Can't reach database server", { code: 'P1001', clientVersion: 'test' }),
+      )
+      try {
+        const r = await recreateVaultAction('a different passphrase')
+        expect(r.ok).toBe(false)
+        if (!r.ok) {
+          expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+          expect(r.message.toLowerCase()).not.toContain('would destroy them')
+        }
+      } finally {
+        spy.mockRestore()
+      }
+    })
+
+    it('reports a neutral failure, naming no cause, for an error it cannot positively identify', async () => {
+      await createVaultAction('right passphrase')
+      const spy = vi.spyOn(prisma, '$transaction').mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError('unrelated failure', { code: 'P2025', clientVersion: 'test' }),
+      )
+      try {
+        const r = await recreateVaultAction('a different passphrase')
+        expect(r.ok).toBe(false)
+        if (!r.ok) {
+          expect(r.message.toLowerCase()).not.toContain('would destroy them')
+          expect(r.message.toLowerCase()).not.toMatch(/database|reach|connect/)
+          expect(r.message).not.toContain('unrelated failure')
+        }
+      } finally {
+        spy.mockRestore()
+      }
+    })
+
+    it('never leaks the new recovery key into a failure message', async () => {
+      await createVaultAction('right passphrase')
+      await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+      const r = await recreateVaultAction('a different passphrase')
+      expect(r.ok).toBe(false)
+      // The key material is generated before the transaction refuses, so a
+      // careless error path could carry it out.
+      if (!r.ok) expect(r.message).not.toMatch(/[A-Za-z0-9_-]{8} [A-Za-z0-9_-]{8}/)
     })
   })
 
