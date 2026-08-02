@@ -53,15 +53,33 @@ check "vault page body could be fetched for inspection" \
 # Greps the rendered HTML for the sealed-envelope format (v1:<b64>:<b64>:<b64>)
 # and for the column name itself. A locked vault must not ship either, and
 # neither must an unlocked one — a sealed secret is still a secret.
+#
+# The character class is STANDARD base64, not base64url. The first version of
+# this line used `[A-Za-z0-9_-]`, which cannot match anything envelope.ts
+# produces: it emits `toString('base64')`, so `+` and `/` appear in the IV and
+# ciphertext, and the 16-byte auth tag always base64-encodes with trailing
+# `=`. Measured against 2000 real seal() outputs, the base64url class matched
+# 0 and this one matched 2000. Half of this check was dead while the script
+# reported PASS — in a script whose own header warns against checks that
+# cannot fail. If you touch this pattern, re-measure it against real output.
 check "no sealed secret in the page source" \
-  '[ "$FETCHED" = 1 ] && ! printf %s "$PAGE" | grep -qE "secretSealed|v1:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+:"'
+  '[ "$FETCHED" = 1 ] && ! printf %s "$PAGE" | grep -qE "secretSealed|v1:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+:"'
 
 # The word Locked must appear before anyone has unlocked. Note this is a
 # weaker statement than it looks: it confirms the page renders its locked
 # branch, not that the lock is enforced. Enforcement is proven by the
 # restart check in the runbook, which is a human step.
+#
+# CASE SENSITIVITY IS LOAD-BEARING: "Locked" is a substring of "Unlocked",
+# so this only discriminates because of the capital L. A well-meaning
+# `grep -qi` would make it match an unlocked page and quietly turn the check
+# vacuous. The companion check below is the real guard — it fails if the
+# page claims to be Unlocked — so the two must be read together.
 check "a freshly started vault renders as locked" \
   '[ "$FETCHED" = 1 ] && printf %s "$PAGE" | grep -q "Locked"'
+
+check "a freshly started vault does NOT render as unlocked" \
+  '[ "$FETCHED" = 1 ] && ! printf %s "$PAGE" | grep -q "Unlocked"'
 
 # The dashboard itself must still work — a vault that breaks the board it
 # lives on is not a successful deployment.
