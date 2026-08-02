@@ -98,9 +98,18 @@ migrations as their own, separate, one-off command -- **never** as part of
 `web` or `ingest`'s startup:
 
 ```bash
-docker compose run --rm web /deploy/with-database-url.sh \
+docker compose run --rm --pull always web /deploy/with-database-url.sh \
   npx prisma migrate deploy --schema web/prisma/schema.prisma
 ```
+
+`--pull always` is load-bearing, not belt-and-braces. Migrations are baked
+into the image, and `docker compose run` defaults to a pull policy of
+`missing` — so on any host that already has a `latest` cached from a
+previous deploy, this command runs the OLD image, reports "No pending
+migrations to apply", exits 0, and leaves the schema behind the code that
+is about to be started. See the vault section's deploy block for what that
+looks like from the outside: a page that 500s and a verification script
+blaming the application.
 
 This has to be a separate step rather than something in
 `deploy/with-database-url.sh` itself: that script is the shared
@@ -413,11 +422,25 @@ Migrations run as their own step, never from an entrypoint: `web` and
 ```bash
 cd /opt/bevora-ops && git fetch origin && git reset --hard origin/main
 export GHCR_OWNER=<owner> TAG=latest INGEST_BIND_ADDR=<this host's private address>
+docker compose pull web ingest
 docker compose run --rm web /deploy/with-database-url.sh \
   npx prisma migrate deploy --schema web/prisma/schema.prisma
-docker compose pull web ingest && docker compose up -d web ingest
+docker compose up -d web ingest
 bash deploy/verify-vault.sh
 ```
+
+**The `pull` must come first, and this order is the fix for a real defect.**
+Migrations are baked into the image; the only bind mount is
+`with-database-url.sh`. `docker compose run` uses a pull policy of `missing`,
+and with `TAG=latest` already cached from the previous deploy, nothing is
+missing — so the migrate step ran inside the **old** image, found the new
+migration absent from it, printed "No pending migrations to apply", and
+exited 0. The `pull` then landed new code on an old schema. `/vault` selects
+a column that does not exist, the route is `force-dynamic` and there is no
+`error.tsx`, so it 500s on every request — and `verify-vault.sh` reported
+"vault page did not answer", pointing the operator at the application while
+the actual fault was the schema. `docker compose run --pull always …` is the
+equivalent fix if the steps are ever reordered again.
 
 Run `verify-vault.sh` **before** deploying as well. Its value is in failing
 first: if it passes before the vault exists, it is not testing what it

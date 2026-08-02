@@ -33,6 +33,50 @@ check() {
 echo "Verifying vault deployment at ${BASE}"
 echo
 
+# --- SCHEMA FIRST, and first for a reason. ---
+#
+# A deploy that landed new code on an old schema is indistinguishable, from
+# the outside, from a dead application: /vault selects a column that does not
+# exist, the route is force-dynamic, there is no error.tsx, so every request
+# 500s. This script used to report "vault page did not answer" and send the
+# operator to the application logs while the actual fault was one unapplied
+# migration. That is exactly the mode this file's header warns about — a check
+# that looks authoritative while measuring the wrong thing.
+#
+# So the schema is probed directly, BEFORE anything HTTP, and names itself.
+# `information_schema.columns` is the authority here rather than Prisma's
+# `_prisma_migrations` table: the question is whether the running database
+# actually has the column the running code selects, not whether a migration
+# row was written.
+#
+# The check FAILS when the probe cannot run at all (no docker, wrong
+# directory, database down). A schema check that passes because it could not
+# look is the empty-input failure this script already learned once, below.
+DB_SERVICE="${DB_SERVICE:-db}"
+DB_USER="${DB_USER:-bevops}"
+DB_NAME="${DB_NAME:-bevops}"
+ACK_COLUMN="$(docker compose exec -T "$DB_SERVICE" \
+  psql -U "$DB_USER" -d "$DB_NAME" -tAc \
+  "SELECT column_name FROM information_schema.columns WHERE table_name = 'VaultConfig' AND column_name = 'recoveryKeyAcknowledgedAt'" \
+  2>/dev/null | tr -d '[:space:]')"
+
+check "database schema is current (VaultConfig.recoveryKeyAcknowledgedAt exists)" \
+  '[ "$ACK_COLUMN" = "recoveryKeyAcknowledgedAt" ]'
+
+if [ "$ACK_COLUMN" != "recoveryKeyAcknowledgedAt" ]; then
+  cat <<'SCHEMA'
+      ^ If this failed, do NOT debug the application. Either the migration
+        was never applied, or it was applied from an image that predates it
+        (`docker compose run` pulls only when the tag is MISSING, so a cached
+        `latest` silently migrates nothing). Pull first, then migrate:
+
+          docker compose pull web ingest
+          docker compose run --rm web /deploy/with-database-url.sh \
+            npx prisma migrate deploy --schema web/prisma/schema.prisma
+
+SCHEMA
+fi
+
 check "vault page answers on loopback" \
   '[ "$(curl -s -o /dev/null -w %{http_code} "$BASE/vault")" = 200 ]'
 
