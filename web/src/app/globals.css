@@ -378,7 +378,23 @@ h1 {
   color: var(--ink);
 }
 
-.vault-field input:focus-visible {
+/* The add form's system picker. Matches the text inputs exactly -- the two
+   sit in the same column and a picker styled by the user agent instead
+   would be the only control on this page not speaking the panel's language.
+   `color-scheme` on :root is what keeps the native dropdown list itself
+   readable in dark mode. */
+.vault-field select {
+  font: inherit;
+  font-size: 0.8125rem;
+  padding: 6px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--field);
+  color: var(--ink);
+}
+
+.vault-field input:focus-visible,
+.vault-field select:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
@@ -498,6 +514,42 @@ h1 {
   color: var(--ink);
 }
 
-.vault-focus-add {
+.vault-focus-add,
+.vault-change-passphrase {
   width: 100%;
+}
+
+/* The inline delete confirmation. It replaces the Remove button IN THE ROW
+   rather than opening a dialog -- so the credential being destroyed stays
+   visible next to the question being asked, which a modal covering the page
+   cannot do. `--alarm` is the panel's only irreversible-action colour and is
+   used nowhere else here. */
+.vault-remove-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.vault-remove-warning {
+  color: var(--alarm);
+  font-size: 0.75rem;
+}
+
+.vault-button-danger {
+  border-color: var(--alarm);
+  color: var(--alarm);
+}
+
+/* Not `background: var(--alarm)`: the button text is --alarm, and both
+   palettes' alarm reds are mid-tone enough that filling the button would
+   leave red on red. Deepening the field keeps the contrast the plain
+   .vault-button:hover rule provides, in both themes. */
+.vault-button-danger:hover {
+  background: var(--rule);
+}
+
+.vault-button-danger:focus-visible {
+  outline: 2px solid var(--alarm);
+  outline-offset: 2px;
 }

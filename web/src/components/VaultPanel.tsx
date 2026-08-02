@@ -10,6 +10,8 @@ import {
   lockAction,
   addCredentialAction,
   revealAction,
+  removeCredentialAction,
+  changePassphraseAction,
 } from '../app/vault/actions.js'
 
 export type VaultPanelProps = {
@@ -70,6 +72,25 @@ const LOCKED_LABEL = 'Locked'
 const UNLOCKED_LABEL = 'Unlocked'
 const UNATTACHED_HEADING = 'Not attached to a system'
 const EMPTY_MESSAGE = 'No credentials stored yet.'
+// Deliberately NOT the same words as UNATTACHED_HEADING: the heading states
+// where a stored credential ended up, this option states what the operator is
+// about to choose. Identical wording would also make a `getByText` for the
+// heading match an <option> as well, which is how a test starts passing for
+// the wrong reason.
+const NO_SYSTEM_OPTION = 'Do not attach to a system'
+
+// The separator joining a hostId and a systemKey into the single string an
+// <option value> (and `systemLabels`) can carry. Split on the FIRST
+// occurrence only: a hostId is a uuid and cannot contain it, but a systemKey
+// comes from a discovered system and is not this code's to make assumptions
+// about.
+const ATTACH_SEPARATOR = '::'
+
+function splitAttachKey(value: string): { hostId: string; systemKey: string } | null {
+  const at = value.indexOf(ATTACH_SEPARATOR)
+  if (at <= 0) return null
+  return { hostId: value.slice(0, at), systemKey: value.slice(at + ATTACH_SEPARATOR.length) }
+}
 
 // How long a revealed secret stays on screen before hiding itself, absent
 // any other action. Chosen, not derived: long enough to read and click Copy
@@ -154,6 +175,15 @@ export function VaultPanel({
   const activeFocusHostId = focusHostId ?? null
   const activeFocusSystemKey = focusSystemKey ?? null
   const labels = systemLabels ?? {}
+
+  // The `${hostId}::${systemKey}` composite the add form's system picker uses
+  // as an option value, for the system the board linked in from -- `null` for
+  // a direct visit to /vault. `''` is the picker's "do not attach" value, so
+  // an unattached credential and an attached one come off the same control.
+  const focusAttachKey =
+    activeFocusHostId !== null && activeFocusSystemKey !== null
+      ? `${activeFocusHostId}::${activeFocusSystemKey}`
+      : null
 
   // The LOCAL absolute deadline this client schedules its own auto-lock
   // against -- always derived by adding a server-issued DURATION to this
@@ -302,6 +332,11 @@ export function VaultPanel({
         setLocalUnlocked(false)
         setRevealedCredential(null)
         setRevealErrors({})
+        // A half-finished delete confirmation must not survive the deadline
+        // either: the row it names could be confirmed with one click by
+        // whoever finds the screen, and the delete has no undo.
+        setPendingRemoveId(null)
+        setRemoveErrors({})
         // Fix I2. The recovery-key gate returns BEFORE every other branch,
         // so without this the whole clearing above was invisible: the key
         // stayed rendered under a screen that never even said Locked. It is
@@ -344,6 +379,8 @@ export function VaultPanel({
     // kind of lingering exposure this feature exists to avoid.
     setRevealedCredential(null)
     setRevealErrors({})
+    setPendingRemoveId(null)
+    setRemoveErrors({})
   }
 
   async function handleReveal(id: string) {
@@ -369,25 +406,41 @@ export function VaultPanel({
     setRevealedCredential(null)
   }
 
-  // --- Add a credential pre-attached to the focused system (Resolution 3) ---
+  // --- Add a credential (fix C1) ---
+  //
+  // Available whenever the vault is unlocked, NOT only when the page was
+  // reached from a board row whose system has zero credentials. That gate was
+  // the whole way in, and it closed the moment it was used: one credential
+  // stored for a system, and the database password, SMTP credential and API
+  // key for that same system could never be stored at all -- which is exactly
+  // the set design spec section 4.2 names as the reason one model covers any
+  // credential type. Opening /vault directly offered no add control
+  // whatsoever, so an unattached credential -- which section 8 requires the
+  // page to LIST -- could never be created either.
+  //
+  // The board context is kept, just demoted from gatekeeper to default: the
+  // system picker starts on the focused system when there is one.
   const [addLabel, setAddLabel] = useState('')
   const [addUsername, setAddUsername] = useState('')
   const [addSecret, setAddSecret] = useState('')
+  const [addAttachTo, setAddAttachTo] = useState<string>(focusAttachKey ?? '')
   const [addPending, setAddPending] = useState(false)
   const [addError, setAddError] = useState<string | null>(null)
 
-  async function handleAddFocused(e: FormEvent<HTMLFormElement>) {
+  async function handleAdd(e: FormEvent<HTMLFormElement>) {
     e.preventDefault()
-    if (activeFocusHostId === null || activeFocusSystemKey === null) return
+    const attach = splitAttachKey(addAttachTo)
     setAddPending(true)
     setAddError(null)
     try {
+      // Spread rather than passing explicit `undefined`s: addCredentialAction
+      // takes hostId/systemKey as optional, and "absent" is what makes the
+      // credential unattached.
       const r = await addCredentialAction({
         label: addLabel,
         username: addUsername,
         secret: addSecret,
-        hostId: activeFocusHostId,
-        systemKey: activeFocusSystemKey,
+        ...(attach !== null ? { hostId: attach.hostId, systemKey: attach.systemKey } : {}),
       })
       if (r.ok) {
         setCredentialsState((prev) => [
@@ -397,8 +450,8 @@ export function VaultPanel({
             label: addLabel,
             username: addUsername,
             notes: null,
-            hostId: activeFocusHostId,
-            systemKey: activeFocusSystemKey,
+            hostId: attach?.hostId ?? null,
+            systemKey: attach?.systemKey ?? null,
             rotatedAt: null,
           },
         ])
@@ -410,6 +463,69 @@ export function VaultPanel({
       }
     } finally {
       setAddPending(false)
+    }
+  }
+
+  // --- Remove a credential (fix C1) ---
+  //
+  // `removeCredentialAction` was exported and tested and called from nowhere.
+  // Two steps, not one click: deleting a stored production password is
+  // irreversible and there is no undo anywhere in this design. Built inline
+  // rather than with `window.confirm`, which blocks the whole page from a
+  // client component and cannot be styled, keyboard-tested or read by the
+  // same assistive technology as the rest of the panel.
+  const [pendingRemoveId, setPendingRemoveId] = useState<string | null>(null)
+  const [removePending, setRemovePending] = useState<Record<string, boolean>>({})
+  const [removeErrors, setRemoveErrors] = useState<Record<string, string>>({})
+
+  async function handleRemove(id: string) {
+    setRemovePending((p) => ({ ...p, [id]: true }))
+    setRemoveErrors((p) => {
+      const next = { ...p }
+      delete next[id]
+      return next
+    })
+    try {
+      const r = await removeCredentialAction(id)
+      if (r.ok) {
+        setCredentialsState((prev) => prev.filter((c) => c.id !== id))
+        setPendingRemoveId(null)
+        // A secret revealed from the row being deleted must go with it --
+        // leaving the plaintext of a credential that no longer exists on
+        // screen is the lingering exposure the rest of this panel works to
+        // avoid.
+        setRevealedCredential((prev) => (prev !== null && prev.id === id ? null : prev))
+      } else {
+        setRemoveErrors((p) => ({ ...p, [id]: r.message }))
+      }
+    } finally {
+      setRemovePending((p) => ({ ...p, [id]: false }))
+    }
+  }
+
+  // --- Change the passphrase (fix C1) ---
+  const [changeCurrent, setChangeCurrent] = useState('')
+  const [changeNext, setChangeNext] = useState('')
+  const [changePending, setChangePending] = useState(false)
+  const [changeError, setChangeError] = useState<string | null>(null)
+  const [changeDone, setChangeDone] = useState(false)
+
+  async function handleChangePassphrase(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault()
+    setChangePending(true)
+    setChangeError(null)
+    setChangeDone(false)
+    try {
+      const r = await changePassphraseAction(changeCurrent, changeNext)
+      if (r.ok) {
+        setChangeDone(true)
+        setChangeCurrent('')
+        setChangeNext('')
+      } else {
+        setChangeError(r.message)
+      }
+    } finally {
+      setChangePending(false)
     }
   }
 
@@ -582,12 +698,18 @@ export function VaultPanel({
   }
 
   // --- Unlocked ---
-  const focusGroupCredentials =
-    activeFocusHostId !== null && activeFocusSystemKey !== null
-      ? credentialsState.filter((c) => c.hostId === activeFocusHostId && c.systemKey === activeFocusSystemKey)
-      : []
-  const focusHasNoCredentials =
-    activeFocusHostId !== null && activeFocusSystemKey !== null && focusGroupCredentials.length === 0
+
+  // Every system the add form can attach to. Built from `systemLabels` (every
+  // host/system pair currently on the board), plus the focused pair when the
+  // board linked in from a system that is no longer resolvable -- that pair is
+  // still a legitimate attachment target, and a credential re-attaches
+  // automatically if the system returns (design spec section 7).
+  const attachOptions = Object.entries(labels)
+    .map(([value, label]) => ({ value, text: `${label.systemName} (host ${label.hostName})` }))
+    .sort((a, b) => a.text.localeCompare(b.text))
+  if (focusAttachKey !== null && labels[focusAttachKey] === undefined) {
+    attachOptions.unshift({ value: focusAttachKey, text: focusSystemLabel ?? focusAttachKey })
+  }
 
   function renderRow(c: CredentialSummary) {
     const secret = revealedCredential !== null && revealedCredential.id === c.id ? revealedCredential.secret : undefined
@@ -620,9 +742,54 @@ export function VaultPanel({
             {pending ? 'Revealing...' : 'Reveal'}
           </button>
         )}
+        {/* Two steps, never one click -- see the handleRemove comment. The
+            row EXPANDS to confirm rather than opening a dialog: this is a
+            client component in a Next app, and window.confirm blocks the
+            whole page, cannot be styled to the panel, and is invisible to
+            the keyboard and focus rules the rest of this file follows. */}
+        {pendingRemoveId === c.id ? (
+          <span className="vault-remove-confirm">
+            <span className="vault-remove-warning">
+              Delete &ldquo;{c.label}&rdquo; permanently? There is no undo.
+            </span>
+            <button
+              type="button"
+              className="vault-button vault-button-danger"
+              data-testid={`confirm-remove-${c.id}`}
+              disabled={removePending[c.id] === true}
+              onClick={() => {
+                void handleRemove(c.id)
+              }}
+            >
+              {removePending[c.id] === true ? 'Deleting...' : 'Yes, delete it'}
+            </button>
+            <button
+              type="button"
+              className="vault-button"
+              data-testid={`cancel-remove-${c.id}`}
+              onClick={() => setPendingRemoveId(null)}
+            >
+              Keep it
+            </button>
+          </span>
+        ) : (
+          <button
+            type="button"
+            className="vault-button"
+            data-testid={`remove-${c.id}`}
+            onClick={() => setPendingRemoveId(c.id)}
+          >
+            Remove
+          </button>
+        )}
         {error !== undefined && (
           <p className="vault-error" role="alert">
             {error}
+          </p>
+        )}
+        {removeErrors[c.id] !== undefined && (
+          <p className="vault-error" role="alert">
+            {removeErrors[c.id]}
           </p>
         )}
       </li>
@@ -657,40 +824,99 @@ export function VaultPanel({
         </div>
       )}
 
-      {focusHasNoCredentials && activeFocusHostId !== null && activeFocusSystemKey !== null && (
-        <div className="vault-focus-add">
-          <h3 className="vault-group-heading">Add a credential for system &ldquo;{focusSystemLabel}&rdquo;</h3>
-          <form onSubmit={handleAddFocused}>
-            <label className="vault-field">
-              Label
-              <input type="text" value={addLabel} onChange={(e) => setAddLabel(e.target.value)} required />
-            </label>
-            <label className="vault-field">
-              Username
-              <input
-                type="text"
-                value={addUsername}
-                onChange={(e) => setAddUsername(e.target.value)}
-                required
-              />
-            </label>
-            <label className="vault-field">
-              Secret
-              <input
-                type="password"
-                value={addSecret}
-                onChange={(e) => setAddSecret(e.target.value)}
-                required
-                autoComplete="new-password"
-              />
-            </label>
-            <button type="submit" className="vault-button" disabled={addPending}>
-              {addPending ? 'Saving...' : 'Add credential'}
-            </button>
-          </form>
-          {addError && <p className="vault-error" role="alert">{addError}</p>}
-        </div>
-      )}
+      <div className="vault-focus-add">
+        <h3 className="vault-group-heading">Add a credential</h3>
+        {focusSystemLabel !== null && (
+          <p className="vault-hint">
+            Starting from system &ldquo;{focusSystemLabel}&rdquo;, because that is the row you came
+            from. Change it below to store this anywhere else.
+          </p>
+        )}
+        <form onSubmit={handleAdd}>
+          <label className="vault-field">
+            Label
+            <input type="text" value={addLabel} onChange={(e) => setAddLabel(e.target.value)} required />
+          </label>
+          <label className="vault-field">
+            Username
+            <input
+              type="text"
+              value={addUsername}
+              onChange={(e) => setAddUsername(e.target.value)}
+              required
+            />
+          </label>
+          <label className="vault-field">
+            Secret
+            <input
+              type="password"
+              value={addSecret}
+              onChange={(e) => setAddSecret(e.target.value)}
+              required
+              autoComplete="new-password"
+            />
+          </label>
+          <label className="vault-field">
+            Attach to
+            <select value={addAttachTo} onChange={(e) => setAddAttachTo(e.target.value)}>
+              <option value="">{NO_SYSTEM_OPTION}</option>
+              {attachOptions.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.text}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button type="submit" className="vault-button" disabled={addPending}>
+            {addPending ? 'Saving...' : 'Add credential'}
+          </button>
+        </form>
+        {addError && <p className="vault-error" role="alert">{addError}</p>}
+      </div>
+
+      <div className="vault-change-passphrase">
+        <h3 className="vault-group-heading">Change the passphrase</h3>
+        {/* Load-bearing, not reassurance: only the passphrase copy of the
+            vault key is re-wrapped, so the printed recovery key keeps
+            working. An operator who assumes otherwise may destroy the one
+            thing that gets them back in if the new passphrase is forgotten. */}
+        <p className="vault-hint">
+          Your existing recovery key still works afterwards -- only the passphrase copy of the vault
+          key is re-wrapped, and stored credentials are not touched. Do not throw the recovery key
+          away.
+        </p>
+        <form onSubmit={handleChangePassphrase}>
+          <label className="vault-field">
+            Current passphrase
+            <input
+              type="password"
+              value={changeCurrent}
+              onChange={(e) => setChangeCurrent(e.target.value)}
+              required
+              autoComplete="current-password"
+            />
+          </label>
+          <label className="vault-field">
+            New passphrase
+            <input
+              type="password"
+              value={changeNext}
+              onChange={(e) => setChangeNext(e.target.value)}
+              required
+              autoComplete="new-password"
+            />
+          </label>
+          <button type="submit" className="vault-button" disabled={changePending}>
+            {changePending ? 'Changing...' : 'Change passphrase'}
+          </button>
+        </form>
+        {changeError && <p className="vault-error" role="alert">{changeError}</p>}
+        {changeDone && (
+          <p className="vault-hint" role="status">
+            Passphrase changed. Your recovery key is unchanged and still works -- keep it.
+          </p>
+        )}
+      </div>
     </section>
   )
 }

@@ -15,6 +15,8 @@ vi.mock('../app/vault/actions.js', () => ({
   lockAction: vi.fn(),
   addCredentialAction: vi.fn(),
   revealAction: vi.fn(),
+  removeCredentialAction: vi.fn(),
+  changePassphraseAction: vi.fn(),
 }))
 
 import {
@@ -23,6 +25,8 @@ import {
   lockAction,
   addCredentialAction,
   revealAction,
+  removeCredentialAction,
+  changePassphraseAction,
 } from '../app/vault/actions.js'
 import { VaultPanel } from './VaultPanel.js'
 
@@ -37,6 +41,8 @@ beforeEach(() => {
   vi.mocked(lockAction).mockReset()
   vi.mocked(addCredentialAction).mockReset()
   vi.mocked(revealAction).mockReset()
+  vi.mocked(removeCredentialAction).mockReset()
+  vi.mocked(changePassphraseAction).mockReset()
 })
 
 describe('VaultPanel', () => {
@@ -452,17 +458,46 @@ describe('VaultPanel', () => {
       expect(screen.getByText(/unlock the vault to add one/i)).toBeTruthy()
     })
 
-    it('does not offer to add when the focused system already has a credential', () => {
+    // --- Task 10 / finding C1. This test used to assert the OPPOSITE, and
+    // in doing so certified the defect as intended behaviour: the only add
+    // form in the product was gated on the focused system having ZERO
+    // credentials, so it vanished the moment it was used. Design spec
+    // section 4.2 names the database password, the SMTP credential and the
+    // API key for one system as the reason a single model covers any
+    // credential type -- and after storing the first of those, the other two
+    // could never be stored at all. Rewritten, not deleted: the scenario is
+    // the right one, the expectation was wrong.
+    it('still offers to add when the focused system already has a credential -- one system, several credentials', async () => {
+      vi.mocked(addCredentialAction).mockResolvedValue({ ok: true, id: 'new-2' })
       render(
         <VaultPanel
           initialised
           unlocked
-          credentials={[cred({ hostId: 'h9', systemKey: 'beta' })]}
+          credentials={[cred({ id: 'c1', label: 'admin login', hostId: 'h9', systemKey: 'beta' })]}
           focusHostId="h9"
           focusSystemKey="beta"
         />,
       )
-      expect(screen.queryByRole('button', { name: /add credential/i })).toBeNull()
+      expect(screen.getByRole('button', { name: /^add credential$/i })).toBeTruthy()
+
+      fireEvent.change(screen.getByLabelText(/^label$/i), { target: { value: 'database password' } })
+      fireEvent.change(screen.getByLabelText(/^username$/i), { target: { value: 'dbuser' } })
+      fireEvent.change(screen.getByLabelText(/^secret$/i), { target: { value: 'x' } })
+      fireEvent.click(screen.getByRole('button', { name: /^add credential$/i }))
+
+      await waitFor(() =>
+        expect(addCredentialAction).toHaveBeenCalledWith({
+          label: 'database password',
+          username: 'dbuser',
+          secret: 'x',
+          hostId: 'h9',
+          systemKey: 'beta',
+        }),
+      )
+      // Both now exist, attached to the same system -- the state the old
+      // behaviour made unreachable.
+      expect(await screen.findByTestId('reveal-new-2')).toBeTruthy()
+      expect(screen.getByTestId('reveal-c1')).toBeTruthy()
     })
 
     it('adding a credential for the focused system attaches it, and it is then revealable', async () => {
@@ -484,6 +519,269 @@ describe('VaultPanel', () => {
         }),
       )
       expect(await screen.findByTestId('reveal-new-1')).toBeTruthy()
+    })
+  })
+
+  // --- Task 10 / finding C1: the add path must not depend on how the page
+  // was reached. Opening /vault directly offered no add control at ALL, so an
+  // unattached credential -- which design spec section 8 requires the page to
+  // list -- could never be created through the product. ---
+  describe('adding a credential without coming from the board (C1)', () => {
+    it('offers an add control on a direct visit, with no focused system', () => {
+      render(<VaultPanel initialised unlocked credentials={[]} />)
+      expect(screen.getByRole('button', { name: /^add credential$/i })).toBeTruthy()
+    })
+
+    it('offers no add control while locked, on a direct visit -- never a dead control', () => {
+      render(<VaultPanel initialised unlocked={false} credentials={[]} />)
+      expect(screen.queryByRole('button', { name: /add credential/i })).toBeNull()
+    })
+
+    it('creates an UNATTACHED credential when no system is chosen', async () => {
+      vi.mocked(addCredentialAction).mockResolvedValue({ ok: true, id: 'new-3' })
+      render(<VaultPanel initialised unlocked credentials={[]} />)
+
+      fireEvent.change(screen.getByLabelText(/^label$/i), { target: { value: 'shared api key' } })
+      fireEvent.change(screen.getByLabelText(/^username$/i), { target: { value: 'service' } })
+      fireEvent.change(screen.getByLabelText(/^secret$/i), { target: { value: 'x' } })
+      fireEvent.click(screen.getByRole('button', { name: /^add credential$/i }))
+
+      // No hostId and no systemKey at all: "absent" is what makes it
+      // unattached, and passing either as a placeholder would attach it to
+      // something that does not exist.
+      await waitFor(() =>
+        expect(addCredentialAction).toHaveBeenCalledWith({
+          label: 'shared api key',
+          username: 'service',
+          secret: 'x',
+        }),
+      )
+      expect(await screen.findByText('Not attached to a system')).toBeTruthy()
+    })
+
+    it('can attach to any system on the board, not only the one linked in from', async () => {
+      vi.mocked(addCredentialAction).mockResolvedValue({ ok: true, id: 'new-4' })
+      render(
+        <VaultPanel
+          initialised
+          unlocked
+          credentials={[]}
+          systemLabels={{
+            'h1::alpha': { hostName: 'host-one', systemName: 'alpha' },
+            'h2::gamma': { hostName: 'host-two', systemName: 'gamma' },
+          }}
+        />,
+      )
+
+      fireEvent.change(screen.getByLabelText(/^label$/i), { target: { value: 'smtp' } })
+      fireEvent.change(screen.getByLabelText(/^username$/i), { target: { value: 'mailer' } })
+      fireEvent.change(screen.getByLabelText(/^secret$/i), { target: { value: 'x' } })
+      fireEvent.change(screen.getByLabelText(/^attach to$/i), { target: { value: 'h2::gamma' } })
+      fireEvent.click(screen.getByRole('button', { name: /^add credential$/i }))
+
+      await waitFor(() =>
+        expect(addCredentialAction).toHaveBeenCalledWith({
+          label: 'smtp',
+          username: 'mailer',
+          secret: 'x',
+          hostId: 'h2',
+          systemKey: 'gamma',
+        }),
+      )
+    })
+
+    it('can create an UNATTACHED credential even when the page was reached from a board row', async () => {
+      vi.mocked(addCredentialAction).mockResolvedValue({ ok: true, id: 'new-5' })
+      render(<VaultPanel initialised unlocked credentials={[]} focusHostId="h9" focusSystemKey="beta" />)
+
+      fireEvent.change(screen.getByLabelText(/^label$/i), { target: { value: 'unrelated' } })
+      fireEvent.change(screen.getByLabelText(/^username$/i), { target: { value: 'someone' } })
+      fireEvent.change(screen.getByLabelText(/^secret$/i), { target: { value: 'x' } })
+      fireEvent.change(screen.getByLabelText(/^attach to$/i), { target: { value: '' } })
+      fireEvent.click(screen.getByRole('button', { name: /^add credential$/i }))
+
+      await waitFor(() =>
+        expect(addCredentialAction).toHaveBeenCalledWith({
+          label: 'unrelated',
+          username: 'someone',
+          secret: 'x',
+        }),
+      )
+    })
+
+    it('shows the failure message and stores nothing when the add fails', async () => {
+      vi.mocked(addCredentialAction).mockResolvedValue({ ok: false, message: 'Could not save the credential.' })
+      render(<VaultPanel initialised unlocked credentials={[]} />)
+
+      fireEvent.change(screen.getByLabelText(/^label$/i), { target: { value: 'x' } })
+      fireEvent.change(screen.getByLabelText(/^username$/i), { target: { value: 'y' } })
+      fireEvent.change(screen.getByLabelText(/^secret$/i), { target: { value: 'z' } })
+      fireEvent.click(screen.getByRole('button', { name: /^add credential$/i }))
+
+      expect(await screen.findByText(/could not save the credential/i)).toBeTruthy()
+      expect(screen.getByText('No credentials stored yet.')).toBeTruthy()
+    })
+  })
+
+  // --- Task 10 / finding C1: removeCredentialAction was exported, tested and
+  // called from nowhere. Deleting a stored production password is
+  // irreversible and there is no undo anywhere in this design, so a single
+  // click must never be enough. ---
+  describe('removing a credential (C1)', () => {
+    it('a single click does not delete -- it asks first', () => {
+      render(<VaultPanel initialised unlocked credentials={[cred()]} />)
+
+      fireEvent.click(screen.getByTestId('remove-c1'))
+
+      // The action must NOT have been called by the first click. This is the
+      // whole requirement: one click away from destroying a production
+      // password is one click too few.
+      expect(removeCredentialAction).not.toHaveBeenCalled()
+      expect(screen.getByTestId('confirm-remove-c1')).toBeTruthy()
+      expect(screen.getByText(/no undo/i)).toBeTruthy()
+      // ...and the credential is still listed.
+      expect(screen.getByTestId('credential-row-c1')).toBeTruthy()
+    })
+
+    it('confirming deletes it and drops it from the list', async () => {
+      vi.mocked(removeCredentialAction).mockResolvedValue({ ok: true })
+      render(<VaultPanel initialised unlocked credentials={[cred()]} />)
+
+      fireEvent.click(screen.getByTestId('remove-c1'))
+      fireEvent.click(screen.getByTestId('confirm-remove-c1'))
+
+      await waitFor(() => expect(removeCredentialAction).toHaveBeenCalledWith('c1'))
+      await waitFor(() => expect(screen.queryByTestId('credential-row-c1')).toBeNull())
+    })
+
+    it('backing out of the confirmation deletes nothing and restores the row', () => {
+      render(<VaultPanel initialised unlocked credentials={[cred()]} />)
+
+      fireEvent.click(screen.getByTestId('remove-c1'))
+      fireEvent.click(screen.getByTestId('cancel-remove-c1'))
+
+      expect(removeCredentialAction).not.toHaveBeenCalled()
+      expect(screen.getByTestId('remove-c1')).toBeTruthy()
+      expect(screen.queryByTestId('confirm-remove-c1')).toBeNull()
+    })
+
+    it('confirming one row does not arm the confirmation on another', () => {
+      render(
+        <VaultPanel
+          initialised
+          unlocked
+          credentials={[cred({ id: 'c1', label: 'first' }), cred({ id: 'c2', label: 'second' })]}
+        />,
+      )
+
+      fireEvent.click(screen.getByTestId('remove-c1'))
+
+      expect(screen.getByTestId('confirm-remove-c1')).toBeTruthy()
+      expect(screen.queryByTestId('confirm-remove-c2')).toBeNull()
+      expect(within(screen.getByTestId('credential-row-c2')).getByTestId('remove-c2')).toBeTruthy()
+    })
+
+    it('keeps the credential listed, with the reason, when the delete fails', async () => {
+      vi.mocked(removeCredentialAction).mockResolvedValue({
+        ok: false,
+        message: 'The vault is locked. Unlock it and try again.',
+      })
+      render(<VaultPanel initialised unlocked credentials={[cred()]} />)
+
+      fireEvent.click(screen.getByTestId('remove-c1'))
+      fireEvent.click(screen.getByTestId('confirm-remove-c1'))
+
+      expect(await screen.findByText(/the vault is locked/i)).toBeTruthy()
+      // Reporting a failure while quietly dropping the row from the list
+      // would tell the operator two contradicting things at once.
+      expect(screen.getByTestId('credential-row-c1')).toBeTruthy()
+    })
+
+    it('offers no remove control while locked -- never a dead control', () => {
+      render(<VaultPanel initialised unlocked={false} credentials={[cred()]} />)
+      expect(screen.queryByTestId('remove-c1')).toBeNull()
+      expect(screen.queryByRole('button', { name: /^remove$/i })).toBeNull()
+    })
+  })
+
+  // --- Task 10 / finding C1: changePassphrase() existed in vault.ts, with
+  // three tests including the recovery-key-survives-a-change proof, and no
+  // action and no UI in front of it. The passphrase could never be changed. ---
+  describe('changing the passphrase (C1)', () => {
+    it('offers the control while unlocked', () => {
+      render(<VaultPanel initialised unlocked credentials={[]} />)
+      expect(screen.getByRole('button', { name: /^change passphrase$/i })).toBeTruthy()
+    })
+
+    it('offers no change control while locked -- never a dead control', () => {
+      render(<VaultPanel initialised unlocked={false} credentials={[]} />)
+      expect(screen.queryByRole('button', { name: /change passphrase/i })).toBeNull()
+    })
+
+    it('passes both passphrases to the action and reports success', async () => {
+      vi.mocked(changePassphraseAction).mockResolvedValue({ ok: true })
+      render(<VaultPanel initialised unlocked credentials={[]} />)
+
+      fireEvent.change(screen.getByLabelText(/^current passphrase$/i), { target: { value: 'the old one' } })
+      fireEvent.change(screen.getByLabelText(/^new passphrase$/i), { target: { value: 'the new one' } })
+      fireEvent.click(screen.getByRole('button', { name: /^change passphrase$/i }))
+
+      await waitFor(() => expect(changePassphraseAction).toHaveBeenCalledWith('the old one', 'the new one'))
+      expect(await screen.findByText(/passphrase changed/i)).toBeTruthy()
+    })
+
+    // Not cosmetic. An operator who believes the change invalidated their
+    // printed recovery key may throw it away -- and it is the only way back
+    // into this vault if the new passphrase is forgotten.
+    it('says the recovery key still works, both before and after the change', async () => {
+      vi.mocked(changePassphraseAction).mockResolvedValue({ ok: true })
+      render(<VaultPanel initialised unlocked credentials={[]} />)
+
+      expect(screen.getByText(/recovery key still works/i)).toBeTruthy()
+
+      fireEvent.change(screen.getByLabelText(/^current passphrase$/i), { target: { value: 'the old one' } })
+      fireEvent.change(screen.getByLabelText(/^new passphrase$/i), { target: { value: 'the new one' } })
+      fireEvent.click(screen.getByRole('button', { name: /^change passphrase$/i }))
+
+      const confirmation = await screen.findByText(/passphrase changed/i)
+      expect(confirmation.textContent).toMatch(/recovery key is unchanged and still works/i)
+    })
+
+    it('shows the failure message and claims no success when the change fails', async () => {
+      vi.mocked(changePassphraseAction).mockResolvedValue({
+        ok: false,
+        message: 'That current passphrase is not the one this vault was locked with. The passphrase is unchanged.',
+      })
+      render(<VaultPanel initialised unlocked credentials={[]} />)
+
+      fireEvent.change(screen.getByLabelText(/^current passphrase$/i), { target: { value: 'wrong' } })
+      fireEvent.change(screen.getByLabelText(/^new passphrase$/i), { target: { value: 'the new one' } })
+      fireEvent.click(screen.getByRole('button', { name: /^change passphrase$/i }))
+
+      expect(await screen.findByText(/is unchanged/i)).toBeTruthy()
+      expect(screen.queryByText(/passphrase changed/i)).toBeNull()
+    })
+
+    // Deliberately exercised on the FAILURE path. On success the handler
+    // clears both fields, so a component that echoed them would show nothing
+    // by the time the assertion runs -- the test would pass without
+    // discriminating (verified: it did). After a failure the values are still
+    // held in state, which is exactly when an echo would be visible, and is
+    // also the moment a failure message is being composed near them.
+    it('never renders either passphrase back into the page, including after a failure', async () => {
+      vi.mocked(changePassphraseAction).mockResolvedValue({
+        ok: false,
+        message: 'That current passphrase is not the one this vault was locked with. The passphrase is unchanged.',
+      })
+      const { container } = render(<VaultPanel initialised unlocked credentials={[]} />)
+
+      fireEvent.change(screen.getByLabelText(/^current passphrase$/i), { target: { value: 'old-passphrase-value' } })
+      fireEvent.change(screen.getByLabelText(/^new passphrase$/i), { target: { value: 'new-passphrase-value' } })
+      fireEvent.click(screen.getByRole('button', { name: /^change passphrase$/i }))
+      await screen.findByText(/is unchanged/i)
+
+      expect(container.textContent ?? '').not.toContain('old-passphrase-value')
+      expect(container.textContent ?? '').not.toContain('new-passphrase-value')
     })
   })
 
