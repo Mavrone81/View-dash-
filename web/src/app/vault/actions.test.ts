@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { Prisma } from '@prisma/client'
 import { prisma } from '../../lib/db.js'
 import { lockSession } from '../../lib/vault/session.js'
 
@@ -314,6 +315,116 @@ describe('vault actions', () => {
       if (!r.ok) {
         expect(r.message.toLowerCase()).not.toMatch(/no longer exists/)
         expect(r.message).not.toContain('connection lost')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  // --- Fix round 3: unlockAction/unlockWithRecoveryAction's own catch must
+  // not attribute EVERY failure to corrupt configuration — only a positively
+  // identified parse failure earns that message. A recognised database
+  // connectivity error gets DATABASE_UNAVAILABLE_MESSAGE, and anything else
+  // gets a neutral message that names no cause. See task-7-report.md
+  // "Fix round 3". ---
+
+  it('unlockAction reports a database problem, not "corrupt configuration", when unlockWithPassphrase itself hits a real Prisma connectivity error', async () => {
+    const created = await createVaultAction('right passphrase')
+    expect(created.ok).toBe(true)
+    lockSession()
+    const row = await prisma.vaultConfig.findFirstOrThrow()
+    // First findUnique call is this action's own isInitialised() guard (must
+    // succeed, so execution reaches unlockWithPassphrase); the second is
+    // unlockWithPassphrase's OWN internal config() read, which is where the
+    // connectivity failure is injected. Using the real Prisma error type
+    // (not a plain Error) is what proves the type-based classification
+    // itself works, rather than merely that some catch fired.
+    const spy = vi.spyOn(prisma.vaultConfig, 'findUnique')
+      .mockResolvedValueOnce(row)
+      .mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError("Can't reach database server", { code: 'P1001', clientVersion: 'test' }),
+      )
+    try {
+      const r = await unlockAction('right passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+        expect(r.message.toLowerCase()).not.toContain('corrupt')
+        expect(r.message.toLowerCase()).not.toContain('passphrase')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('unlockAction reports a neutral failure, not "corrupt configuration" or a database claim, for an error it cannot positively identify', async () => {
+    const created = await createVaultAction('right passphrase')
+    expect(created.ok).toBe(true)
+    lockSession()
+    const row = await prisma.vaultConfig.findFirstOrThrow()
+    // A REAL PrismaClientKnownRequestError, but with a code that is not one
+    // of the recognised connectivity codes (P2025 is "record not found",
+    // unrelated here) — this is what proves the classifier checks the
+    // SPECIFIC code, not just "any PrismaClientKnownRequestError".
+    const spy = vi.spyOn(prisma.vaultConfig, 'findUnique')
+      .mockResolvedValueOnce(row)
+      .mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError('unrelated failure', { code: 'P2025', clientVersion: 'test' }),
+      )
+    try {
+      const r = await unlockAction('right passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).not.toContain('corrupt')
+        expect(r.message.toLowerCase()).not.toMatch(/database|reach|connect/)
+        expect(r.message).not.toContain('unrelated failure')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('unlockWithRecoveryAction reports a database problem, not "corrupt configuration", when unlockWithRecoveryKey itself hits a real Prisma connectivity error', async () => {
+    const created = await createVaultAction('right passphrase')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    lockSession()
+    const row = await prisma.vaultConfig.findFirstOrThrow()
+    const spy = vi.spyOn(prisma.vaultConfig, 'findUnique')
+      .mockResolvedValueOnce(row)
+      .mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError('server has closed the connection', { code: 'P1017', clientVersion: 'test' }),
+      )
+    try {
+      const r = await unlockWithRecoveryAction(created.recoveryKey)
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+        expect(r.message.toLowerCase()).not.toContain('corrupt')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('unlockWithRecoveryAction reports a neutral failure for an error it cannot positively identify', async () => {
+    const created = await createVaultAction('right passphrase')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    lockSession()
+    const row = await prisma.vaultConfig.findFirstOrThrow()
+    const spy = vi.spyOn(prisma.vaultConfig, 'findUnique')
+      .mockResolvedValueOnce(row)
+      .mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError('unrelated failure', { code: 'P2025', clientVersion: 'test' }),
+      )
+    try {
+      const r = await unlockWithRecoveryAction(created.recoveryKey)
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).not.toContain('corrupt')
+        expect(r.message.toLowerCase()).not.toMatch(/database|reach|connect/)
+        expect(r.message).not.toContain('unrelated failure')
       }
     } finally {
       spy.mockRestore()

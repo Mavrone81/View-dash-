@@ -55,6 +55,41 @@ const CONFIG_UNREADABLE_RECOVERY_MESSAGE = 'The stored vault configuration could
 // two vaults fighting over the same singleton row. Kept as its own message
 // in every action that calls isInitialised().
 const DATABASE_UNAVAILABLE_MESSAGE = 'Could not reach the vault database right now. This is a connectivity problem, not evidence that no vault exists — do not create a new one; try again shortly.'
+// For a failure this file cannot positively identify at all: neither a
+// parse failure nor a recognised connectivity error. Naming a cause without
+// evidence is the defect this branch exists to avoid — an unattributed
+// failure is honest, a misattributed one is not.
+const UNLOCK_FAILED_MESSAGE = 'The vault could not be unlocked right now. Try again in a moment.'
+
+// Identifies a database connectivity failure by Prisma's own error TYPES,
+// not by matching error message text (text is version-fragile and can
+// legitimately vary). PrismaClientInitializationError is what Prisma throws
+// when it cannot establish a connection at all; P1001 ("can't reach
+// database server") and P1017 ("server has closed the connection") are the
+// two PrismaClientKnownRequestError codes for a connection that was reachable
+// at some point but isn't now. Anything else — including other
+// PrismaClientKnownRequestError codes — is NOT classified as connectivity;
+// guessing here is exactly what this function exists to refuse to do.
+function isDatabaseConnectivityError(err: unknown): boolean {
+  if (err instanceof Prisma.PrismaClientInitializationError) return true
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    return err.code === 'P1001' || err.code === 'P1017'
+  }
+  return false
+}
+
+// Only claims a corrupt VaultConfig when the evidence actually says so (a
+// JSON.parse failure surfaces as a SyntaxError — that is the one case where
+// the error's own type tells us what happened). A recognised connectivity
+// failure gets its own message instead of being folded into "corrupt", since
+// the correct next step (wait and retry) is the opposite of the corrupt-config
+// advice (use the recovery key). Anything else gets the neutral message
+// rather than a guess.
+function classifyUnlockFailure(err: unknown, corruptConfigMessage: string): Err {
+  if (err instanceof SyntaxError) return failed(corruptConfigMessage)
+  if (isDatabaseConnectivityError(err)) return failed(DATABASE_UNAVAILABLE_MESSAGE)
+  return failed(UNLOCK_FAILED_MESSAGE)
+}
 
 export async function createVaultAction(passphrase: string): Promise<{ ok: true; recoveryKey: string } | Err> {
   if (passphrase.length < MIN_PASSPHRASE_LENGTH) {
@@ -95,13 +130,17 @@ export async function unlockAction(passphrase: string): Promise<{ ok: true } | E
   let ok: boolean
   try {
     ok = await unlockWithPassphrase(passphrase)
-  } catch {
-    // unlockWithPassphrase JSON.parses the stored kdfParams; a corrupt value
-    // throws a raw SyntaxError rather than returning false. That is not a
-    // wrong-passphrase outcome — no passphrase will ever parse corrupt JSON
-    // — so it gets its own message, and the parse error's own text (which
-    // can contain a fragment of the corrupt value) is never surfaced.
-    return failed(CONFIG_UNREADABLE_MESSAGE)
+  } catch (err) {
+    // unlockWithPassphrase can fail for at least two UNRELATED reasons that
+    // call for opposite advice: a corrupt kdfParams column (JSON.parse
+    // throws a SyntaxError — retype-your-passphrase will never help, use
+    // the recovery key) or a database connectivity blip mid-call (retrying
+    // shortly is exactly right, and "corrupt configuration" would be a
+    // guess the evidence does not support). classifyUnlockFailure only
+    // claims corruption when the error type actually says so. The caught
+    // error's own text (which can carry a fragment of the corrupt value) is
+    // never surfaced either way.
+    return classifyUnlockFailure(err, CONFIG_UNREADABLE_MESSAGE)
   }
   if (!ok) return failed('That passphrase did not unlock the vault.')
   revalidatePath('/vault')
@@ -119,13 +158,16 @@ export async function unlockWithRecoveryAction(display: string): Promise<{ ok: t
   let ok: boolean
   try {
     ok = await unlockWithRecoveryKey(display)
-  } catch {
-    // unlockWithRecoveryKey does not currently read kdfParams, so this branch
-    // is not reachable through the same corruption that breaks unlockAction
-    // above — it guards this action against a throw from ANY future change
-    // to that function, consistent with the invariant every other action in
-    // this file follows: nothing here throws to the client.
-    return failed(CONFIG_UNREADABLE_RECOVERY_MESSAGE)
+  } catch (err) {
+    // unlockWithRecoveryKey does not currently read kdfParams, so the
+    // SyntaxError branch of classifyUnlockFailure is not reachable through
+    // this path today — but it still calls config() internally, so a
+    // database connectivity blip during THAT read reaches here and must not
+    // be misreported as "corrupt configuration" (see the same reasoning in
+    // unlockAction above). Shared classification, kept even where one
+    // branch is currently dead, for the same defense-in-depth reason this
+    // catch was added in fix round 1.
+    return classifyUnlockFailure(err, CONFIG_UNREADABLE_RECOVERY_MESSAGE)
   }
   if (!ok) return failed('That recovery key did not unlock the vault.')
   revalidatePath('/vault')
