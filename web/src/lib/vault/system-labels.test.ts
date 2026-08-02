@@ -26,17 +26,18 @@ describe('resolveSystemLabels', () => {
     expect(labels[`${host.id}::alpha`]).toEqual({ hostName: FIXTURE_HOST_A, systemName: 'Alpha System' })
   })
 
-  it('does not resolve a system key that was never enrolled on that host', async () => {
-    const host = await prisma.host.create({ data: { name: FIXTURE_HOST_A } })
-    await prisma.system.create({ data: { hostId: host.id, key: 'alpha', displayName: 'Alpha System' } })
-
-    const labels = await resolveSystemLabels()
-
-    // A credential attached to this same host but a DIFFERENT, never-enrolled
-    // key must read as unresolvable (VaultPanel folds it into "unattached")
-    // -- this is the fixture-level proof behind that design decision.
-    expect(labels[`${host.id}::ghost-key`]).toBeUndefined()
-  })
+  // REMOVED: 'does not resolve a system key that was never enrolled on that
+  // host'. It looked up a key that had never been inserted and asserted the
+  // result was undefined — which is a property of JavaScript object lookup,
+  // not of this function, so no implementation could have failed it. The
+  // implementer reported being unable to make it fail under any mutation,
+  // and that report was correct.
+  //
+  // The design decision it claimed to protect — an unresolvable system reads
+  // as "unattached" rather than as broken — is a VaultPanel behaviour, and it
+  // is covered there by a test that was mutation-verified. Keeping a test
+  // that cannot fail would have left the suite advertising protection that
+  // lives somewhere else.
 
   it('keeps two hosts running a same-named system key distinguishable by hostId', async () => {
     const hostA = await prisma.host.create({ data: { name: FIXTURE_HOST_A } })

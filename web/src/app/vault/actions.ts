@@ -50,13 +50,26 @@ const failed = (message: string): Err => ({ ok: false, message })
 //
 // `remainingSessionMs()` is called on the SAME call stack as the
 // `unlockSession()` call that just set the state it reads (inside
-// createVault/unlockWithPassphrase/unlockWithRecoveryKey in vault.ts), so it
-// returning null here should be unreachable. The `?? DEFAULT_TTL_MS`
-// fallback is not a guess if it is ever hit: every call site in this
-// codebase calls `unlockSession()` without overriding its `ttlMs` parameter,
-// so DEFAULT_TTL_MS is the value that was actually just used.
+// createVault/unlockWithPassphrase/unlockWithRecoveryKey in vault.ts), so
+// null here should be unreachable.
+//
+// It nevertheless falls back to 0, not to DEFAULT_TTL_MS. The tempting
+// argument for DEFAULT_TTL_MS is that every call site unlocks without
+// overriding `ttlMs`, so it is the value that was just used — true today,
+// and still the wrong default. null means "no session is open", so the one
+// state in which this branch can be reached is the state in which the
+// server considers the vault LOCKED. Handing the client a fresh fifteen
+// minutes there would put the panel into exactly the failure this whole
+// round exists to remove: a screen presenting itself as unlocked, holding a
+// secret, while the server refuses every reveal behind it. 0 makes the
+// panel clear and re-lock immediately, which is self-correcting and honest.
+//
+// Deliberately untested: the branch is unreachable, so any test asserting
+// it would have to fake the unreachable state and would prove only that the
+// fake was wired up. Recorded as a reasoned choice rather than covered by a
+// test that cannot fail for the reason it names.
 function sessionDurationForClient(): number {
-  return remainingSessionMs() ?? DEFAULT_TTL_MS
+  return remainingSessionMs() ?? 0
 }
 
 const MIN_PASSPHRASE_LENGTH = 12
