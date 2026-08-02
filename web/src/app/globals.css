@@ -198,11 +198,18 @@ h1 {
 
 .col-version,
 .col-deployed,
-.col-drift {
+.col-drift,
+.col-containers {
   font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
   font-variant-numeric: tabular-nums;
   font-size: 0.75rem;
   color: var(--ink);
+}
+
+/* Never-reported (em dash), NOT a genuine 0/0 -- these two must stay visibly
+   distinct, see FleetRow.containersRunning. */
+.col-containers--unknown {
+  color: var(--ink-muted);
 }
 
 .col-change {

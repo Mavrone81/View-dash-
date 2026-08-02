@@ -45,13 +45,53 @@ describe('FleetTable', () => {
     expect(screen.getByText(/no systems reported/i)).toBeTruthy()
   })
 
-  // The redesign ("Heartbeat") drops the Containers column from the visual
-  // layout entirely -- the spec's column list is System, State, Last 40
-  // beats, Version, Deployed, Latest change, Drift, with no Containers among
-  // them. The never-vs-zero-containers distinction this used to guard is
-  // still enforced, just one layer down: fleet-query.test.ts asserts
-  // `row.containersRunning`/`containersTotal` stay null vs. real 0 at the
-  // data layer, which is the only layer that still surfaces them.
+  // Restored after the "Heartbeat" redesign dropped this column: the spec's
+  // column list omitted it by mistake, not by decision, and the product
+  // owner asked for it back between State and Last 40 beats. Scoped to
+  // `.col-containers` throughout -- other cells on the row (state, sha,
+  // deployed timestamp, drift) render their own em dashes for their own
+  // unknowns, so an unscoped `getAllByText('—')` would pass whether or not
+  // this column renders anything at all.
+  describe('the Containers column', () => {
+    it('renders a real zero-container count as 0/0, not a dash', () => {
+      const { container } = render(
+        <FleetTable rows={[row({ containersRunning: 0, containersTotal: 0 })]} />,
+      )
+      const cell = container.querySelector('.col-containers')
+      expect(cell?.textContent).toBe('0/0')
+      expect(cell?.textContent).not.toContain('—')
+    })
+
+    it('renders an em dash, not a fabricated 0/0, for a system that has never reported', () => {
+      const { container } = render(
+        <FleetTable rows={[row({ containersRunning: null, containersTotal: null })]} />,
+      )
+      const cell = container.querySelector('.col-containers')
+      expect(cell?.textContent).toBe('—')
+      expect(cell?.textContent).not.toContain('0/0')
+    })
+
+    it('renders a genuine non-zero count plainly', () => {
+      const { container } = render(
+        <FleetTable rows={[row({ containersRunning: 2, containersTotal: 3 })]} />,
+      )
+      expect(container.querySelector('.col-containers')?.textContent).toBe('2/3')
+    })
+
+    it('marks the never-reported dash as muted, distinct from a real count', () => {
+      const { container } = render(
+        <FleetTable rows={[row({ containersRunning: null, containersTotal: null })]} />,
+      )
+      expect(container.querySelector('.col-containers')?.classList.contains('col-containers--unknown')).toBe(true)
+    })
+
+    it('does not mark a genuine 0/0 as the muted unknown state', () => {
+      const { container } = render(
+        <FleetTable rows={[row({ containersRunning: 0, containersTotal: 0 })]} />,
+      )
+      expect(container.querySelector('.col-containers')?.classList.contains('col-containers--unknown')).toBe(false)
+    })
+  })
 
   describe('the trace strip (Last 40 beats)', () => {
     // Scoped to `.beat-trace` (the strip itself), NOT the whole rendered

@@ -30,9 +30,7 @@ export type FleetRow = {
   // collapsing "never heard from" into that same text would let a system
   // that has been silent since it was enrolled look identical to one that
   // is live and simply empty, on the one page whose job is telling an
-  // operator which of those is true. (Not rendered in the table itself since
-  // the "Heartbeat" redesign — the trace strip carries that signal now — but
-  // kept on the row and enforced at the data layer, see fleet-query.test.ts.)
+  // operator which of those is true. Rendered by `containersLabel` below.
   containersRunning: number | null
   containersTotal: number | null
   deployedSha: string | null
@@ -97,6 +95,20 @@ function lastSeenLabel(at: Date | null): string {
 function stateLabel(row: FleetRow): string {
   if (row.state !== 'stale' && row.state !== 'unknown') return row.state
   return `${row.state} — agent unreachable, ${lastSeenLabel(row.receivedAt ?? row.lastSeenAt)}`
+}
+
+/**
+ * `null` (either field) means this system has never reported and there is
+ * nothing to count -- rendered as the same em dash every other unknown value
+ * on this board gets. A genuine `0/0` is a real, checked fact about a system
+ * that IS reporting and simply runs no containers, so it renders as ordinary
+ * digits, never the dash. These two must stay visually distinguishable: the
+ * dash carries `.col-containers--unknown` (muted), a real count does not --
+ * see the CRITICAL defect this guards against in `FleetRow.containersRunning`.
+ */
+function containersLabel(running: number | null, total: number | null): string {
+  if (running === null || total === null) return DASH
+  return `${running}/${total}`
 }
 
 /**
@@ -174,6 +186,7 @@ export function FleetTable({ rows }: { rows: FleetRow[] }) {
           <tr>
             <th scope="col">System</th>
             <th scope="col">State</th>
+            <th scope="col">Containers</th>
             <th scope="col">Last 40 beats</th>
             <th scope="col">Version</th>
             <th scope="col">Deployed</th>
@@ -191,6 +204,15 @@ export function FleetTable({ rows }: { rows: FleetRow[] }) {
               </td>
               <td className="col-state" data-state={r.state}>
                 {stateLabel(r)}
+              </td>
+              <td
+                className={
+                  r.containersRunning === null || r.containersTotal === null
+                    ? 'col-containers col-containers--unknown'
+                    : 'col-containers'
+                }
+              >
+                {containersLabel(r.containersRunning, r.containersTotal)}
               </td>
               <td className="col-trace">
                 <BeatTrace beats={r.beats} />
