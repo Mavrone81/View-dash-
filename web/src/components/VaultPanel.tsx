@@ -183,6 +183,11 @@ export function VaultPanel({
   // once dismissed, there is no way back to this screen short of a fresh
   // createVaultAction call, which the "already exists" guard refuses.
   const [createdRecoveryKey, setCreatedRecoveryKey] = useState<string | null>(null)
+  // Set when the session deadline passed while the recovery key was STILL ON
+  // SCREEN unacknowledged (fix I2). Distinct from `createdRecoveryKey ===
+  // null`, which is also true after the operator confirms storing it -- this
+  // one means the key was destroyed before anyone wrote it down.
+  const [recoveryKeyLostToDeadline, setRecoveryKeyLostToDeadline] = useState(false)
 
   async function handleCreate(e: FormEvent<HTMLFormElement>) {
     e.preventDefault()
@@ -284,6 +289,12 @@ export function VaultPanel({
   // the timer unfired -- exactly the walk-away cases this fix exists for --
   // so `visibilitychange` and `focus` re-check the same deadline every time
   // the tab could plausibly have been away.
+  //
+  // `createdRecoveryKey` is in the dependency list, not merely read from a
+  // stale closure, so `checkAndLock` always sees the CURRENT value: the
+  // recovery-key gate is set by the same handler that sets the deadline, and
+  // is cleared by a later, unrelated click, so neither ordering may be
+  // assumed.
   useEffect(() => {
     if (localDeadlineMs === null) return
     function checkAndLock() {
@@ -291,6 +302,23 @@ export function VaultPanel({
         setLocalUnlocked(false)
         setRevealedCredential(null)
         setRevealErrors({})
+        // Fix I2. The recovery-key gate returns BEFORE every other branch,
+        // so without this the whole clearing above was invisible: the key
+        // stayed rendered under a screen that never even said Locked. It is
+        // the worst secret this panel ever displays -- it permanently
+        // unwraps the vault key, nothing can redisplay or rotate it, and it
+        // survives a passphrase change by design -- so it gets the same
+        // treatment as a revealed credential, not an exemption.
+        //
+        // Clearing it is safe precisely because of where that gate sits: the
+        // operator cannot have reached any add control yet, so the vault is
+        // provably empty and recreating it costs nothing. Losing an
+        // unacknowledged recovery key to a timeout is survivable; leaving it
+        // on an unattended screen indefinitely is not.
+        if (createdRecoveryKey !== null) {
+          setCreatedRecoveryKey(null)
+          setRecoveryKeyLostToDeadline(true)
+        }
       }
     }
     checkAndLock() // in case the deadline has already passed by the time this effect runs
@@ -303,7 +331,7 @@ export function VaultPanel({
       document.removeEventListener('visibilitychange', checkAndLock)
       window.removeEventListener('focus', checkAndLock)
     }
-  }, [localDeadlineMs])
+  }, [localDeadlineMs, createdRecoveryKey])
 
   // --- Lock (manual) ---
   async function handleLock() {
@@ -394,6 +422,35 @@ export function VaultPanel({
     activeFocusHostId !== null && activeFocusSystemKey !== null
       ? (labels[`${activeFocusHostId}::${activeFocusSystemKey}`]?.systemName ?? activeFocusSystemKey)
       : null
+
+  // --- Recovery key destroyed at the deadline before it was acknowledged
+  // (fix I2): a hard stop, ahead of every other branch including the gate
+  // itself. There is deliberately no control here to carry on with. A vault
+  // whose only recovery key was never written down is one forgotten
+  // passphrase away from taking every credential in it with it, and the
+  // moment to say so is BEFORE the first credential is stored -- which is
+  // exactly the moment this state can occur in, and no other. ---
+  if (recoveryKeyLostToDeadline) {
+    return (
+      <section className="vault-panel" aria-labelledby="vault-heading">
+        <h2 id="vault-heading">Vault</h2>
+        <div className="vault-recovery-gate" role="alert">
+          <p>
+            <strong>The recovery key was cleared before you confirmed storing it.</strong> The vault
+            session reached its deadline while the key was still on screen, so it was removed rather
+            than left on an unattended display. It cannot be shown again, and nothing can regenerate
+            it.
+          </p>
+          <p>
+            <strong>This vault must be recreated before anything is stored in it.</strong> Nothing has
+            been stored yet -- the recovery key is shown before any credential can be added -- so
+            recreating it costs nothing but the time. Remove the stored vault configuration and set
+            the vault up again, and store the new recovery key the moment it appears.
+          </p>
+        </div>
+      </section>
+    )
+  }
 
   // --- Recovery-key gate: takes over the ENTIRE panel until acknowledged ---
   if (createdRecoveryKey !== null) {

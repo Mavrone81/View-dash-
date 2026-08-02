@@ -487,6 +487,104 @@ describe('VaultPanel', () => {
     })
   })
 
+  // --- Task 10 / finding I2: the recovery-key gate renders BEFORE every
+  // other branch, and `checkAndLock` cleared `localUnlocked`,
+  // `revealedCredential` and `revealErrors` -- never `createdRecoveryKey`.
+  // So an unacknowledged recovery key stayed on screen indefinitely past the
+  // auto-lock, on the one screen where the deadline was never applied. That
+  // is worse than a leaked reveal: the recovery key permanently unwraps the
+  // vault key, nothing can redisplay or rotate it, and it survives every
+  // passphrase change by design.
+  //
+  // The ruling: clear it at the deadline and replace it with a hard stop.
+  // Safe precisely because this gate renders before every other branch --
+  // the operator cannot have added a credential yet, so the vault is
+  // provably empty at that moment and recreating it costs nothing.
+  describe('the recovery key does not outlive the session deadline (I2)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+      vi.setSystemTime(0)
+    })
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    async function createVaultShowingTheKey() {
+      vi.mocked(createVaultAction).mockResolvedValue({
+        ok: true,
+        recoveryKey: 'RK-EXAMPLE-VALUE',
+        sessionRemainingMs: 5000,
+      })
+      render(<VaultPanel initialised={false} unlocked={false} credentials={[]} />)
+      await act(async () => {
+        fireEvent.change(screen.getByLabelText(/passphrase/i), { target: { value: 'a very long passphrase' } })
+        fireEvent.click(screen.getByRole('button', { name: /^create vault$/i }))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      // Precondition, not the assertion under test: it really is on screen
+      // before the deadline, so its absence afterwards means something.
+      expect(screen.getByText('RK-EXAMPLE-VALUE')).toBeTruthy()
+    }
+
+    it('clears an unacknowledged recovery key at the deadline, via its own timer', async () => {
+      await createVaultShowingTheKey()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5001)
+      })
+
+      expect(screen.queryByText('RK-EXAMPLE-VALUE')).toBeNull()
+      // ...and does not silently drop the operator into a working vault whose
+      // recovery key they never stored.
+      expect(screen.getByText(/must be recreated/i)).toBeTruthy()
+      expect(screen.queryByRole('button', { name: /i have stored it/i })).toBeNull()
+    })
+
+    // The suspended-laptop path: the wall clock jumps but the timer queue
+    // never advances, so only a focus/visibility re-check can notice. Covered
+    // independently of the timer above -- the timer firing and the event
+    // firing are different code paths and only one of them was ever wired to
+    // this state.
+    it('clears an unacknowledged recovery key when the tab regains focus past the deadline', async () => {
+      await createVaultShowingTheKey()
+
+      vi.setSystemTime(6000)
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'))
+      })
+
+      expect(screen.queryByText('RK-EXAMPLE-VALUE')).toBeNull()
+      expect(screen.getByText(/must be recreated/i)).toBeTruthy()
+    })
+
+    it('leaves the recovery key alone right up to the deadline', async () => {
+      await createVaultShowingTheKey()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000)
+      })
+
+      expect(screen.getByText('RK-EXAMPLE-VALUE')).toBeTruthy()
+      expect(screen.queryByText(/must be recreated/i)).toBeNull()
+    })
+
+    it('an acknowledged recovery key leaves no hard stop behind at the deadline', async () => {
+      await createVaultShowingTheKey()
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /i have stored it/i }))
+      })
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5001)
+      })
+
+      // The normal auto-lock, not the hard stop: the key was stored, so
+      // there is nothing to recreate.
+      expect(screen.getByText('Locked', { exact: true })).toBeTruthy()
+      expect(screen.queryByText(/must be recreated/i)).toBeNull()
+    })
+  })
+
   describe('creating the vault', () => {
     it('shows the recovery key once after creation, with an instruction to store it off this machine, and never shows it again', async () => {
       vi.mocked(createVaultAction).mockResolvedValue({
