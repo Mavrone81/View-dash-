@@ -20,12 +20,21 @@ const SUMMARY = {
 
 const aadFor = (id: string): string => `credential:${id}:secret`
 
+// Named so callers (the server-action layer, in particular) can distinguish
+// "the vault is locked" from "the id doesn't exist" from a decrypt failure
+// with `instanceof`, rather than matching on error message text — a rename
+// of the message would otherwise silently break that distinction. Messages
+// are kept identical to what this file already threw so existing tests that
+// assert on them keep passing.
+export class VaultLockedError extends Error {}
+export class CredentialNotFoundError extends Error {}
+
 function requireKey(): Buffer {
   const key = currentVaultKey()
   // A locked vault must fail loudly. Returning an empty string here would let
   // a caller render a blank field, which reads as "no credential stored" —
   // a different and false fact.
-  if (!key) throw new Error('vault is locked')
+  if (!key) throw new VaultLockedError('vault is locked')
   return key
 }
 
@@ -89,12 +98,12 @@ export async function revealCredential(id: string): Promise<string> {
   // In every failure path, the row written to the audit table is the id and an action
   // string only — never the ciphertext, the key, or any fragment of a secret.
   const row = await prisma.credential.findUnique({ where: { id }, select: { id: true, secretSealed: true } })
-  if (!row) throw new Error('credential not found')
+  if (!row) throw new CredentialNotFoundError('credential not found')
 
   const key = currentVaultKey()
   if (!key) {
     await prisma.credentialAccess.create({ data: { credentialId: id, action: 'reveal-denied' } })
-    throw new Error('vault is locked')
+    throw new VaultLockedError('vault is locked')
   }
 
   let secret: string
