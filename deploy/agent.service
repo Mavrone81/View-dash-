@@ -97,7 +97,13 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 RestrictNamespaces=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
+# MemoryDenyWriteExecute is deliberately NOT set. It forbids memory pages
+# that are both writable and executable, which is exactly what V8's JIT
+# needs: with it enabled, node dies immediately with a SIGTRAP core dump
+# inside the baseline compiler. Verified on a real systemd host — the unit
+# looked correct and could not start at all.
+# Do not "restore" this directive without re-running the agent under it.
+# MemoryDenyWriteExecute=true   # incompatible with any V8/JIT runtime
 # AF_UNIX for the Docker socket; AF_INET/AF_INET6 for the outbound
 # WebSocket connection to the dashboard. Nothing else this agent does
 # needs any other address family.
