@@ -1,5 +1,6 @@
 'use server'
 
+import { Prisma } from '@prisma/client'
 import { createVault, unlockWithPassphrase, unlockWithRecoveryKey, isInitialised } from '../../lib/vault/vault.js'
 import { lockSession } from '../../lib/vault/session.js'
 import {
@@ -45,12 +46,27 @@ const CONFIG_UNREADABLE_MESSAGE = 'The stored vault configuration could not be r
 // recovery key here would be circular, since that is what the caller is
 // already using.
 const CONFIG_UNREADABLE_RECOVERY_MESSAGE = 'The stored vault configuration could not be read and may be corrupt.'
+// isInitialised() is a bare database read (`prisma.vaultConfig.findUnique`).
+// If the database itself is unreachable or times out, that call rejects —
+// and "we cannot currently tell whether a vault exists" is a DIFFERENT fact
+// from "no vault has been created yet". Folding the two together would
+// invite an operator to create a new vault over one that is merely
+// temporarily unreachable, which is exactly how a dashboard ends up with
+// two vaults fighting over the same singleton row. Kept as its own message
+// in every action that calls isInitialised().
+const DATABASE_UNAVAILABLE_MESSAGE = 'Could not reach the vault database right now. This is a connectivity problem, not evidence that no vault exists — do not create a new one; try again shortly.'
 
 export async function createVaultAction(passphrase: string): Promise<{ ok: true; recoveryKey: string } | Err> {
   if (passphrase.length < MIN_PASSPHRASE_LENGTH) {
     return failed(`Passphrase must be at least ${MIN_PASSPHRASE_LENGTH} characters.`)
   }
-  if (await isInitialised()) return failed('A vault already exists on this dashboard.')
+  let alreadyExists: boolean
+  try {
+    alreadyExists = await isInitialised()
+  } catch {
+    return failed(DATABASE_UNAVAILABLE_MESSAGE)
+  }
+  if (alreadyExists) return failed('A vault already exists on this dashboard.')
   try {
     const { recoveryKey } = await createVault(passphrase)
     revalidatePath('/vault')
@@ -69,7 +85,13 @@ export async function createVaultAction(passphrase: string): Promise<{ ok: true;
 }
 
 export async function unlockAction(passphrase: string): Promise<{ ok: true } | Err> {
-  if (!(await isInitialised())) return failed(NOT_INITIALISED_MESSAGE)
+  let initialised: boolean
+  try {
+    initialised = await isInitialised()
+  } catch {
+    return failed(DATABASE_UNAVAILABLE_MESSAGE)
+  }
+  if (!initialised) return failed(NOT_INITIALISED_MESSAGE)
   let ok: boolean
   try {
     ok = await unlockWithPassphrase(passphrase)
@@ -87,7 +109,13 @@ export async function unlockAction(passphrase: string): Promise<{ ok: true } | E
 }
 
 export async function unlockWithRecoveryAction(display: string): Promise<{ ok: true } | Err> {
-  if (!(await isInitialised())) return failed(NOT_INITIALISED_MESSAGE)
+  let initialised: boolean
+  try {
+    initialised = await isInitialised()
+  } catch {
+    return failed(DATABASE_UNAVAILABLE_MESSAGE)
+  }
+  if (!initialised) return failed(NOT_INITIALISED_MESSAGE)
   let ok: boolean
   try {
     ok = await unlockWithRecoveryKey(display)
@@ -155,7 +183,16 @@ export async function removeCredentialAction(id: string): Promise<{ ok: true } |
     await removeCredential(id)
     revalidatePath('/vault')
     return { ok: true }
-  } catch {
+  } catch (err) {
+    // Prisma's delete throws P2025 ("Record to delete does not exist") when
+    // the id is already gone — a distinguishable, non-alarming fact (the
+    // caller's goal, "this credential should not exist", is already true)
+    // from any other delete failure (e.g. the database rejecting the
+    // statement itself), which is worth flagging as failed rather than as
+    // a no-op success.
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
+      return failed('This credential no longer exists.')
+    }
     return failed('Could not delete this credential.')
   }
 }

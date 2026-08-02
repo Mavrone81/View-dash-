@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { prisma } from '../../lib/db.js'
 import { lockSession } from '../../lib/vault/session.js'
@@ -217,6 +218,102 @@ describe('vault actions', () => {
         expect(r.message.toLowerCase()).toContain('already exists')
         // The rejected insert's own message must not leak through.
         expect(r.message).not.toContain('Unique constraint')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  // --- Fix round 2: isInitialised() itself must not be able to throw past
+  // the action boundary, and it must be reported as its own fact (a
+  // database problem), never folded into "no vault exists" or "wrong
+  // passphrase" — see task-7-report.md "Fix round 2". ---
+
+  it('createVaultAction reports a database problem, not a thrown rejection, when isInitialised() itself rejects', async () => {
+    const spy = vi.spyOn(prisma.vaultConfig, 'findUnique').mockRejectedValueOnce(new Error('connection refused'))
+    try {
+      const r = await createVaultAction('right passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+        // Must not read as "no vault exists" (which would invite creating a
+        // second one once the database comes back) or leak the raw error.
+        expect(r.message.toLowerCase()).not.toContain('already exists')
+        expect(r.message).not.toContain('connection refused')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+    expect(await prisma.vaultConfig.count()).toBe(0)
+  })
+
+  it('unlockAction reports a database problem, not a thrown rejection, when isInitialised() itself rejects', async () => {
+    const spy = vi.spyOn(prisma.vaultConfig, 'findUnique').mockRejectedValueOnce(new Error('connection refused'))
+    try {
+      const r = await unlockAction('right passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+        // Must not read as "no vault has been created" or "wrong passphrase".
+        expect(r.message.toLowerCase()).not.toContain('passphrase')
+        expect(r.message).not.toContain('connection refused')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('unlockWithRecoveryAction reports a database problem, not a thrown rejection, when isInitialised() itself rejects', async () => {
+    const spy = vi.spyOn(prisma.vaultConfig, 'findUnique').mockRejectedValueOnce(new Error('connection refused'))
+    try {
+      const r = await unlockWithRecoveryAction('irrelevant recovery key')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+        expect(r.message).not.toContain('connection refused')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  // --- Fix round 2: addCredentialAction's locked-vault branch had no test ---
+
+  it('addCredentialAction reports a locked vault distinctly from a generic save failure', async () => {
+    await createVaultAction('right passphrase')
+    lockSession()
+    const r = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.message.toLowerCase()).toContain('locked')
+      expect(r.message).not.toContain('hunter2')
+    }
+  })
+
+  // --- Fix round 2: removeCredentialAction's catch was untested; "already
+  // gone" (Prisma P2025) and any other delete failure are deliberately
+  // distinguished rather than sharing a message, matching how the reveal
+  // and add paths distinguish their own failure facts. ---
+
+  it('removeCredentialAction reports an already-gone credential distinctly from a generic delete failure', async () => {
+    await createVaultAction('right passphrase')
+    const r = await removeCredentialAction(randomUUID())
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.message.toLowerCase()).toMatch(/no longer exists|already/)
+  })
+
+  it('removeCredentialAction reports a generic delete failure distinctly from an already-gone credential', async () => {
+    await createVaultAction('right passphrase')
+    const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+    expect(add.ok).toBe(true)
+    if (!add.ok) return
+    const spy = vi.spyOn(prisma.credential, 'delete').mockRejectedValueOnce(new Error('connection lost'))
+    try {
+      const r = await removeCredentialAction(add.id)
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).not.toMatch(/no longer exists/)
+        expect(r.message).not.toContain('connection lost')
       }
     } finally {
       spy.mockRestore()
