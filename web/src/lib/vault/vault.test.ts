@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { prisma } from '../db.js'
 import { lockSession, unlockSession, isUnlocked, currentVaultKey } from './session.js'
 import {
@@ -171,6 +171,7 @@ describe('recreating a vault whose recovery key was never stored', () => {
   // the UI's for having hidden a button.
   it('REFUSES to recreate a vault holding a credential, and destroys nothing', async () => {
     await createVault('right passphrase')
+    await acknowledgeRecoveryKey()
     const id = await addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
 
     await expect(recreateVault('a different passphrase')).rejects.toBeInstanceOf(VaultNotEmptyError)
@@ -186,6 +187,7 @@ describe('recreating a vault whose recovery key was never stored', () => {
 
   it('refuses on the credential COUNT, not on whether the credential is attached to a system', async () => {
     await createVault('right passphrase')
+    await acknowledgeRecoveryKey()
     await addCredential({ label: 'orphan', username: 'operator', secret: 'hunter2' })
     await expect(recreateVault('a different passphrase')).rejects.toBeInstanceOf(VaultNotEmptyError)
   })
@@ -256,8 +258,8 @@ describe('recreating a vault whose recovery key was never stored', () => {
 
     it('reports the not-empty refusal, not the acknowledgement one, when BOTH would apply', async () => {
       await createVault('right passphrase')
-      await addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
       await acknowledgeRecoveryKey()
+      await addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
       lockSession()
       // Stored credentials are the graver fact and the one with no way
       // around it; reporting "unlock and retry" here would send the operator
@@ -266,8 +268,177 @@ describe('recreating a vault whose recovery key was never stored', () => {
     })
   })
 
+  // --- Task 10 round 4. The SERIALIZABLE pairing was reasoned about and was
+  // WRONG, which a real database settled: with both transactions at
+  // SERIALIZABLE, this interleaving committed BOTH of them. Postgres SSI
+  // aborts on a dangerous structure that needs a CYCLE; `recreateVault` read
+  // Credential and wrote VaultConfig, `addCredential` wrote Credential and
+  // read nothing `recreateVault` writes -- one rw-edge, no cycle, no abort.
+  // The credential survived, sealed under the OLD vault key, while
+  // VaultConfig held the new one. Permanently unreadable, silently, with no
+  // error anywhere.
+  //
+  // These tests DRIVE the interleaving against the real database rather than
+  // describing it: one transaction is suspended mid-flight, at the exact
+  // statement that matters, while the other runs into it. Both orderings are
+  // covered, because the fix has a different mechanism in each.
+  describe('a credential stored while a recreate is in flight (round 4)', () => {
+    /**
+     * Suspends the NEXT `prisma.$transaction` immediately after a chosen
+     * statement, using the real transaction underneath so the locking under
+     * test is Postgres's own and not a simulation.
+     *
+     * `after: 'count'` pauses a recreate just past its `credential.count()`;
+     * `after: 'lock'` pauses an addCredential just past the `$queryRaw` that
+     * takes the row lock. In both cases the transaction stays OPEN, holding
+     * whatever it has locked, until `release()`.
+     */
+    function suspendNextTransaction(after: 'count' | 'lock') {
+      let release!: () => void
+      const suspended = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      let reach!: () => void
+      const reached = new Promise<void>((resolve) => {
+        reach = resolve
+      })
+
+      const realTransaction = prisma.$transaction.bind(prisma)
+      const spy = vi
+        .spyOn(prisma, '$transaction')
+        .mockImplementationOnce((run: unknown, options: unknown) =>
+          (realTransaction as (r: unknown, o: unknown) => Promise<unknown>)(
+            async (tx: unknown) => {
+              const target = tx as Record<string, unknown>
+              const paused = new Proxy(target, {
+                get(t, prop, receiver) {
+                  if (after === 'count' && prop === 'credential') {
+                    const real = Reflect.get(t, prop, receiver) as {
+                      count: (...a: unknown[]) => Promise<number>
+                    }
+                    return {
+                      ...real,
+                      count: async (...args: unknown[]) => {
+                        const n = await real.count(...args)
+                        reach()
+                        await suspended
+                        return n
+                      },
+                    }
+                  }
+                  if (after === 'lock' && prop === '$queryRaw') {
+                    const real = Reflect.get(t, prop, receiver) as (
+                      ...a: unknown[]
+                    ) => Promise<unknown>
+                    return async (...args: unknown[]) => {
+                      const rows = await real.apply(t, args)
+                      reach()
+                      await suspended
+                      return rows
+                    }
+                  }
+                  return Reflect.get(t, prop, receiver)
+                },
+              })
+              return (run as (t: unknown) => Promise<unknown>)(paused)
+            },
+            options,
+          ),
+        )
+
+      return { release, reached, restore: () => spy.mockRestore() }
+    }
+
+    /** Long enough for the other transaction to reach its lock and block on it. */
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 250))
+
+    /**
+     * The invariant, checked against the DATABASE rather than inferred from
+     * which promise rejected: whatever survived must still be readable under
+     * whatever configuration survived. A credential sealed under a discarded
+     * vault key is the exact silent corruption this is about.
+     */
+    async function everySurvivingCredentialIsStillReadable() {
+      const survivors = await prisma.credential.findMany({ select: { id: true } })
+      lockSession()
+      const opened =
+        (await unlockWithPassphrase('right passphrase')) ||
+        (await unlockWithPassphrase('a different passphrase'))
+      expect(opened).toBe(true)
+      for (const row of survivors) {
+        await expect(revealCredential(row.id)).resolves.toBe('hunter2')
+      }
+      return survivors.length
+    }
+
+    it('refuses the ADD when a recreate already holds the vault configuration', async () => {
+      await createVault('right passphrase')
+      await acknowledgeRecoveryKey()
+
+      const held = suspendNextTransaction('count')
+      let addOutcome: PromiseSettledResult<string>
+      let recreateOutcome: PromiseSettledResult<{ recoveryKey: string }>
+      try {
+        const recreating = recreateVault('a different passphrase')
+        await held.reached
+
+        // Starts while the recreate holds the row lock, so this blocks on it.
+        const adding = addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
+        await settle()
+        held.release()
+        ;[recreateOutcome, addOutcome] = await Promise.allSettled([recreating, adding])
+      } finally {
+        held.restore()
+      }
+
+      // Both succeeding is the reviewer's finding. Before the fix this
+      // assertion failed with `expected true to be false`.
+      expect(
+        addOutcome.status === 'fulfilled' && recreateOutcome.status === 'fulfilled',
+      ).toBe(false)
+      // In THIS ordering the recreate wins and the add is the one refused:
+      // the row it waited for was deleted, so its lock query returns nothing.
+      expect(recreateOutcome.status).toBe('fulfilled')
+      expect(addOutcome.status).toBe('rejected')
+      expect(await everySurvivingCredentialIsStillReadable()).toBe(0)
+    })
+
+    it('refuses the RECREATE when an add already holds the vault configuration', async () => {
+      await createVault('right passphrase')
+      await acknowledgeRecoveryKey()
+
+      const held = suspendNextTransaction('lock')
+      let addOutcome: PromiseSettledResult<string>
+      let recreateOutcome: PromiseSettledResult<{ recoveryKey: string }>
+      try {
+        const adding = addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
+        await held.reached
+
+        const recreating = recreateVault('a different passphrase')
+        await settle()
+        held.release()
+        ;[recreateOutcome, addOutcome] = await Promise.allSettled([recreating, adding])
+      } finally {
+        held.restore()
+      }
+
+      expect(
+        addOutcome.status === 'fulfilled' && recreateOutcome.status === 'fulfilled',
+      ).toBe(false)
+      // The mirror ordering: the add commits, and the recreate's count --
+      // taken only after it finally acquires the lock -- sees it.
+      expect(addOutcome.status).toBe('fulfilled')
+      expect(recreateOutcome.status).toBe('rejected')
+      if (recreateOutcome.status === 'rejected') {
+        expect(recreateOutcome.reason).toBeInstanceOf(VaultNotEmptyError)
+      }
+      expect(await everySurvivingCredentialIsStillReadable()).toBe(1)
+    })
+  })
+
   it('allows recreation again once the last credential is gone', async () => {
     await createVault('right passphrase')
+    await acknowledgeRecoveryKey()
     const id = await addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
     await expect(recreateVault('a different passphrase')).rejects.toThrow()
     await prisma.credential.delete({ where: { id } })

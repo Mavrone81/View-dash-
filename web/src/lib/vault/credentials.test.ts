@@ -3,13 +3,14 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Prisma } from '@prisma/client'
 import { prisma } from '../db.js'
 import { lockSession } from './session.js'
-import { createVault, unlockWithPassphrase } from './vault.js'
+import { createVault, unlockWithPassphrase, acknowledgeRecoveryKey } from './vault.js'
 import {
   addCredential,
   listCredentials,
   revealCredential,
   credentialsForSystem,
   removeCredential,
+  RecoveryKeyUnacknowledgedError,
 } from './credentials.js'
 
 // Host.name is @unique and nothing in this suite truncates the Host table, so
@@ -82,6 +83,13 @@ describe('credentials', () => {
     await prisma.credential.deleteMany()
     await prisma.vaultConfig.deleteMany()
     await createVault('right')
+    // Storing a credential now REQUIRES the recovery key to have been
+    // acknowledged (round 4, finding 3) -- design spec section 4.1's "this
+    // vault must be recreated before anything is stored in it" is enforced by
+    // `addCredential` rather than by a paragraph above the add form. Every
+    // test below that stores a credential therefore starts from a vault in
+    // the ordinary post-setup state: created, key stored, confirmed.
+    await acknowledgeRecoveryKey()
   })
 
   it('stores a secret and reveals it again', async () => {
@@ -264,6 +272,53 @@ describe('credentials', () => {
       // retry therefore cannot produce a second row holding the same secret.
       expect(await prisma.credential.count()).toBe(0)
       expect(await prisma.credentialAccess.count()).toBe(0)
+    })
+  })
+
+  // --- Task 10 round 4, finding 3. Design spec section 4.1's "this vault
+  // must be recreated before anything is stored in it" was enforced by a
+  // PARAGRAPH above the add form. Clicking past it was enough: store one
+  // login and the recreate offer withdraws, the warning inverts to
+  // "recreating is no longer possible", and the recovery key was never
+  // recorded -- one forgotten passphrase from losing every credential in the
+  // vault, which is the exact catastrophe rounds 2 and 3 exist to remove.
+  // Hiding a control is presentation; this is the refusal. ---
+  describe('storing into a vault whose recovery key was never acknowledged', () => {
+    it('REFUSES, and persists nothing at all', async () => {
+      // Undo the suite's acknowledgement to get the state a real operator
+      // reaches by creating a vault and walking away from the gate.
+      await prisma.vaultConfig.updateMany({ data: { recoveryKeyAcknowledgedAt: null } })
+
+      await expect(
+        addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' }),
+      ).rejects.toBeInstanceOf(RecoveryKeyUnacknowledgedError)
+
+      expect(await prisma.credential.count()).toBe(0)
+      expect(await prisma.credentialAccess.count()).toBe(0)
+    })
+
+    it('accepts the very same credential once the acknowledgement is recorded', async () => {
+      await prisma.vaultConfig.updateMany({ data: { recoveryKeyAcknowledgedAt: null } })
+      await expect(
+        addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' }),
+      ).rejects.toThrow()
+
+      // Proves the refusal is about the acknowledgement and nothing else --
+      // no trap, and no lingering state from the rejected attempt.
+      await acknowledgeRecoveryKey()
+      const id = await addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
+      expect(await revealCredential(id)).toBe('hunter2')
+    })
+
+    it('refuses when the vault configuration has vanished underneath the session', async () => {
+      // The recreate race, seen from this side: the process still holds a
+      // vault key, but the configuration it belongs to is gone. Sealing
+      // against it would produce a credential nothing can ever open.
+      await prisma.vaultConfig.deleteMany()
+      await expect(
+        addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' }),
+      ).rejects.toThrow('vault configuration is gone')
+      expect(await prisma.credential.count()).toBe(0)
     })
   })
 

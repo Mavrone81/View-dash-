@@ -456,13 +456,13 @@ describe('VaultPanel', () => {
   // --- Resolution 3: the board link must never land on a dead end ---
   describe('linking in from the board for a specific system', () => {
     it('offers to add a credential, pre-attached to the focused system, when it has none', () => {
-      render(<VaultPanel initialised unlocked credentials={[]} focusHostId="h9" focusSystemKey="beta" />)
+      render(<VaultPanel recoveryKeyAcknowledged initialised unlocked credentials={[]} focusHostId="h9" focusSystemKey="beta" />)
       expect(screen.getByRole('button', { name: /^add credential$/i })).toBeTruthy()
     })
 
     it('does not offer an add control while locked -- never a dead control', () => {
       render(
-        <VaultPanel initialised unlocked={false} credentials={[]} focusHostId="h9" focusSystemKey="beta" />,
+        <VaultPanel recoveryKeyAcknowledged initialised unlocked={false} credentials={[]} focusHostId="h9" focusSystemKey="beta" />,
       )
       expect(screen.queryByRole('button', { name: /add credential/i })).toBeNull()
       expect(screen.getByText(/unlock the vault to add one/i)).toBeTruthy()
@@ -480,7 +480,7 @@ describe('VaultPanel', () => {
     it('still offers to add when the focused system already has a credential -- one system, several credentials', async () => {
       vi.mocked(addCredentialAction).mockResolvedValue({ ok: true, id: 'new-2' })
       render(
-        <VaultPanel
+        <VaultPanel recoveryKeyAcknowledged
           initialised
           unlocked
           credentials={[cred({ id: 'c1', label: 'admin login', hostId: 'h9', systemKey: 'beta' })]}
@@ -512,7 +512,7 @@ describe('VaultPanel', () => {
 
     it('adding a credential for the focused system attaches it, and it is then revealable', async () => {
       vi.mocked(addCredentialAction).mockResolvedValue({ ok: true, id: 'new-1' })
-      render(<VaultPanel initialised unlocked credentials={[]} focusHostId="h9" focusSystemKey="beta" />)
+      render(<VaultPanel recoveryKeyAcknowledged initialised unlocked credentials={[]} focusHostId="h9" focusSystemKey="beta" />)
 
       fireEvent.change(screen.getByLabelText(/^label$/i), { target: { value: 'root' } })
       fireEvent.change(screen.getByLabelText(/^username$/i), { target: { value: 'admin' } })
@@ -538,18 +538,18 @@ describe('VaultPanel', () => {
   // list -- could never be created through the product. ---
   describe('adding a credential without coming from the board (C1)', () => {
     it('offers an add control on a direct visit, with no focused system', () => {
-      render(<VaultPanel initialised unlocked credentials={[]} />)
+      render(<VaultPanel recoveryKeyAcknowledged initialised unlocked credentials={[]} />)
       expect(screen.getByRole('button', { name: /^add credential$/i })).toBeTruthy()
     })
 
     it('offers no add control while locked, on a direct visit -- never a dead control', () => {
-      render(<VaultPanel initialised unlocked={false} credentials={[]} />)
+      render(<VaultPanel recoveryKeyAcknowledged initialised unlocked={false} credentials={[]} />)
       expect(screen.queryByRole('button', { name: /add credential/i })).toBeNull()
     })
 
     it('creates an UNATTACHED credential when no system is chosen', async () => {
       vi.mocked(addCredentialAction).mockResolvedValue({ ok: true, id: 'new-3' })
-      render(<VaultPanel initialised unlocked credentials={[]} />)
+      render(<VaultPanel recoveryKeyAcknowledged initialised unlocked credentials={[]} />)
 
       fireEvent.change(screen.getByLabelText(/^label$/i), { target: { value: 'shared api key' } })
       fireEvent.change(screen.getByLabelText(/^username$/i), { target: { value: 'service' } })
@@ -572,7 +572,7 @@ describe('VaultPanel', () => {
     it('can attach to any system on the board, not only the one linked in from', async () => {
       vi.mocked(addCredentialAction).mockResolvedValue({ ok: true, id: 'new-4' })
       render(
-        <VaultPanel
+        <VaultPanel recoveryKeyAcknowledged
           initialised
           unlocked
           credentials={[]}
@@ -602,7 +602,7 @@ describe('VaultPanel', () => {
 
     it('can create an UNATTACHED credential even when the page was reached from a board row', async () => {
       vi.mocked(addCredentialAction).mockResolvedValue({ ok: true, id: 'new-5' })
-      render(<VaultPanel initialised unlocked credentials={[]} focusHostId="h9" focusSystemKey="beta" />)
+      render(<VaultPanel recoveryKeyAcknowledged initialised unlocked credentials={[]} focusHostId="h9" focusSystemKey="beta" />)
 
       fireEvent.change(screen.getByLabelText(/^label$/i), { target: { value: 'unrelated' } })
       fireEvent.change(screen.getByLabelText(/^username$/i), { target: { value: 'someone' } })
@@ -621,7 +621,7 @@ describe('VaultPanel', () => {
 
     it('shows the failure message and stores nothing when the add fails', async () => {
       vi.mocked(addCredentialAction).mockResolvedValue({ ok: false, message: 'Could not save the credential.' })
-      render(<VaultPanel initialised unlocked credentials={[]} />)
+      render(<VaultPanel recoveryKeyAcknowledged initialised unlocked credentials={[]} />)
 
       fireEvent.change(screen.getByLabelText(/^label$/i), { target: { value: 'x' } })
       fireEvent.change(screen.getByLabelText(/^username$/i), { target: { value: 'y' } })
@@ -917,6 +917,25 @@ describe('VaultPanel', () => {
         <VaultPanel initialised unlocked={false} credentials={[]} recoveryKeyAcknowledged={false} />,
       )
       expect(screen.getByText(/nobody ever confirmed storing/i)).toBeTruthy()
+    })
+
+    // Round 4, finding 3: `addCredential` refuses in this state, so the page
+    // must not offer the form. Storing one credential here is what used to
+    // withdraw the recreate offer, invert the warning to "no longer
+    // possible", and leave the vault one forgotten passphrase from total
+    // loss with its recovery key never recorded.
+    it('withholds the add form while the recovery key is unacknowledged -- the server would refuse it', () => {
+      render(<VaultPanel initialised unlocked credentials={[]} recoveryKeyAcknowledged={false} />)
+      expect(screen.queryByRole('button', { name: /^add credential$/i })).toBeNull()
+      expect(screen.queryByLabelText(/^secret$/i)).toBeNull()
+      // Not a control vanishing without explanation: the warning is what is
+      // there instead, and it says what to do.
+      expect(screen.getByText(/nobody ever confirmed storing/i)).toBeTruthy()
+    })
+
+    it('restores the add form the moment the acknowledgement exists', () => {
+      render(<VaultPanel initialised unlocked credentials={[]} recoveryKeyAcknowledged />)
+      expect(screen.getByRole('button', { name: /^add credential$/i })).toBeTruthy()
     })
 
     it('says nothing at all once the acknowledgement exists', () => {

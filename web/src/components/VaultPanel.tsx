@@ -1069,6 +1069,12 @@ export function VaultPanel({
         </div>
       )}
 
+      {/* Withheld while the recovery key is unacknowledged, because
+          `addCredential` now REFUSES in that state (round 4, finding 3) and
+          this branch has held throughout that the page must not offer what
+          the server will decline. The standing warning above says why and
+          what to do; it is not a control vanishing without explanation. */}
+      {localAcknowledged && (
       <div className="vault-focus-add">
         <h3 className="vault-group-heading">Add a credential</h3>
         {focusSystemLabel !== null && (
@@ -1118,6 +1124,7 @@ export function VaultPanel({
         </form>
         {addError && <p className="vault-error" role="alert">{addError}</p>}
       </div>
+      )}
 
       <div className="vault-change-passphrase">
         <h3 className="vault-group-heading">Change the passphrase</h3>

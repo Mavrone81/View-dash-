@@ -52,6 +52,7 @@ describe('vault actions', () => {
 
   it('refuses to reveal while locked, without throwing at the client', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
     expect(add.ok).toBe(true)
     lockSession()
@@ -64,6 +65,7 @@ describe('vault actions', () => {
 
   it('reveal while locked reports the vault as locked, distinct from other failures', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
     expect(add.ok).toBe(true)
     lockSession()
@@ -84,6 +86,7 @@ describe('vault actions', () => {
 
   it('reveal of a tampered ciphertext reports it as unreadable, not as locked or missing', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const a = await addCredentialAction({ label: 'a', username: 'u', secret: 'secret-a' })
     const b = await addCredentialAction({ label: 'b', username: 'u', secret: 'secret-b' })
     expect(a.ok).toBe(true)
@@ -121,6 +124,7 @@ describe('vault actions', () => {
 
   it('unlocks through the recovery key action', async () => {
     const created = await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     expect(created.ok).toBe(true)
     if (!created.ok) return
     lockSession()
@@ -136,6 +140,7 @@ describe('vault actions', () => {
 
   it('lockAction actually locks the session: a reveal that worked before fails after', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
     expect(add.ok).toBe(true)
     if (!add.ok) return
@@ -148,6 +153,7 @@ describe('vault actions', () => {
 
   it('removeCredentialAction removes the credential', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
     expect(add.ok).toBe(true)
     if (!add.ok) return
@@ -162,6 +168,7 @@ describe('vault actions', () => {
 
   it('removeCredentialAction REFUSES to delete while the vault is locked, and the credential survives', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
     expect(add.ok).toBe(true)
     if (!add.ok) return
@@ -195,6 +202,7 @@ describe('vault actions', () => {
 
     it('leaves every stored credential readable under the new passphrase', async () => {
       await createVaultAction('right passphrase')
+      await acknowledgeRecoveryKeyAction()
       const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
       expect(add.ok).toBe(true)
       if (!add.ok) return
@@ -396,6 +404,7 @@ describe('vault actions', () => {
     // directly, exactly as a network caller could.
     it('REFUSES to recreate a vault that holds a credential, and destroys nothing', async () => {
       await createVaultAction('right passphrase')
+      await acknowledgeRecoveryKeyAction()
       const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
       expect(add.ok).toBe(true)
       if (!add.ok) return
@@ -510,6 +519,7 @@ describe('vault actions', () => {
 
     it('never leaks the new recovery key into a failure message', async () => {
       await createVaultAction('right passphrase')
+      await acknowledgeRecoveryKeyAction()
       await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
       const r = await recreateVaultAction('a different passphrase')
       expect(r.ok).toBe(false)
@@ -738,6 +748,7 @@ describe('vault actions', () => {
 
   it('addCredentialAction reports a locked vault distinctly from a generic save failure', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     lockSession()
     const r = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
     expect(r.ok).toBe(false)
@@ -745,6 +756,33 @@ describe('vault actions', () => {
       expect(r.message.toLowerCase()).toContain('locked')
       expect(r.message).not.toContain('hunter2')
     }
+  })
+
+  // --- Task 10 round 4, finding 3 ---
+
+  it('addCredentialAction REFUSES to store into a vault whose recovery key was never acknowledged', async () => {
+    await createVaultAction('right passphrase')
+    // Deliberately NOT acknowledged: the state an operator reaches by
+    // creating the vault and being called away before clicking through the
+    // one-time gate.
+    const r = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.message.toLowerCase()).toContain('recovery key')
+      // Not a locked vault: unlocking would not help, and saying so would
+      // send the operator to the wrong control.
+      expect(r.message.toLowerCase()).not.toContain('the vault is locked')
+      expect(r.message).not.toContain('hunter2')
+    }
+    expect(await prisma.credential.count()).toBe(0)
+  })
+
+  it('addCredentialAction accepts the credential once the acknowledgement exists', async () => {
+    await createVaultAction('right passphrase')
+    expect((await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })).ok).toBe(false)
+    await acknowledgeRecoveryKeyAction()
+    const r = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+    expect(r.ok).toBe(true)
   })
 
   // --- Fix round 2: removeCredentialAction's catch was untested; "already
@@ -761,6 +799,7 @@ describe('vault actions', () => {
 
   it('removeCredentialAction reports a generic delete failure distinctly from an already-gone credential', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
     expect(add.ok).toBe(true)
     if (!add.ok) return
@@ -899,6 +938,7 @@ describe('vault actions', () => {
 
   it('revealAction reports a database problem, not tampering, when the initial credential lookup itself hits a real Prisma connectivity error', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
     expect(add.ok).toBe(true)
     if (!add.ok) return
@@ -919,6 +959,7 @@ describe('vault actions', () => {
 
   it('revealAction still reports the vault as locked when the reveal-denied audit write itself hits a real Prisma connectivity error', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
     expect(add.ok).toBe(true)
     if (!add.ok) return
@@ -943,6 +984,7 @@ describe('vault actions', () => {
 
   it('revealAction still reports a tampered credential as unreadable when the reveal-failed audit write itself hits a real Prisma connectivity error', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const a = await addCredentialAction({ label: 'a', username: 'u', secret: 'secret-a' })
     const b = await addCredentialAction({ label: 'b', username: 'u', secret: 'secret-b' })
     expect(a.ok).toBe(true)
@@ -975,6 +1017,7 @@ describe('vault actions', () => {
 
   it('revealAction reports a database problem, not tampering, when the final success audit write hits a real Prisma connectivity error despite a genuinely successful decrypt', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
     expect(add.ok).toBe(true)
     if (!add.ok) return
@@ -1002,6 +1045,7 @@ describe('vault actions', () => {
 
   it('revealAction reports a neutral failure, not tampering or a database claim, for an error it cannot positively identify', async () => {
     await createVaultAction('right passphrase')
+    await acknowledgeRecoveryKeyAction()
     const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
     expect(add.ok).toBe(true)
     if (!add.ok) return

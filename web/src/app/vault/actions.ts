@@ -22,6 +22,7 @@ import {
   VaultLockedError,
   CredentialNotFoundError,
   CredentialDecryptError,
+  RecoveryKeyUnacknowledgedError,
 } from '../../lib/vault/credentials.js'
 import { revalidatePath } from 'next/cache'
 
@@ -423,6 +424,8 @@ export async function lockAction(): Promise<{ ok: true }> {
   return { ok: true }
 }
 
+const RECOVERY_KEY_UNACKNOWLEDGED_MESSAGE = 'Nothing can be stored in this vault until its recovery key is confirmed as stored. It has not been, and it cannot be shown again — recreate the vault to get a usable one, then confirm it.'
+
 export async function addCredentialAction(input: {
   label: string; username: string; secret: string
   notes?: string; hostId?: string; systemKey?: string
@@ -434,6 +437,11 @@ export async function addCredentialAction(input: {
   } catch (err) {
     if (err instanceof VaultLockedError) {
       return failed('The vault is locked. Unlock it and try again.')
+    }
+    // Its own fact, with its own remedy, and distinct from a locked vault:
+    // unlocking will not help, and the operator needs to be told what will.
+    if (err instanceof RecoveryKeyUnacknowledgedError) {
+      return failed(RECOVERY_KEY_UNACKNOWLEDGED_MESSAGE)
     }
     return failed('Could not save the credential.')
   }

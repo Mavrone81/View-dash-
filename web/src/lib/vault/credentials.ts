@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import { Prisma } from '@prisma/client'
 import { prisma } from '../db.js'
 import { seal, open } from '../crypto/envelope.js'
 import { currentVaultKey } from './session.js'
@@ -40,6 +39,19 @@ export class CredentialNotFoundError extends Error {}
 // is never left inferring "corrupted" from an error that could have come
 // from an unrelated database operation. See task-7-report.md "Fix round 5".
 export class CredentialDecryptError extends Error {}
+/**
+ * Refuses to store a credential in a vault whose recovery key was never
+ * confirmed as stored. Named, like the others, so the action layer can
+ * classify it by `instanceof` rather than by message text.
+ *
+ * This is not a trap for a vault that can still be fixed: while it holds no
+ * credentials, `recreateVault` remains available, which issues a new key,
+ * shows the one-time gate, and takes the acknowledgement — after which
+ * storing works. See task-10-report.md for the one state where it IS a
+ * dead end (a vault that already holds credentials and predates the
+ * acknowledgement column) and why that state is unreachable going forward.
+ */
+export class RecoveryKeyUnacknowledgedError extends Error {}
 
 function requireKey(): Buffer {
   const key = currentVaultKey()
@@ -84,16 +96,67 @@ export async function addCredential(input: {
   // creation nothing witnessed. Rolling back makes the failure the operator
   // is shown TRUE, which is what stops the retry from silently storing a
   // second copy of the same production password.
-  //
-  // SERIALIZABLE, and not merely for the two writes below. `recreateVault`
-  // destroys the vault key after taking a count of THIS table, and Postgres
-  // only applies its serializable checks between transactions that are both
-  // serializable — so a plain READ COMMITTED insert here would be invisible
-  // to that count and could commit under it, leaving a credential sealed
-  // with a key that no longer exists. Both sides opt in, or neither is
-  // protected.
   await prisma.$transaction(
     async (tx) => {
+      // Take the singleton VaultConfig row's LOCK before writing anything.
+      //
+      // CORRECTING WHAT THIS COMMENT USED TO CLAIM. It previously said that
+      // running both this transaction and `recreateVault`'s at SERIALIZABLE
+      // was what stopped a credential being sealed under a vault key that
+      // was concurrently destroyed. That was reasoning, and it was wrong —
+      // settled against a real database, where the interleaving committed
+      // BOTH transactions three times out of three. Postgres SSI aborts on a
+      // dangerous structure that requires a CYCLE; `recreateVault` reads
+      // Credential and writes VaultConfig, while this function wrote
+      // Credential and read nothing `recreateVault` writes. One rw-edge, no
+      // cycle, no abort. Matching isolation levels never made it safe, and a
+      // comment asserting protection that the database does not provide is
+      // worse than no comment: the next person reads the gap as covered.
+      // `vault.test.ts` now drives that exact interleaving.
+      //
+      // What holds it now is this lock, and it holds in both orderings:
+      //
+      //  - Recreate counts first, then this transaction locks and commits:
+      //    recreate's own DELETE of the row must then wait on a lock taken by
+      //    a transaction that has since committed, and at its REPEATABLE
+      //    READ-or-stricter isolation that raises a serialization failure
+      //    instead of proceeding on the stale count.
+      //  - Recreate deletes the row first: this lock waits, and finds NO ROW
+      //    afterwards, because the tuple it was waiting on is gone. That is
+      //    the `rows.length === 0` branch below — it is not a paranoid
+      //    check, it is the second half of the fix.
+      //
+      // The lock is deliberately preferred over adding a read for
+      // `recreateVault` to conflict with: a lock does not depend on either
+      // side's isolation level, so it still holds for a future writer to
+      // this table that opens a plain READ COMMITTED transaction. This
+      // transaction therefore no longer asks for SERIALIZABLE — it does not
+      // need it, and asking would only add spurious 40001 failures.
+      //
+      // The same statement reads the acknowledgement, so it costs no extra
+      // round trip. See the refusal below.
+      const rows = await tx.$queryRaw<Array<{ recoveryKeyAcknowledgedAt: Date | null }>>`
+        SELECT "recoveryKeyAcknowledgedAt" FROM "VaultConfig" WHERE id = 'singleton' FOR UPDATE
+      `
+      const config = rows[0]
+      if (config === undefined) {
+        // No configuration behind the key this process is holding: the vault
+        // was replaced while this call was in flight. Reported as locked
+        // because that is both true and the right advice — the key in memory
+        // opens nothing, and the operator does need to unlock the new vault.
+        throw new VaultLockedError('vault configuration is gone')
+      }
+      if (config.recoveryKeyAcknowledgedAt === null) {
+        // Design spec section 4.1's "this vault must be recreated before
+        // anything is stored in it" was, until now, enforced by a paragraph
+        // above the add form. Clicking past it was enough: store one login
+        // and the recreate offer withdraws, the warning inverts to
+        // "recreating is no longer possible", and the recovery key was never
+        // recorded — one forgotten passphrase from losing the lot, which is
+        // the exact catastrophe rounds 2 and 3 exist to remove. Hiding a
+        // control is presentation; this is the refusal.
+        throw new RecoveryKeyUnacknowledgedError('recovery key has not been acknowledged')
+      }
       await tx.credential.create({
         data: {
           id,
@@ -108,7 +171,6 @@ export async function addCredential(input: {
       })
       await tx.credentialAccess.create({ data: { credentialId: id, action: 'create' } })
     },
-    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
   )
   return id
 }

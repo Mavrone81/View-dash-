@@ -1,4 +1,3 @@
-import { Prisma } from '@prisma/client'
 import { prisma } from '../db.js'
 import { newKdfParams, deriveWrappingKey, makeVerifier, checkVerifier, type KdfParams } from './kdf.js'
 import { newVaultKey, newRecoveryKey, wrapVaultKey, unwrapVaultKey, recoveryKeyFromDisplay } from './keyring.js'
@@ -173,13 +172,56 @@ export async function createVault(passphrase: string): Promise<{ recoveryKey: st
  * nothing to acknowledge, so this reduces to creating one. That is the same
  * outcome `createVault` would produce, not a way around its guard.
  *
- * The transaction runs at SERIALIZABLE, which is what makes the count
- * meaningful rather than decorative: a plain `count()` under READ COMMITTED
- * does not lock the rows it did not find, so a concurrent INSERT could still
- * commit underneath it. `addCredential` runs at the same level for the same
- * reason — Postgres's serializable checks only apply between transactions
- * that are BOTH serializable, so one of the pair opting out would silently
- * remove the guarantee from both.
+ * WHAT ACTUALLY MAKES THE COUNT MEANINGFUL — and what this comment used to
+ * get wrong. It previously claimed that running this transaction and
+ * `addCredential`'s both at SERIALIZABLE was the protection. That was
+ * reasoning, and a real database disproved it: the interleaving committed
+ * BOTH transactions, three times out of three, leaving a credential sealed
+ * under the old vault key while this row held the new one — permanently
+ * unreadable, with no error anywhere. Postgres SSI aborts on a dangerous
+ * structure that needs a CYCLE, and there is none here: this transaction
+ * reads `Credential` and writes `VaultConfig`; `addCredential` wrote
+ * `Credential` and read nothing this one writes. One rw-edge, no cycle, no
+ * abort.
+ *
+ * The protection is a LOCK on this same singleton row, taken by BOTH sides
+ * before either looks at anything: here as the first statement of the
+ * transaction, and in `addCredential` as the first statement of its own.
+ * That gives the two a row to contend over, which they did not previously
+ * have.
+ *
+ * TAKING IT BEFORE THE COUNT is the whole point, and the first attempt at
+ * this fix got it wrong — the lock was added to `addCredential` only, while
+ * this function still counted first and locked later (via the DELETE). The
+ * interleaving still committed both, because a `SELECT … FOR UPDATE` marks a
+ * tuple as locked WITHOUT creating a new version, so a later DELETE of it
+ * does not raise "could not serialize access due to concurrent update" even
+ * at SERIALIZABLE. Measured, not assumed: the test below still failed with
+ * `expected true to be false`. Lock first, then read, or the read is stale
+ * before it is taken.
+ *
+ * With the lock held first by both, the two orderings are:
+ *
+ *  - This transaction wins the lock: `addCredential` blocks, and when it
+ *    resumes the row it was waiting for has been deleted, so its own lock
+ *    query returns nothing and it refuses rather than sealing under a dead
+ *    key.
+ *  - `addCredential` wins: it commits and releases; this transaction then
+ *    acquires the lock and its `count()` — a statement that begins AFTER the
+ *    lock is held — sees the new credential and refuses with
+ *    `VaultNotEmptyError`.
+ *
+ * Neither ordering depends on an isolation level, which is why this
+ * transaction no longer asks for SERIALIZABLE and `addCredential` no longer
+ * does either. That was the point of choosing a lock over an extra read: it
+ * still holds for a future writer to `Credential` that opens a plain READ
+ * COMMITTED transaction, where a serializability argument would silently
+ * stop applying. It also removes the spurious-40001 exposure that came with
+ * the isolation level.
+ *
+ * When there is no config row at all, neither side has anything to lock —
+ * and neither needs it, because `addCredential` refuses outright when its
+ * own lock query finds no row.
  */
 export async function recreateVault(passphrase: string): Promise<{ recoveryKey: string }> {
   const params = newKdfParams()
@@ -189,13 +231,19 @@ export async function recreateVault(passphrase: string): Promise<{ recoveryKey: 
 
   await prisma.$transaction(
     async (tx) => {
+      // FIRST statement, before the count: it both takes the row lock that
+      // orders this against `addCredential` and reads the acknowledgement,
+      // in one round trip. Order is load-bearing — see the block comment.
+      const existing = await tx.$queryRaw<Array<{ recoveryKeyAcknowledgedAt: Date | null }>>`
+        SELECT "recoveryKeyAcknowledgedAt" FROM "VaultConfig" WHERE id = ${SINGLETON} FOR UPDATE
+      `
+      const config = existing[0]
+      // Counted only once the lock is held, so no insert can be in flight
+      // behind it: any that committed earlier is visible to this statement's
+      // snapshot, and any that has not yet started is blocked on the lock.
       const held = await tx.credential.count()
       if (held > 0) throw new VaultNotEmptyError('vault holds credentials')
-      const existing = await tx.vaultConfig.findUnique({
-        where: { id: SINGLETON },
-        select: { recoveryKeyAcknowledgedAt: true },
-      })
-      if (existing !== null && existing.recoveryKeyAcknowledgedAt !== null && !isUnlocked()) {
+      if (config !== undefined && config.recoveryKeyAcknowledgedAt !== null && !isUnlocked()) {
         throw new RecoveryKeyStillValidError('recovery key is acknowledged and the vault is locked')
       }
       // deleteMany, not delete: a row with an unexpected id cannot be left
@@ -215,7 +263,6 @@ export async function recreateVault(passphrase: string): Promise<{ recoveryKey: 
         },
       })
     },
-    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
   )
 
   unlockSession(vaultKey)
