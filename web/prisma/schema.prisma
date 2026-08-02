@@ -100,6 +100,14 @@ model VaultConfig {
   verifier            String
   wrappedByPassphrase String
   wrappedByRecovery   String
+
+  // Set when the operator confirms they have stored the recovery key shown
+  // once at creation. NULL = never confirmed, which the vault page reports as
+  // a standing warning: a recovery key that was displayed and recorded nowhere
+  // is a mitigation that is silently absent, and the discovery moment would
+  // otherwise be a forgotten passphrase with every credential already lost.
+  recoveryKeyAcknowledgedAt DateTime?
+
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 }

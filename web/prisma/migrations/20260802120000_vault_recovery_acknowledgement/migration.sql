@@ -1,0 +1,18 @@
+-- Records the moment the operator confirmed they had stored the recovery key
+-- shown once at vault creation. NULL means no such confirmation exists.
+--
+-- Nullable with no default, deliberately: a VaultConfig row that already
+-- exists when this migration runs becomes NULL, and that is the correct
+-- reading of it. Nothing ever recorded that its recovery key was stored, so
+-- the honest state is "unconfirmed" -- backfilling CURRENT_TIMESTAMP would
+-- assert a fact nobody established and would permanently silence the warning
+-- for the one vault most likely to need it.
+--
+-- Why this column exists at all: the recovery key is displayed exactly once
+-- and persisted nowhere. Before this, an operator who walked away or reloaded
+-- came back to a vault that looked completely healthy and whose only recovery
+-- key had been recorded nowhere. The discovery moment would be a forgotten
+-- passphrase, at which point every credential in the vault is gone with no
+-- undo -- and the design's stated mitigation for exactly that catastrophe
+-- would turn out to have been silently absent for months.
+ALTER TABLE "VaultConfig" ADD COLUMN "recoveryKeyAcknowledgedAt" TIMESTAMP(3);
