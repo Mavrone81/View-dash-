@@ -30,31 +30,81 @@ const failed = (message: string): Err => ({ ok: false, message })
 
 const MIN_PASSPHRASE_LENGTH = 12
 
-export async function createVaultAction(passphrase: string): Promise<Ok<{ recoveryKey: string }> | Err> {
+// Shared wording for "there is nothing usable to unlock". A VaultConfig row
+// can be absent (no vault ever created) or present-but-corrupt (e.g. a
+// hand-edited or truncated kdfParams column); either way, retyping a
+// passphrase will never succeed, so this is reported as its own fact rather
+// than folded into "wrong passphrase" — design spec section 9.
+const NOT_INITIALISED_MESSAGE = 'This dashboard does not have a usable vault. Create one, or use the recovery key if one was created before.'
+// Used only from the passphrase path: a corrupt VaultConfig means the
+// passphrase route can never work, so the advice steers toward the
+// recovery key specifically (unlike NOT_INITIALISED_MESSAGE, which covers
+// "no vault at all" too and so can't promise a recovery key exists).
+const CONFIG_UNREADABLE_MESSAGE = 'The stored vault configuration could not be read and may be corrupt. A passphrase cannot unlock it; try the recovery key.'
+// Used from the recovery path's own corrupt-config catch: recommending the
+// recovery key here would be circular, since that is what the caller is
+// already using.
+const CONFIG_UNREADABLE_RECOVERY_MESSAGE = 'The stored vault configuration could not be read and may be corrupt.'
+
+export async function createVaultAction(passphrase: string): Promise<{ ok: true; recoveryKey: string } | Err> {
   if (passphrase.length < MIN_PASSPHRASE_LENGTH) {
     return failed(`Passphrase must be at least ${MIN_PASSPHRASE_LENGTH} characters.`)
   }
   if (await isInitialised()) return failed('A vault already exists on this dashboard.')
-  const { recoveryKey } = await createVault(passphrase)
-  revalidatePath('/vault')
-  return { ok: true, recoveryKey }
+  try {
+    const { recoveryKey } = await createVault(passphrase)
+    revalidatePath('/vault')
+    return { ok: true, recoveryKey }
+  } catch {
+    // The isInitialised() check above and createVault()'s own write are two
+    // separate round trips, so a second concurrent call can pass the check
+    // before either finishes — the database's singleton constraint on
+    // VaultConfig (see the migration CHECK, and vault.ts's own internal
+    // isInitialised() re-check) is what actually stops the second write,
+    // and it throws when that race is lost. The caught error's own message
+    // is discarded on purpose rather than surfaced: a rejected insert can
+    // echo back fragments of the row it tried to write.
+    return failed('A vault already exists on this dashboard.')
+  }
 }
 
-export async function unlockAction(passphrase: string): Promise<Ok<object> | Err> {
-  const ok = await unlockWithPassphrase(passphrase)
+export async function unlockAction(passphrase: string): Promise<{ ok: true } | Err> {
+  if (!(await isInitialised())) return failed(NOT_INITIALISED_MESSAGE)
+  let ok: boolean
+  try {
+    ok = await unlockWithPassphrase(passphrase)
+  } catch {
+    // unlockWithPassphrase JSON.parses the stored kdfParams; a corrupt value
+    // throws a raw SyntaxError rather than returning false. That is not a
+    // wrong-passphrase outcome — no passphrase will ever parse corrupt JSON
+    // — so it gets its own message, and the parse error's own text (which
+    // can contain a fragment of the corrupt value) is never surfaced.
+    return failed(CONFIG_UNREADABLE_MESSAGE)
+  }
   if (!ok) return failed('That passphrase did not unlock the vault.')
   revalidatePath('/vault')
   return { ok: true }
 }
 
-export async function unlockWithRecoveryAction(display: string): Promise<Ok<object> | Err> {
-  const ok = await unlockWithRecoveryKey(display)
+export async function unlockWithRecoveryAction(display: string): Promise<{ ok: true } | Err> {
+  if (!(await isInitialised())) return failed(NOT_INITIALISED_MESSAGE)
+  let ok: boolean
+  try {
+    ok = await unlockWithRecoveryKey(display)
+  } catch {
+    // unlockWithRecoveryKey does not currently read kdfParams, so this branch
+    // is not reachable through the same corruption that breaks unlockAction
+    // above — it guards this action against a throw from ANY future change
+    // to that function, consistent with the invariant every other action in
+    // this file follows: nothing here throws to the client.
+    return failed(CONFIG_UNREADABLE_RECOVERY_MESSAGE)
+  }
   if (!ok) return failed('That recovery key did not unlock the vault.')
   revalidatePath('/vault')
   return { ok: true }
 }
 
-export async function lockAction(): Promise<Ok<object>> {
+export async function lockAction(): Promise<{ ok: true }> {
   lockSession()
   revalidatePath('/vault')
   return { ok: true }
@@ -100,7 +150,7 @@ export async function revealAction(id: string): Promise<Ok<{ secret: string }> |
   }
 }
 
-export async function removeCredentialAction(id: string): Promise<Ok<object> | Err> {
+export async function removeCredentialAction(id: string): Promise<{ ok: true } | Err> {
   try {
     await removeCredential(id)
     revalidatePath('/vault')

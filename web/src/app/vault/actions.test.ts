@@ -150,4 +150,76 @@ describe('vault actions', () => {
     expect(removed.ok).toBe(true)
     expect(await prisma.credential.count()).toBe(0)
   })
+
+  // --- Fix round 1: unlockAction / unlockWithRecoveryAction / createVaultAction
+  // must never throw, and a corrupt-or-missing VaultConfig must not be
+  // reported as "wrong passphrase" (design spec section 9). ---
+
+  it('unlockAction against a corrupt VaultConfig returns a plain failure, not a thrown error, and does not say "wrong passphrase"', async () => {
+    const created = await createVaultAction('right passphrase')
+    expect(created.ok).toBe(true)
+    lockSession()
+    // Same reproduction as the coordinator's probe: a VaultConfig row exists,
+    // but its kdfParams column is not valid JSON. unlockWithPassphrase()
+    // JSON.parses this column directly and previously let that SyntaxError
+    // escape uncaught.
+    await prisma.vaultConfig.updateMany({ data: { kdfParams: 'not-json-at-all' } })
+    const r = await unlockAction('right passphrase')
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.message.toLowerCase()).not.toContain('wrong')
+      expect(r.message.toLowerCase()).toMatch(/corrupt|unreadable/)
+      // The caught SyntaxError's own text can carry a fragment of the
+      // corrupt value — must never reach the caller.
+      expect(r.message).not.toContain('not-json-at-all')
+    }
+  })
+
+  it('unlockWithRecoveryAction is unaffected by the same corrupt kdfParams, and never throws', async () => {
+    const created = await createVaultAction('right passphrase')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    lockSession()
+    // unlockWithRecoveryKey never reads kdfParams, so this corruption does
+    // not break it — the real recovery key still works. This proves the
+    // action-level guard added for consistency does not change correct
+    // behaviour, and that nothing throws along the way.
+    await prisma.vaultConfig.updateMany({ data: { kdfParams: 'not-json-at-all' } })
+    const r = await unlockWithRecoveryAction(created.recoveryKey)
+    expect(r.ok).toBe(true)
+  })
+
+  it('unlockAction when no vault has ever been created returns a plain failure distinct from "wrong passphrase"', async () => {
+    const r = await unlockAction('whatever passphrase')
+    expect(r.ok).toBe(false)
+    // The old wording ("That passphrase did not unlock the vault.") happens
+    // to contain the substring "vault" and even "not...vault", so a loose
+    // regex on those words alone would pass against either message — the
+    // one thing that actually distinguishes them is that the old wording
+    // talks about a passphrase being wrong at all, and the new one never
+    // mentions "passphrase".
+    if (!r.ok) expect(r.message.toLowerCase()).not.toContain('passphrase')
+  })
+
+  it('createVaultAction returns a plain failure, not a thrown error, when the underlying create fails', async () => {
+    // Simulates the TOCTOU window between this action's own isInitialised()
+    // check and createVault()'s write: two concurrent calls can both pass
+    // the check, and the database's singleton constraint then rejects the
+    // second insert. Reproduced deterministically here by making the
+    // underlying prisma insert fail once, exactly as a lost race would.
+    const spy = vi.spyOn(prisma.vaultConfig, 'create').mockRejectedValueOnce(
+      new Error('Unique constraint failed on the fields: (`id`)'),
+    )
+    try {
+      const r = await createVaultAction('right passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toContain('already exists')
+        // The rejected insert's own message must not leak through.
+        expect(r.message).not.toContain('Unique constraint')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
 })
