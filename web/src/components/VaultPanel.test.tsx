@@ -1053,11 +1053,17 @@ describe('VaultPanel', () => {
 
       // Telling the operator to recreate at this point would be telling them
       // to delete their own data.
-      it('says recreation is no longer possible, and that the passphrase is now the only way in', () => {
+      it('says recreation is no longer possible, without telling an operator who kept the key to discard it', () => {
         render(<VaultPanel initialised unlocked credentials={[cred()]} recoveryKeyAcknowledged={false} />)
         expect(screen.getByText(/no longer possible/i)).toBeTruthy()
         expect(screen.getByText(/only way into this vault/i)).toBeTruthy()
         expect(screen.queryByText(/must be recreated/i)).toBeNull()
+        // The wording must not flatly assert the passphrase is the only way
+        // in. Two paragraphs above, the same warning admits this dashboard
+        // cannot tell whether a usable copy of the key exists -- so an
+        // operator who DID file it could read the flat claim as licence to
+        // throw it away, turning the warning into the loss it warns about.
+        expect(screen.getByText(/if you did keep a copy of the recovery key, it still works/i)).toBeTruthy()
       })
 
       it('still warns while locked, where the credential count is equally known', () => {

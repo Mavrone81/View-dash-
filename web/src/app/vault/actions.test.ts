@@ -517,15 +517,43 @@ describe('vault actions', () => {
       expect((await unlockWithRecoveryAction(created.recoveryKey)).ok).toBe(true)
     })
 
-    it('never leaks the new recovery key into a failure message', async () => {
+    // REWRITTEN because the first version could not fail. It asserted that
+    // no recovery key appeared in the message -- but every branch of
+    // `recreateVaultAction` returns a module constant, so the assertion only
+    // ever inspected hardcoded text it could see for itself. The realistic
+    // mutation, `failed(VAULT_NOT_EMPTY_MESSAGE + ' ' + (err as Error).message)`,
+    // survived the entire suite: the appended text is "vault holds
+    // credentials", which contains no key and no key-shaped substring.
+    //
+    // These two check the property that was actually claimed -- that a caught
+    // error's OWN text never reaches the caller -- against text the caught
+    // errors really carry.
+    it('never lets the internal refusal text out of the not-empty branch', async () => {
       await createVaultAction('right passphrase')
       await acknowledgeRecoveryKeyAction()
       await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
       const r = await recreateVaultAction('a different passphrase')
       expect(r.ok).toBe(false)
-      // The key material is generated before the transaction refuses, so a
-      // careless error path could carry it out.
-      if (!r.ok) expect(r.message).not.toMatch(/[A-Za-z0-9_-]{8} [A-Za-z0-9_-]{8}/)
+      // The message `VaultNotEmptyError` is genuinely constructed with. If
+      // any branch appends the caught error, this is what appears.
+      if (!r.ok) expect(r.message).not.toContain('vault holds credentials')
+    })
+
+    it('never lets a caught error carry its own text to the caller', async () => {
+      await createVaultAction('right passphrase')
+      // A marker the action cannot have invented, on the path that catches
+      // an error it cannot classify -- the branch most likely to be "helpful"
+      // by including the cause.
+      const spy = vi
+        .spyOn(prisma, '$transaction')
+        .mockRejectedValueOnce(new Error('wrapped-vault-key-fragment-QUJDRA'))
+      try {
+        const r = await recreateVaultAction('a different passphrase')
+        expect(r.ok).toBe(false)
+        if (!r.ok) expect(r.message).not.toContain('wrapped-vault-key-fragment-QUJDRA')
+      } finally {
+        spy.mockRestore()
+      }
     })
   })
 

@@ -79,7 +79,9 @@ Each credential's secret is sealed with the existing envelope primitive (`web/sr
 
 - **`Credential`** — `id`, `label`, `username`, `secretSealed`, `notes`, optional `hostId` + `systemKey`, `createdAt`, `updatedAt`, `rotatedAt`.
   The system link is a plain pair, not a foreign key to `System`: systems are discovered and can vanish, and a credential must survive that. Attachment is resolved by matching, so a returning system re-attaches automatically.
-- **`VaultConfig`** — exactly one row: KDF parameters, the verifier, and both wrapped copies of the vault key. A partial-unique index enforces the single row.
+- **`VaultConfig`** — exactly one row: KDF parameters, the verifier, both wrapped copies of the vault key, and `recoveryKeyAcknowledgedAt`.
+
+  The single row is enforced by a **`CHECK (id = 'singleton')`** constraint, not by the partial-unique index this line described until now. The distinction is not pedantry: `id` merely *defaulting* to `'singleton'` is an application-level promise that a caller supplying any other id would sidestep, and the rest of the vault assumes there is exactly one config row holding the wrapped keys. The CHECK closes that at the database layer whatever any caller does — see `20260802091500_vault_config_singleton_check`.
 - **`CredentialAccess`** — append-only: `credentialId`, `action`, `at`. Never records the secret itself.
 
   The actions actually written are `create`, `reveal`, `reveal-denied` and `reveal-failed`. The last two were added during implementation: an access log that records only the reveals that succeeded is backwards, because a reveal blocked by the lock, or one whose ciphertext failed its authentication check, is the event most worth seeing.

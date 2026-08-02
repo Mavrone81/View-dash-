@@ -459,6 +459,52 @@ exists only in your head from the moment you choose it.
    back to twenty production admin logins.
 3. The recovery key is shown **once**, immediately after creation, and
    never again. Nothing in the system can redisplay it.
+4. Store it (see the next section) and then click **I have stored it —
+   continue**. That click is not cosmetic: it writes
+   `VaultConfig.recoveryKeyAcknowledgedAt`, and it is the only thing that
+   does. **Do not walk away from this screen before clicking it.**
+5. Only then can credentials be added. The add form does not appear, and
+   `addCredentialAction` refuses, until step 4 has happened.
+
+#### If you leave that screen without confirming
+
+You will find a red **RECOVERY KEY NOT CONFIRMED** panel on `/vault`, in
+both the locked and unlocked views. It is not a nag and it is not a bug: it
+means this dashboard has no record that a usable recovery key exists
+anywhere, and it cannot check — the key is displayed once and stored
+nowhere.
+
+The vault also refuses to store anything while it stands. That is
+deliberate. The alternative was the state this whole mechanism exists to
+prevent: a vault holding twenty production logins whose only recovery key
+was never written down, looking perfectly healthy, until one forgotten
+passphrase takes the lot.
+
+The way out, offered in that same panel while the vault is **empty**:
+
+- **Recreate the vault.** Two steps, like every destructive control here.
+  It issues a new passphrase and a new recovery key, retires the old ones,
+  and returns you to the one-time screen — where you store the key and
+  click through properly this time.
+- The offer is withheld once the vault holds credentials, because
+  recreating would destroy them. It is also withheld, once the key HAS been
+  acknowledged, unless the vault is unlocked — an unlocked session is the
+  proof of passphrase knowledge that stops anything reaching the app from
+  silently invalidating a recovery key already in your drawer.
+
+If a vault somehow reaches "unacknowledged **and** holding credentials",
+there is no in-product remedy: recreation would destroy the credentials and
+acknowledgement is only reachable from the one-time screen. No vault created
+after this change can get there, because storing the first credential
+requires the acknowledgement. Ask before doing anything clever.
+
+#### Rolling back
+
+Roll back the **image only**. `prisma migrate deploy` run from an older
+image fails on divergence rather than reverting anything, and there is no
+down-migration. The acknowledgement column is nullable and additive, so an
+older `web` image ignores it and keeps working against the newer schema —
+which is the direction rollback has to go.
 
 ### The recovery key: print it, then get it off this machine
 

@@ -749,11 +749,20 @@ export function VaultPanel({
             {renderRecreateControl()}
           </>
         ) : (
+          // Deliberately does NOT say "your passphrase is now the only way
+          // in". That contradicted the paragraph two lines above, which
+          // correctly admits this dashboard cannot tell whether a usable copy
+          // of the key exists -- and an operator who DID file the key could
+          // read the stronger sentence as a reason to throw it away, which
+          // would turn a warning into the very loss it warns about. State the
+          // asymmetry instead: if a copy exists it still works; if it does
+          // not, the passphrase is all there is.
           <p>
             Recreating the vault is no longer possible: it holds{' '}
             {held === 1 ? '1 stored credential' : `${held} stored credentials`}, and recreating it
-            would destroy them. Your passphrase is now the only way into this vault -- if it is lost,
-            these credentials cannot be recovered.
+            would destroy them. If you did keep a copy of the recovery key, it still works -- do not
+            discard it on the strength of this warning. If you did not, your passphrase is the only
+            way into this vault, and these credentials cannot be recovered without it.
           </p>
         )}
       </div>
