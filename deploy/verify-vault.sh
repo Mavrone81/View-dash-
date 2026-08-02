@@ -109,20 +109,35 @@ check "vault page body could be fetched for inspection" \
 check "no sealed secret in the page source" \
   '[ "$FETCHED" = 1 ] && ! printf %s "$PAGE" | grep -qE "secretSealed|v1:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+:"'
 
-# The word Locked must appear before anyone has unlocked. Note this is a
-# weaker statement than it looks: it confirms the page renders its locked
-# branch, not that the lock is enforced. Enforcement is proven by the
-# restart check in the runbook, which is a human step.
+# The page has three legitimate states and this check has to know which one
+# it is looking at. An earlier version asserted "Locked" unconditionally and
+# FAILED on the very first deploy — correctly reporting a problem that did
+# not exist, because a vault that has never been created cannot be locked.
+# It renders its setup call to action instead. A check that cannot pass in
+# the state a fresh deployment is actually in is a false alarm, and a false
+# alarm on the one run an operator pays closest attention to is worse than
+# no check: it teaches them to discount the script.
 #
-# CASE SENSITIVITY IS LOAD-BEARING: "Locked" is a substring of "Unlocked",
-# so this only discriminates because of the capital L. A well-meaning
-# `grep -qi` would make it match an unlocked page and quietly turn the check
-# vacuous. The companion check below is the real guard — it fails if the
-# page claims to be Unlocked — so the two must be read together.
-check "a freshly started vault renders as locked" \
-  '[ "$FETCHED" = 1 ] && printf %s "$PAGE" | grep -q "Locked"'
+# So: an uninitialised vault must offer setup, and an initialised one must
+# render Locked. Either is a pass; neither is.
+#
+# CASE SENSITIVITY IS LOAD-BEARING below: "Locked" is a substring of
+# "Unlocked", so the second arm only discriminates because of the capital L.
+# A well-meaning `grep -qi` would make it match an unlocked page and quietly
+# turn the check vacuous.
+if printf %s "$PAGE" | grep -qi "set up the vault"; then
+  VAULT_STATE="uninitialised"
+else
+  VAULT_STATE="initialised"
+fi
 
-check "a freshly started vault does NOT render as unlocked" \
+check "the vault page renders a coherent state (found: ${VAULT_STATE})" \
+  '[ "$FETCHED" = 1 ] && { [ "$VAULT_STATE" = uninitialised ] || printf %s "$PAGE" | grep -q "Locked"; }'
+
+# Holds in BOTH states: an uninitialised vault has nothing to unlock, and a
+# freshly started process always starts locked. This is the arm that would
+# catch a vault claiming to be open to anyone who loads the page.
+check "the vault does NOT present itself as unlocked" \
   '[ "$FETCHED" = 1 ] && ! printf %s "$PAGE" | grep -q "Unlocked"'
 
 # The dashboard itself must still work — a vault that breaks the board it
