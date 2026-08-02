@@ -12,10 +12,25 @@ import {
   revealAction,
   removeCredentialAction,
   changePassphraseAction,
+  acknowledgeRecoveryKeyAction,
+  recreateVaultAction,
 } from '../app/vault/actions.js'
 
 export type VaultPanelProps = {
   initialised: boolean
+  /**
+   * Whether the operator ever confirmed storing the recovery key shown once
+   * at creation (`VaultConfig.recoveryKeyAcknowledgedAt`).
+   *
+   * Optional, and defaulting to FALSE -- warn -- rather than true. The
+   * default is the direction that fails safe: a caller that has not told this
+   * panel the key was stored has not established that it was, and a vault
+   * whose only recovery key was displayed and recorded nowhere looks
+   * identical to a healthy one right up until a forgotten passphrase makes
+   * every credential in it unrecoverable. A false alarm costs a dismissible
+   * paragraph; a missing alarm costs the vault.
+   */
+  recoveryKeyAcknowledged?: boolean
   unlocked: boolean
   credentials: CredentialSummary[]
   /** From the board link: `/vault?host=<hostId>&system=<systemKey>`. Absent for a direct visit. */
@@ -153,6 +168,7 @@ function groupBySystem(
 
 export function VaultPanel({
   initialised,
+  recoveryKeyAcknowledged = false,
   unlocked,
   credentials,
   focusHostId,
@@ -218,6 +234,66 @@ export function VaultPanel({
   // null`, which is also true after the operator confirms storing it -- this
   // one means the key was destroyed before anyone wrote it down.
   const [recoveryKeyLostToDeadline, setRecoveryKeyLostToDeadline] = useState(false)
+  // Mirrors the prop, updated from the authoritative `ok` of the
+  // acknowledge/recreate actions -- same pattern as `localUnlocked`.
+  const [localAcknowledged, setLocalAcknowledged] = useState(recoveryKeyAcknowledged)
+  const [acknowledgePending, setAcknowledgePending] = useState(false)
+  const [acknowledgeError, setAcknowledgeError] = useState<string | null>(null)
+
+  /**
+   * Dismissing the recovery key is what RECORDS that it was stored. The key
+   * is only cleared from the screen once the server confirms the write: if
+   * the write fails, the key stays visible and the operator can try again,
+   * rather than losing it AND leaving the vault permanently marked
+   * unacknowledged.
+   */
+  async function handleAcknowledge() {
+    setAcknowledgePending(true)
+    setAcknowledgeError(null)
+    try {
+      const r = await acknowledgeRecoveryKeyAction()
+      if (r.ok) {
+        setLocalAcknowledged(true)
+        setCreatedRecoveryKey(null)
+      } else {
+        setAcknowledgeError(r.message)
+      }
+    } finally {
+      setAcknowledgePending(false)
+    }
+  }
+
+  // --- Recreate a vault whose recovery key was never stored ---
+  const [recreateArmed, setRecreateArmed] = useState(false)
+  const [recreatePassphrase, setRecreatePassphrase] = useState('')
+  const [recreatePending, setRecreatePending] = useState(false)
+  const [recreateError, setRecreateError] = useState<string | null>(null)
+
+  async function handleRecreate(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault()
+    setRecreatePending(true)
+    setRecreateError(null)
+    try {
+      const r = await recreateVaultAction(recreatePassphrase)
+      if (r.ok) {
+        // Straight back to the one-time gate, with the new key -- and
+        // unacknowledged again, because this key has now been shown and not
+        // yet stored either.
+        setCreatedRecoveryKey(r.recoveryKey)
+        setRecoveryKeyLostToDeadline(false)
+        setLocalAcknowledged(false)
+        setLocalInitialised(true)
+        setLocalUnlocked(true)
+        setLocalDeadlineMs(Date.now() + r.sessionRemainingMs)
+        setRecreateArmed(false)
+        setRecreatePassphrase('')
+      } else {
+        setRecreateError(r.message)
+      }
+    } finally {
+      setRecreatePending(false)
+    }
+  }
 
   async function handleCreate(e: FormEvent<HTMLFormElement>) {
     e.preventDefault()
@@ -539,6 +615,112 @@ export function VaultPanel({
       ? (labels[`${activeFocusHostId}::${activeFocusSystemKey}`]?.systemName ?? activeFocusSystemKey)
       : null
 
+  /**
+   * The standing warning for a vault whose one-time recovery key was never
+   * confirmed as stored. Rendered in the locked view, the unlocked view and
+   * the deadline hard stop -- everywhere the operator can land -- because the
+   * failure it reports is precisely one that is INVISIBLE: such a vault looks
+   * and behaves exactly like a healthy one, and would keep doing so for
+   * months, until a forgotten passphrase makes every credential in it
+   * unrecoverable at the same instant.
+   *
+   * It reports only that an acknowledgement is absent. It never renders the
+   * recovery key, any part of it, or anything derived from it -- the key is
+   * not in this component's state by then, and must not be put back.
+   *
+   * The recreate offer is conditional on the vault being EMPTY, and that
+   * condition is enforced again server-side inside the transaction that does
+   * the replacing (see `recreateVault`). Hiding a control is presentation;
+   * the refusal has to be code. Once credentials exist the message inverts,
+   * because at that point telling the operator to recreate would be telling
+   * them to delete their own data.
+   */
+  function renderRecoveryWarning() {
+    if (!localInitialised || localAcknowledged) return null
+    const held = credentialsState.length
+    return (
+      <div className="vault-recovery-warning">
+        <h3 className="vault-warning-heading">Recovery key not confirmed</h3>
+        <p>
+          <strong>Nobody ever confirmed storing this vault&rsquo;s recovery key.</strong> It is shown
+          once, at creation, and kept nowhere afterwards -- so it cannot be displayed again, and this
+          dashboard cannot tell whether a usable copy exists anywhere.
+        </p>
+        {held === 0 ? (
+          <>
+            <p>
+              The only way to get a usable recovery key is to recreate the vault, so this vault must
+              be recreated before anything is stored in it. It holds no credentials, so recreating it
+              destroys nothing.
+            </p>
+            {recreateArmed ? (
+              <form onSubmit={handleRecreate}>
+                <p className="vault-remove-warning">
+                  This replaces the vault key. The current passphrase and the recovery key you cannot
+                  find both stop working. There is no undo.
+                </p>
+                <label className="vault-field">
+                  New vault passphrase
+                  <input
+                    type="password"
+                    value={recreatePassphrase}
+                    onChange={(e) => setRecreatePassphrase(e.target.value)}
+                    required
+                    autoComplete="new-password"
+                  />
+                </label>
+                <button
+                  type="submit"
+                  className="vault-button vault-button-danger"
+                  data-testid="confirm-recreate"
+                  disabled={recreatePending}
+                >
+                  {recreatePending ? 'Recreating...' : 'Yes, recreate the vault'}
+                </button>
+                <button
+                  type="button"
+                  className="vault-button"
+                  data-testid="cancel-recreate"
+                  onClick={() => {
+                    setRecreateArmed(false)
+                    setRecreatePassphrase('')
+                    setRecreateError(null)
+                  }}
+                >
+                  Cancel
+                </button>
+              </form>
+            ) : (
+              // Two steps, like the delete control: arming this reveals what
+              // it destroys and asks for the new passphrase before anything
+              // happens.
+              <button
+                type="button"
+                className="vault-button vault-button-danger"
+                data-testid="recreate-vault"
+                onClick={() => setRecreateArmed(true)}
+              >
+                Recreate the vault
+              </button>
+            )}
+            {recreateError && (
+              <p className="vault-error" role="alert">
+                {recreateError}
+              </p>
+            )}
+          </>
+        ) : (
+          <p>
+            Recreating the vault is no longer possible: it holds{' '}
+            {held === 1 ? '1 stored credential' : `${held} stored credentials`}, and recreating it
+            would destroy them. Your passphrase is now the only way into this vault -- if it is lost,
+            these credentials cannot be recovered.
+          </p>
+        )}
+      </div>
+    )
+  }
+
   // --- Recovery key destroyed at the deadline before it was acknowledged
   // (fix I2): a hard stop, ahead of every other branch including the gate
   // itself. There is deliberately no control here to carry on with. A vault
@@ -557,13 +739,12 @@ export function VaultPanel({
             than left on an unattended display. It cannot be shown again, and nothing can regenerate
             it.
           </p>
-          <p>
-            <strong>This vault must be recreated before anything is stored in it.</strong> Nothing has
-            been stored yet -- the recovery key is shown before any credential can be added -- so
-            recreating it costs nothing but the time. Remove the stored vault configuration and set
-            the vault up again, and store the new recovery key the moment it appears.
-          </p>
         </div>
+        {/* Carries the recreate control, so this is no longer a dead end.
+            Nothing can have been stored yet -- this gate renders ahead of
+            every other branch -- so the vault is provably empty here and the
+            offer is always the empty-vault one. */}
+        {renderRecoveryWarning()}
       </section>
     )
   }
@@ -583,9 +764,25 @@ export function VaultPanel({
           <button type="button" className="vault-button" onClick={() => copyToClipboard(createdRecoveryKey)}>
             Copy recovery key
           </button>
-          <button type="button" className="vault-button" onClick={() => setCreatedRecoveryKey(null)}>
-            I have stored it -- continue
+          {/* Dismissing is what RECORDS the acknowledgement. The key is
+              cleared only once the server confirms the write -- a failed
+              write leaves it on screen and retryable, rather than losing it
+              and marking the vault unacknowledged for good. */}
+          <button
+            type="button"
+            className="vault-button"
+            disabled={acknowledgePending}
+            onClick={() => {
+              void handleAcknowledge()
+            }}
+          >
+            {acknowledgePending ? 'Recording...' : 'I have stored it -- continue'}
           </button>
+          {acknowledgeError && (
+            <p className="vault-error" role="alert">
+              {acknowledgeError}
+            </p>
+          )}
         </div>
       </section>
     )
@@ -633,6 +830,7 @@ export function VaultPanel({
         <p className="vault-status" data-status="locked">
           {LOCKED_LABEL}
         </p>
+        {renderRecoveryWarning()}
         <form onSubmit={handleUnlock}>
           <label className="vault-field">
             Passphrase
@@ -805,6 +1003,7 @@ export function VaultPanel({
       <button type="button" className="vault-button" onClick={() => void handleLock()}>
         Lock now
       </button>
+      {renderRecoveryWarning()}
 
       {credentialsState.length === 0 && <p>{EMPTY_MESSAGE}</p>}
 

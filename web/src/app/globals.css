@@ -456,6 +456,48 @@ h1 {
   width: 100%;
 }
 
+/* The standing "recovery key never confirmed" warning. Bordered in --alarm
+   rather than --warn: --warn already marks the Unlocked status on this same
+   page, and the two must not read as the same weight of thing. Unlocked is
+   "pay attention for the next fifteen minutes"; this is "the mitigation for
+   losing every credential in here is missing, and has been since creation".
+   Both tokens are re-derived per theme, so this reads correctly in light and
+   dark without a second rule. */
+.vault-recovery-warning {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  border: 1px solid var(--alarm);
+  border-left-width: 4px;
+  border-radius: 4px;
+  padding: 14px;
+  background: var(--field);
+}
+
+.vault-recovery-warning p {
+  margin: 0;
+  font-size: 0.8125rem;
+}
+
+.vault-recovery-warning form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.vault-warning-heading {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--alarm);
+  margin: 0;
+}
+
 .vault-group-heading {
   font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
   font-size: 0.6875rem;

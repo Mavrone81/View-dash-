@@ -1,5 +1,5 @@
 import { VaultPanel } from '../../components/VaultPanel.js'
-import { isInitialised } from '../../lib/vault/vault.js'
+import { readVaultStatus } from '../../lib/vault/vault.js'
 import { remainingSessionMs } from '../../lib/vault/session.js'
 import { listCredentials } from '../../lib/vault/credentials.js'
 import { resolveSystemLabels } from '../../lib/vault/system-labels.js'
@@ -39,11 +39,19 @@ export default async function VaultPage({ searchParams }: { searchParams: VaultP
   // the function ever changed) disagree. It returns a DURATION, not the
   // absolute epoch instant an earlier version of this page passed down (fix
   // round 2) -- see session.ts's own doc comment on why a duration is safer
-  // to hand to a client. `isInitialised()`, `listCredentials()` and
+  // to hand to a client. `readVaultStatus()`, `listCredentials()` and
   // `resolveSystemLabels()` all hit the database, so those three run
   // concurrently.
-  const [initialised, credentials, systemLabels] = await Promise.all([
-    isInitialised(),
+  //
+  // `readVaultStatus()` replaces the earlier `isInitialised()` call and
+  // answers both questions from ONE read of the singleton row: whether a
+  // vault exists, and whether its one-time recovery key was ever confirmed
+  // as stored. The second drives a standing warning on the panel -- a vault
+  // whose recovery key was displayed once and recorded nowhere looks exactly
+  // like a healthy one, and stays that way until a forgotten passphrase makes
+  // every credential in it unrecoverable.
+  const [status, credentials, systemLabels] = await Promise.all([
+    readVaultStatus(),
     listCredentials(),
     resolveSystemLabels(),
   ])
@@ -54,7 +62,8 @@ export default async function VaultPage({ searchParams }: { searchParams: VaultP
     <main>
       <h1>Vault</h1>
       <VaultPanel
-        initialised={initialised}
+        initialised={status.initialised}
+        recoveryKeyAcknowledged={status.recoveryKeyAcknowledged}
         unlocked={unlocked}
         credentials={credentials}
         focusHostId={focusHostId}

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, within, fireEvent, waitFor, act } from '@testing-library/react'
+import { render, screen, within, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
 
 // The actions module is a Next.js server-action layer ('use server') that
 // talks to a real Postgres-backed vault (see actions.test.ts, which exercises
@@ -17,6 +17,8 @@ vi.mock('../app/vault/actions.js', () => ({
   revealAction: vi.fn(),
   removeCredentialAction: vi.fn(),
   changePassphraseAction: vi.fn(),
+  acknowledgeRecoveryKeyAction: vi.fn(),
+  recreateVaultAction: vi.fn(),
 }))
 
 import {
@@ -27,6 +29,8 @@ import {
   revealAction,
   removeCredentialAction,
   changePassphraseAction,
+  acknowledgeRecoveryKeyAction,
+  recreateVaultAction,
 } from '../app/vault/actions.js'
 import { VaultPanel } from './VaultPanel.js'
 
@@ -43,6 +47,8 @@ beforeEach(() => {
   vi.mocked(revealAction).mockReset()
   vi.mocked(removeCredentialAction).mockReset()
   vi.mocked(changePassphraseAction).mockReset()
+  vi.mocked(acknowledgeRecoveryKeyAction).mockReset()
+  vi.mocked(recreateVaultAction).mockReset()
 })
 
 describe('VaultPanel', () => {
@@ -415,8 +421,12 @@ describe('VaultPanel', () => {
         fireEvent.click(screen.getByRole('button', { name: /^create vault$/i }))
         await vi.advanceTimersByTimeAsync(0)
       })
+      // Dismissing the recovery key now RECORDS the acknowledgement, so the
+      // action must resolve before the gate clears -- see handleAcknowledge.
+      vi.mocked(acknowledgeRecoveryKeyAction).mockResolvedValue({ ok: true })
       await act(async () => {
         fireEvent.click(screen.getByRole('button', { name: /i have stored it/i }))
+        await vi.advanceTimersByTimeAsync(0)
       })
       expect(screen.getByText('Unlocked', { exact: true })).toBeTruthy()
 
@@ -868,8 +878,10 @@ describe('VaultPanel', () => {
 
     it('an acknowledged recovery key leaves no hard stop behind at the deadline', async () => {
       await createVaultShowingTheKey()
+      vi.mocked(acknowledgeRecoveryKeyAction).mockResolvedValue({ ok: true })
       await act(async () => {
         fireEvent.click(screen.getByRole('button', { name: /i have stored it/i }))
+        await vi.advanceTimersByTimeAsync(0)
       })
 
       await act(async () => {
@@ -880,6 +892,197 @@ describe('VaultPanel', () => {
       // there is nothing to recreate.
       expect(screen.getByText('Locked', { exact: true })).toBeTruthy()
       expect(screen.queryByText(/must be recreated/i)).toBeNull()
+    })
+  })
+
+  // --- Task 10 round 2. The residual left by the I2 fix: the operator
+  // creates the vault, the recovery key appears, they walk away or reload,
+  // and they come back to a vault that looks perfectly healthy and whose only
+  // recovery key was recorded nowhere. Nothing on screen said so, and nothing
+  // would, for months -- until a forgotten passphrase took every credential
+  // with it. This is the same shape as a sole encryption key whose loss is
+  // invisible until a restore is attempted; a mitigation that can be silently
+  // absent is not one. ---
+  describe('a vault whose recovery key was never confirmed as stored', () => {
+    it('warns, persistently, once the page is merely reloaded -- not only in the session that created it', () => {
+      // No `createdRecoveryKey` in state anywhere: this is a fresh page load
+      // against a vault whose acknowledgement is absent, which is exactly the
+      // state that used to look completely healthy.
+      render(<VaultPanel initialised unlocked credentials={[]} recoveryKeyAcknowledged={false} />)
+      expect(screen.getByText(/nobody ever confirmed storing/i)).toBeTruthy()
+    })
+
+    it('warns in the LOCKED view too -- the fact does not depend on being unlocked', () => {
+      render(
+        <VaultPanel initialised unlocked={false} credentials={[]} recoveryKeyAcknowledged={false} />,
+      )
+      expect(screen.getByText(/nobody ever confirmed storing/i)).toBeTruthy()
+    })
+
+    it('says nothing at all once the acknowledgement exists', () => {
+      render(<VaultPanel initialised unlocked credentials={[cred()]} recoveryKeyAcknowledged />)
+      expect(screen.queryByText(/nobody ever confirmed storing/i)).toBeNull()
+      expect(screen.queryByTestId('recreate-vault')).toBeNull()
+    })
+
+    it('says nothing when there is no vault yet -- there is nothing to have acknowledged', () => {
+      render(<VaultPanel initialised={false} unlocked={false} credentials={[]} />)
+      expect(screen.queryByText(/nobody ever confirmed storing/i)).toBeNull()
+    })
+
+    // The warning reports an ABSENCE. It must never put the key, or anything
+    // shaped like it, back on the page.
+    it('never renders the recovery key, in either the warning or the hard stop', async () => {
+      vi.mocked(createVaultAction).mockResolvedValue({
+        ok: true,
+        recoveryKey: 'RK-EXAMPLE-VALUE',
+        sessionRemainingMs: 5000,
+      })
+      const { container } = render(<VaultPanel initialised={false} unlocked={false} credentials={[]} />)
+      fireEvent.change(screen.getByLabelText(/passphrase/i), { target: { value: 'a very long passphrase' } })
+      fireEvent.click(screen.getByRole('button', { name: /^create vault$/i }))
+      await screen.findByText('RK-EXAMPLE-VALUE')
+
+      // Reaching the warning without acknowledging: a fresh render of the
+      // same unacknowledged vault, i.e. the reload case.
+      cleanup()
+      const reloaded = render(
+        <VaultPanel initialised unlocked credentials={[]} recoveryKeyAcknowledged={false} />,
+      )
+      expect(reloaded.container.textContent ?? '').not.toContain('RK-EXAMPLE-VALUE')
+      expect(container.textContent ?? '').not.toContain('RK-EXAMPLE-VALUE')
+    })
+
+    describe('while the vault is empty, recreation is offered', () => {
+      it('offers it, and a single click does not recreate anything', () => {
+        render(<VaultPanel initialised unlocked credentials={[]} recoveryKeyAcknowledged={false} />)
+
+        fireEvent.click(screen.getByTestId('recreate-vault'))
+
+        // Same discipline as the delete control: arming is not doing.
+        expect(recreateVaultAction).not.toHaveBeenCalled()
+        expect(screen.getByTestId('confirm-recreate')).toBeTruthy()
+        expect(screen.getByText(/no undo/i)).toBeTruthy()
+      })
+
+      it('recreates on confirmation and shows the NEW recovery key once', async () => {
+        vi.mocked(recreateVaultAction).mockResolvedValue({
+          ok: true,
+          recoveryKey: 'RK-SECOND-VALUE',
+          sessionRemainingMs: 900_000,
+        })
+        render(<VaultPanel initialised unlocked credentials={[]} recoveryKeyAcknowledged={false} />)
+
+        fireEvent.click(screen.getByTestId('recreate-vault'))
+        fireEvent.change(screen.getByLabelText(/^new vault passphrase$/i), {
+          target: { value: 'a brand new passphrase' },
+        })
+        fireEvent.click(screen.getByTestId('confirm-recreate'))
+
+        await waitFor(() => expect(recreateVaultAction).toHaveBeenCalledWith('a brand new passphrase'))
+        expect(await screen.findByText('RK-SECOND-VALUE')).toBeTruthy()
+        // Back at the one-time gate, unacknowledged again -- this key has now
+        // been shown and not yet stored either.
+        expect(screen.getByRole('button', { name: /i have stored it/i })).toBeTruthy()
+      })
+
+      it('backing out recreates nothing', () => {
+        render(<VaultPanel initialised unlocked credentials={[]} recoveryKeyAcknowledged={false} />)
+
+        fireEvent.click(screen.getByTestId('recreate-vault'))
+        fireEvent.click(screen.getByTestId('cancel-recreate'))
+
+        expect(recreateVaultAction).not.toHaveBeenCalled()
+        expect(screen.getByTestId('recreate-vault')).toBeTruthy()
+        expect(screen.queryByTestId('confirm-recreate')).toBeNull()
+      })
+
+      it('shows the reason and keeps the warning when the recreate is refused', async () => {
+        vi.mocked(recreateVaultAction).mockResolvedValue({
+          ok: false,
+          message:
+            'This vault already holds stored credentials. Recreating it would destroy them, so it is refused. The passphrase is now the only way in.',
+        })
+        render(<VaultPanel initialised unlocked credentials={[]} recoveryKeyAcknowledged={false} />)
+
+        fireEvent.click(screen.getByTestId('recreate-vault'))
+        fireEvent.change(screen.getByLabelText(/^new vault passphrase$/i), {
+          target: { value: 'a brand new passphrase' },
+        })
+        fireEvent.click(screen.getByTestId('confirm-recreate'))
+
+        expect(await screen.findByText(/would destroy them/i)).toBeTruthy()
+        expect(screen.getByText(/nobody ever confirmed storing/i)).toBeTruthy()
+      })
+    })
+
+    describe('once the vault holds credentials, recreation is withdrawn', () => {
+      it('offers no recreate control at all', () => {
+        render(<VaultPanel initialised unlocked credentials={[cred()]} recoveryKeyAcknowledged={false} />)
+        expect(screen.queryByTestId('recreate-vault')).toBeNull()
+        expect(screen.queryByTestId('confirm-recreate')).toBeNull()
+      })
+
+      // Telling the operator to recreate at this point would be telling them
+      // to delete their own data.
+      it('says recreation is no longer possible, and that the passphrase is now the only way in', () => {
+        render(<VaultPanel initialised unlocked credentials={[cred()]} recoveryKeyAcknowledged={false} />)
+        expect(screen.getByText(/no longer possible/i)).toBeTruthy()
+        expect(screen.getByText(/only way into this vault/i)).toBeTruthy()
+        expect(screen.queryByText(/must be recreated/i)).toBeNull()
+      })
+
+      it('still warns while locked, where the credential count is equally known', () => {
+        render(
+          <VaultPanel initialised unlocked={false} credentials={[cred()]} recoveryKeyAcknowledged={false} />,
+        )
+        expect(screen.getByText(/no longer possible/i)).toBeTruthy()
+        expect(screen.queryByTestId('recreate-vault')).toBeNull()
+      })
+    })
+  })
+
+  describe('acknowledging the recovery key (round 2)', () => {
+    async function showTheKey() {
+      vi.mocked(createVaultAction).mockResolvedValue({
+        ok: true,
+        recoveryKey: 'RK-EXAMPLE-VALUE',
+        sessionRemainingMs: 900_000,
+      })
+      render(<VaultPanel initialised={false} unlocked={false} credentials={[]} />)
+      fireEvent.change(screen.getByLabelText(/passphrase/i), { target: { value: 'a very long passphrase' } })
+      fireEvent.click(screen.getByRole('button', { name: /^create vault$/i }))
+      await screen.findByText('RK-EXAMPLE-VALUE')
+    }
+
+    it('records the acknowledgement when the key is dismissed', async () => {
+      vi.mocked(acknowledgeRecoveryKeyAction).mockResolvedValue({ ok: true })
+      await showTheKey()
+
+      fireEvent.click(screen.getByRole('button', { name: /i have stored it/i }))
+
+      await waitFor(() => expect(acknowledgeRecoveryKeyAction).toHaveBeenCalledTimes(1))
+      await waitFor(() => expect(screen.queryByText('RK-EXAMPLE-VALUE')).toBeNull())
+      // ...and the standing warning does not then appear behind it.
+      expect(screen.queryByText(/nobody ever confirmed storing/i)).toBeNull()
+    })
+
+    // If a failed write dismissed the key anyway, the operator would lose the
+    // key AND the vault would stay marked unacknowledged -- the precise
+    // silent absence this whole mechanism exists to prevent.
+    it('KEEPS the key on screen when the acknowledgement could not be recorded', async () => {
+      vi.mocked(acknowledgeRecoveryKeyAction).mockResolvedValue({
+        ok: false,
+        message: 'Could not record that the recovery key was stored.',
+      })
+      await showTheKey()
+
+      fireEvent.click(screen.getByRole('button', { name: /i have stored it/i }))
+
+      expect(await screen.findByText(/could not record/i)).toBeTruthy()
+      expect(screen.getByText('RK-EXAMPLE-VALUE')).toBeTruthy()
+      // Still retryable -- not a dead end.
+      expect(screen.getByRole('button', { name: /i have stored it/i })).toBeTruthy()
     })
   })
 
@@ -895,12 +1098,14 @@ describe('VaultPanel', () => {
       fireEvent.change(screen.getByLabelText(/passphrase/i), { target: { value: 'a very long passphrase' } })
       fireEvent.click(screen.getByRole('button', { name: /^create vault$/i }))
 
+      vi.mocked(acknowledgeRecoveryKeyAction).mockResolvedValue({ ok: true })
+
       expect(await screen.findByText('RK-EXAMPLE-VALUE')).toBeTruthy()
       expect(screen.getByText(/store this off this machine/i)).toBeTruthy()
 
       fireEvent.click(screen.getByRole('button', { name: /i have stored it/i }))
 
-      expect(screen.queryByText('RK-EXAMPLE-VALUE')).toBeNull()
+      await waitFor(() => expect(screen.queryByText('RK-EXAMPLE-VALUE')).toBeNull())
       expect(screen.getByText('Unlocked', { exact: true })).toBeTruthy()
     })
   })
