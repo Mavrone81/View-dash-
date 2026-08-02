@@ -91,7 +91,7 @@ describe('credentials', () => {
   it('REFUSES to reveal while the vault is locked', async () => {
     const id = await addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
     lockSession()
-    await expect(revealCredential(id)).rejects.toThrow()
+    await expect(revealCredential(id)).rejects.toThrow('vault is locked')
   })
 
   it('writes an audit row for every reveal', async () => {
