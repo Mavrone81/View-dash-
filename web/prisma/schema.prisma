@@ -68,3 +68,56 @@ model AgentEnrolment {
   createdAt DateTime  @default(now())
   revokedAt DateTime?
 }
+
+model Credential {
+  id        String   @id @default(uuid())
+  label     String
+  username  String
+  // AES-256-GCM envelope, AAD-bound to `credential:<id>:secret`.
+  // There is deliberately no plaintext column anywhere in this model.
+  secretSealed String
+  notes     String?
+
+  // A LOOSE link, not a foreign key. Systems are discovered and can vanish
+  // when a container stops; a credential must survive that and re-attach if
+  // the system returns. A relation with a cascade would delete passwords
+  // because a container went away.
+  hostId    String?
+  systemKey String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  rotatedAt DateTime?
+
+  accesses  CredentialAccess[]
+
+  @@index([hostId, systemKey])
+}
+
+model VaultConfig {
+  id                  String @id @default("singleton")
+  kdfParams           String
+  verifier            String
+  wrappedByPassphrase String
+  wrappedByRecovery   String
+
+  // Set when the operator confirms they have stored the recovery key shown
+  // once at creation. NULL = never confirmed, which the vault page reports as
+  // a standing warning: a recovery key that was displayed and recorded nowhere
+  // is a mitigation that is silently absent, and the discovery moment would
+  // otherwise be a forgotten passphrase with every credential already lost.
+  recoveryKeyAcknowledgedAt DateTime?
+
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+model CredentialAccess {
+  id           String   @id @default(uuid())
+  credentialId String
+  credential   Credential @relation(fields: [credentialId], references: [id], onDelete: Cascade)
+  action       String
+  at           DateTime @default(now())
+
+  @@index([credentialId, at])
+}

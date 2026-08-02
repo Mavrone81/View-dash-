@@ -45,6 +45,28 @@ describe('FleetTable', () => {
     expect(screen.getByText(/no systems reported/i)).toBeTruthy()
   })
 
+  // task-8-brief.md Resolution 3: the board is the way IN to the credential
+  // vault for a specific system, so every row -- including one with no
+  // credentials stored yet -- must link somewhere useful rather than
+  // nowhere.
+  describe('the link into the vault', () => {
+    it('links a system row to the vault, scoped to its host and system key', () => {
+      render(<FleetTable rows={[row({ id: 'host-1:web', hostName: 'host-1', key: 'web', displayName: 'web' })]} />)
+      const link = screen.getByRole('link', { name: 'web' })
+      expect(link.getAttribute('href')).toBe('/vault?host=host-1&system=web')
+    })
+
+    it('links even when a real system key would need URL-encoding', () => {
+      render(
+        <FleetTable
+          rows={[row({ id: 'host-1:my system', hostName: 'host-1', key: 'my system', displayName: 'my system' })]}
+        />,
+      )
+      const link = screen.getByRole('link', { name: 'my system' })
+      expect(link.getAttribute('href')).toBe('/vault?host=host-1&system=my%20system')
+    })
+  })
+
   // Restored after the "Heartbeat" redesign dropped this column: the spec's
   // column list omitted it by mistake, not by decision, and the product
   // owner asked for it back between State and Last 40 beats. Scoped to

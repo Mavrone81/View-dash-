@@ -168,6 +168,17 @@ h1 {
 
 .sys-name {
   font-weight: 600;
+  color: inherit;
+  text-decoration: none;
+}
+
+.sys-name:hover {
+  text-decoration: underline;
+}
+
+.sys-name:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 /* State is a label AND a number-adjacent fact (it's read alongside the last
@@ -298,4 +309,289 @@ h1 {
   width: 8px;
   height: 8px;
   border-radius: 2px;
+}
+
+/*
+ * --- Vault panel ---
+ *
+ * Same instrument-panel language as the fleet board: mono/uppercase for
+ * status and structural labels, plain weight for values, colour reserved
+ * for meaning (never decoration). `--warn` marks Unlocked -- not a fault,
+ * but the one state in this whole dashboard where a secret can leave the
+ * server, so it deliberately reads as "pay attention" rather than "fine".
+ */
+
+.vault-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  max-width: 640px;
+}
+
+.vault-panel form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.vault-status {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-weight: 600;
+  font-size: 0.9375rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin: 0;
+}
+
+.vault-status[data-status='locked'] {
+  color: var(--ink-muted);
+}
+
+.vault-status[data-status='unlocked'] {
+  color: var(--warn);
+}
+
+.vault-hint {
+  color: var(--ink-muted);
+  font-size: 0.8125rem;
+  margin: 0;
+}
+
+.vault-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.8125rem;
+  color: var(--ink-muted);
+}
+
+.vault-field input {
+  font: inherit;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 0.8125rem;
+  padding: 6px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--field);
+  color: var(--ink);
+}
+
+/* The add form's system picker. Matches the text inputs exactly -- the two
+   sit in the same column and a picker styled by the user agent instead
+   would be the only control on this page not speaking the panel's language.
+   `color-scheme` on :root is what keeps the native dropdown list itself
+   readable in dark mode. */
+.vault-field select {
+  font: inherit;
+  font-size: 0.8125rem;
+  padding: 6px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--field);
+  color: var(--ink);
+}
+
+.vault-field input:focus-visible,
+.vault-field select:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.vault-button {
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  padding: 6px 12px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--field);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.vault-button:hover {
+  background: var(--rule);
+}
+
+.vault-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.vault-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.vault-error {
+  color: var(--alarm);
+  font-size: 0.8125rem;
+  margin: 0;
+}
+
+/* The recovery-key gate: a one-time full-panel takeover, bordered in --warn
+   so it visually stands apart from every other state this page can be in. */
+.vault-recovery-gate {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  padding: 14px;
+  background: var(--field);
+}
+
+.vault-recovery-gate code {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 0.9375rem;
+  padding: 8px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--paper);
+  color: var(--ink);
+  word-break: break-all;
+  width: 100%;
+}
+
+/* The standing "recovery key never confirmed" warning. Bordered in --alarm
+   rather than --warn: --warn already marks the Unlocked status on this same
+   page, and the two must not read as the same weight of thing. Unlocked is
+   "pay attention for the next fifteen minutes"; this is "the mitigation for
+   losing every credential in here is missing, and has been since creation".
+   Both tokens are re-derived per theme, so this reads correctly in light and
+   dark without a second rule. */
+.vault-recovery-warning {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  border: 1px solid var(--alarm);
+  border-left-width: 4px;
+  border-radius: 4px;
+  padding: 14px;
+  background: var(--field);
+}
+
+.vault-recovery-warning p {
+  margin: 0;
+  font-size: 0.8125rem;
+}
+
+.vault-recovery-warning form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.vault-warning-heading {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--alarm);
+  margin: 0;
+}
+
+.vault-group-heading {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--ink-muted);
+  margin: 12px 0 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--rule);
+  width: 100%;
+}
+
+.vault-credential-list,
+.vault-locked-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.vault-credential-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--rule);
+  flex-wrap: wrap;
+}
+
+.vault-credential-label {
+  font-weight: 600;
+}
+
+.vault-credential-username {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  color: var(--ink-muted);
+  font-size: 0.75rem;
+}
+
+.vault-secret {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.vault-secret code {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 2px 6px;
+  color: var(--ink);
+}
+
+.vault-focus-add,
+.vault-change-passphrase {
+  width: 100%;
+}
+
+/* The inline delete confirmation. It replaces the Remove button IN THE ROW
+   rather than opening a dialog -- so the credential being destroyed stays
+   visible next to the question being asked, which a modal covering the page
+   cannot do. `--alarm` is the panel's only irreversible-action colour and is
+   used nowhere else here. */
+.vault-remove-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.vault-remove-warning {
+  color: var(--alarm);
+  font-size: 0.75rem;
+}
+
+.vault-button-danger {
+  border-color: var(--alarm);
+  color: var(--alarm);
+}
+
+/* Not `background: var(--alarm)`: the button text is --alarm, and both
+   palettes' alarm reds are mid-tone enough that filling the button would
+   leave red on red. Deepening the field keeps the contrast the plain
+   .vault-button:hover rule provides, in both themes. */
+.vault-button-danger:hover {
+  background: var(--rule);
+}
+
+.vault-button-danger:focus-visible {
+  outline: 2px solid var(--alarm);
+  outline-offset: 2px;
 }

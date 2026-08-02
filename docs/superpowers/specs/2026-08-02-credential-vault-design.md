@@ -34,6 +34,10 @@ Attribution is the one thing genuinely absent. With a single operator it is not 
 ## 4 · Decisions
 
 1. **Recovery: a printed recovery key**, generated once at vault creation and stored off this machine. Rationale: a passphrase-only vault means one forgotten passphrase permanently destroys credentials for twenty production systems, with no undo. For a solo operator, losing access is far likelier than physical theft of a printed key. The estate already carries the mirror of this risk elsewhere, where a sole encryption key lives on one laptop and its loss would be silent until a restore is attempted.
+   **The acknowledgement, added during implementation.** As first built, this decision could silently not happen: the key is displayed exactly once and persisted nowhere, so an operator who reloaded or walked away came back to a vault that looked and behaved exactly like a healthy one and whose only recovery key had been recorded nowhere. Nothing said so, and nothing would — the discovery moment would be a forgotten passphrase, with every credential already lost. That is the identical shape as the risk this decision cites in its own last sentence, reproduced inside the mitigation for it. A mitigation that can be silently absent is not one.
+
+   So `VaultConfig.recoveryKeyAcknowledgedAt` records the moment the operator confirms storing the key, and dismissing the key is what writes it. While it is NULL the vault page carries a standing warning, in every view, reporting only that the acknowledgement is absent — never the key. The way out is to recreate the vault, refused server-side inside the same transaction that replaces the configuration. Recreation destroys the vault key, so the rule is **zero credentials AND (the key was never acknowledged OR the session is unlocked)**. Emptiness alone is not enough: an empty vault's only casualty is the vault key itself, and a recovery key someone already printed and filed dies with it — silently, to be discovered on the day it is needed, which is the failure this whole mechanism exists to remove. An unlocked session is accepted as proof of passphrase knowledge, and is also the way out for an operator who acknowledged by mistake. Once credentials exist, recreation is refused outright and the warning changes to say the passphrase is now the only way in.
+
 2. **One model for any credential type.** Admin logins now; database passwords, SMTP and API keys fit the same shape. No second system later.
 3. **Credentials attach to a system but never die with one.** If a system disappears from the board, its credentials become unattached — never deleted. Deleting a password because a container went away would be indefensible.
 4. **Reveal is the audited event**, not access to the page.
@@ -42,8 +46,12 @@ Attribution is the one thing genuinely absent. With a single operator it is not 
 
 A random 32-byte **vault key** is generated once. It is never stored raw. It is wrapped twice:
 
-- by a key derived from the operator's **passphrase** (Argon2id, parameters stored alongside), and
+- by a key derived from the operator's **passphrase** (**scrypt**, N=65536 r=8 p=1, parameters stored alongside), and
 - by the **recovery key**.
+
+  This section originally specified Argon2id. It was changed during implementation and the reason is worth keeping: every Argon2 binding available to Node is a native module, and this project admits no new dependencies — a native addon would have to compile on the deployment host and would become a way for the dashboard to fail to start. scrypt is in the Node standard library, is memory-hard, and at these parameters costs roughly 64 MB per derivation. Argon2id is the better primitive in the abstract; scrypt without a native dependency is the better choice here, and the parameters are stored per-vault so they can be raised later without invalidating anything.
+
+  The stored parameters are validated on every unlock against a floor, not merely parsed — a `kdfParams` row edited to a weak work factor is rejected rather than honoured, and reported as a corrupt configuration rather than as a wrong passphrase.
 
 Unlocking derives the wrapping key in memory and unwraps the vault key; neither is ever written to disk. Changing the passphrase re-wraps the vault key — it does **not** re-encrypt every secret, so a passphrase change is instant regardless of vault size.
 
@@ -55,15 +63,35 @@ Each credential's secret is sealed with the existing envelope primitive (`web/sr
 
 - The vault is **locked at process start**. A restart always locks.
 - Unlock is required before any reveal.
-- **Automatic re-lock after 15 minutes of inactivity.** A dashboard left open on an unlocked laptop stops being a credential dispenser.
+- **Automatic re-lock 15 minutes after unlocking**, measured from the unlock itself and never extended by use. A dashboard left open on an unlocked laptop stops being a credential dispenser.
+
+  This corrects the original wording, "after 15 minutes of inactivity", which described a sliding idle window. That would have been the weaker control: revealing a credential every fourteen minutes would keep the vault unlocked indefinitely, so the session most actively dispensing secrets would be the one that never re-locked. An absolute deadline costs an occasional re-entry mid-task and buys a guarantee — no unlock outlives its 15 minutes, whatever the operator does. The implementation was already absolute; the wording was wrong, not the behaviour.
+
+  A revealed secret is cleared from the screen at that same deadline, not merely refused at the next reveal. Blocking new reveals while leaving an already-rendered secret on display would miss the unattended-laptop case this rule exists for.
 - The unwrapped vault key exists only in process memory, never in the database, a file, an environment variable, or a log line.
+- **The system clipboard is out of the lock's reach, and deliberately not swept.** Copying a secret puts a plaintext copy somewhere this application cannot see, cannot verify, and does not own. It survives the auto-lock, the auto-hide and an explicit *Lock now*.
+
+  Writing an empty string to the clipboard on lock was considered and rejected. It cannot be verified — the page cannot read the clipboard back to confirm the secret is gone — and it fails silently in the common case, because clipboard writes require document focus and user activation that a background timer does not have. Worse, it is wrong when it does work: the operator who copied a secret and has since copied something else would lose that instead, and the vault would have destroyed unrelated data to no benefit. A control that usually fails quietly, and does damage when it succeeds, is worse than a documented limitation — it converts a known gap into a false assurance, which is the failure mode this design keeps guarding against elsewhere.
+
+  So it is stated instead: **a copied secret is out of the vault's custody.** Paste it, use it, and clear the clipboard yourself if the machine is shared.
 
 ## 7 · Data model
 
 - **`Credential`** — `id`, `label`, `username`, `secretSealed`, `notes`, optional `hostId` + `systemKey`, `createdAt`, `updatedAt`, `rotatedAt`.
   The system link is a plain pair, not a foreign key to `System`: systems are discovered and can vanish, and a credential must survive that. Attachment is resolved by matching, so a returning system re-attaches automatically.
-- **`VaultConfig`** — exactly one row: KDF parameters, the verifier, and both wrapped copies of the vault key. A partial-unique index enforces the single row.
-- **`CredentialAccess`** — append-only: `credentialId`, `action` (`reveal` | `create` | `update` | `delete`), `at`. Never records the secret itself.
+- **`VaultConfig`** — exactly one row: KDF parameters, the verifier, both wrapped copies of the vault key, and `recoveryKeyAcknowledgedAt`.
+
+  The single row is enforced by a **`CHECK (id = 'singleton')`** constraint, not by the partial-unique index this line described until now. The distinction is not pedantry: `id` merely *defaulting* to `'singleton'` is an application-level promise that a caller supplying any other id would sidestep, and the rest of the vault assumes there is exactly one config row holding the wrapped keys. The CHECK closes that at the database layer whatever any caller does — see `20260802091500_vault_config_singleton_check`.
+- **`CredentialAccess`** — append-only: `credentialId`, `action`, `at`. Never records the secret itself.
+
+  The actions actually written are `create`, `reveal`, `reveal-denied` and `reveal-failed`. The last two were added during implementation: an access log that records only the reveals that succeeded is backwards, because a reveal blocked by the lock, or one whose ciphertext failed its authentication check, is the event most worth seeing.
+
+  Two actions named in the original draft are **not** written, and each is a real limitation rather than an oversight:
+
+  - **`delete`** cannot be recorded. `CredentialAccess` rows cascade with the credential, so a row describing a deletion would be removed by the same statement that deletes the thing it describes. The audit trail therefore cannot record the one action that destroys its own evidence. Recording deletions would need a separate log not foreign-keyed to `Credential`.
+  - **`update`** has no code path, because there is no edit-in-place operation. Changing a stored secret means deleting the credential and adding a new one, which starts a fresh audit history and loses continuity with the old one. `rotatedAt` exists on the model for the same unbuilt operation and is written by nothing.
+
+  Both belong to the same follow-up: credential rotation with an audit trail that survives it.
 
 ## 8 · Interface
 

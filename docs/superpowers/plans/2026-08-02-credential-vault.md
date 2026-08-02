@@ -1259,12 +1259,24 @@ Expected: the first check FAILs — `/vault` does not exist yet.
 
 Migrations run as their own step, never in an entrypoint — `web` and `ingest` share one image and would otherwise race:
 
+> **This block was wrong and is corrected below. `deploy/README.md` is the
+> runbook of record — prefer it to this plan.** The original ordering ran
+> `migrate deploy` *before* `docker compose pull`. Migrations are baked into
+> the image, and compose's `run` pull policy is `missing` with `TAG=latest`
+> already cached, so the migrate step executed inside the **old** image,
+> printed "No pending migrations", exited 0 — and the pull then landed new
+> code on an old schema. The vault page selects a column that would not
+> exist, and being `force-dynamic` with no error boundary, it 500s on every
+> request while the verify script blames the application rather than the
+> schema. Pull first.
+
 ```bash
 cd /opt/bevora-ops && git fetch origin && git reset --hard origin/main
 export GHCR_OWNER=<owner> TAG=latest INGEST_BIND_ADDR=<this host's private address>
-docker compose run --rm web /deploy/with-database-url.sh \
+docker compose pull web ingest
+docker compose run --rm --pull always web /deploy/with-database-url.sh \
   npx prisma migrate deploy --schema web/prisma/schema.prisma
-docker compose pull web ingest && docker compose up -d web ingest
+docker compose up -d web ingest
 ```
 
 Then document in `deploy/README.md`: creating the vault, and — stated plainly — that the recovery key must be **printed and stored off the machine**. Saving it to a synced folder puts a copy of the key next to nothing it protects and quietly undoes the encryption.
