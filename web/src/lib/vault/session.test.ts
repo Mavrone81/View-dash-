@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { randomBytes } from 'node:crypto'
-import { unlockSession, currentVaultKey, lockSession, isUnlocked, DEFAULT_TTL_MS } from './session.js'
+import { unlockSession, currentVaultKey, lockSession, isUnlocked, sessionExpiresAt, DEFAULT_TTL_MS } from './session.js'
 
 const at = (ms: number) => () => new Date(ms)
 
@@ -43,6 +43,36 @@ describe('vault session', () => {
     expect(currentVaultKey(at(1000))).toBeNull()
     unlockSession(vk2, at(2000))
     expect(currentVaultKey(at(2000))?.equals(vk2)).toBe(true)
+  })
+
+  describe('sessionExpiresAt', () => {
+    it('is null while locked', () => {
+      expect(sessionExpiresAt()).toBeNull()
+    })
+
+    it('returns the exact deadline currentVaultKey is checking against', () => {
+      unlockSession(randomBytes(32), at(1000))
+      expect(sessionExpiresAt(at(1000))).toBe(1000 + DEFAULT_TTL_MS)
+    })
+
+    it('locks itself and returns null once the window expires -- same boundary as currentVaultKey', () => {
+      unlockSession(randomBytes(32), at(1000))
+      expect(sessionExpiresAt(at(1000 + DEFAULT_TTL_MS + 1))).toBeNull()
+      // The side effect (locking) is shared with currentVaultKey, not a
+      // separate check that could disagree with it.
+      expect(currentVaultKey(at(1000 + DEFAULT_TTL_MS + 1))).toBeNull()
+    })
+
+    it('is still non-null exactly AT the boundary, not past it', () => {
+      unlockSession(randomBytes(32), at(1000))
+      expect(sessionExpiresAt(at(1000 + DEFAULT_TTL_MS))).toBe(1000 + DEFAULT_TTL_MS)
+    })
+
+    it('reflects a lock taken on demand', () => {
+      unlockSession(randomBytes(32), at(1000))
+      lockSession()
+      expect(sessionExpiresAt(at(1000))).toBeNull()
+    })
   })
 
   it('default clock is evaluated per-call, not frozen at module load', () => {

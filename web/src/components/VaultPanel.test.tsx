@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, within, fireEvent, waitFor } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, within, fireEvent, waitFor, act } from '@testing-library/react'
 
 // The actions module is a Next.js server-action layer ('use server') that
 // talks to a real Postgres-backed vault (see actions.test.ts, which exercises
@@ -69,10 +69,14 @@ describe('VaultPanel', () => {
     expect(screen.queryByText('—')).toBeNull()
   })
 
-  it('never renders a secret into the page before it is asked for', () => {
-    const { container } = render(<VaultPanel initialised unlocked credentials={[cred()]} />)
-    expect(container.innerHTML).not.toContain('hunter2')
-  })
+  // Fix round 1: the brief's/task-8's original version of this test rendered
+  // `cred()`, which has no secret field at all -- so no implementation,
+  // buggy or not, could ever make 'hunter2' appear from `credentials` alone.
+  // It could not fail and was removed rather than kept as a paper trail
+  // (git history and this comment are the record). The real coverage is
+  // below, in "revealing a secret": a MOCKED reveal action returns a KNOWN
+  // secret, and its absence before the click is asserted against that real
+  // value.
 
   it('shows unattached credentials, clearly labelled, rather than hiding them', () => {
     render(<VaultPanel initialised unlocked credentials={[cred({ hostId: null, systemKey: null })]} />)
@@ -93,6 +97,7 @@ describe('VaultPanel', () => {
           cred({ id: 'c1', label: 'db', hostId: 'h1', systemKey: 'alpha' }),
           cred({ id: 'c2', label: 'orphan', hostId: null, systemKey: null }),
         ]}
+        systemLabels={{ 'h1::alpha': { hostName: 'host-one', systemName: 'alpha' } }}
       />,
     )
     const headings = screen.getAllByRole('heading', { level: 3 }).map((h) => h.textContent ?? '')
@@ -100,6 +105,27 @@ describe('VaultPanel', () => {
     const unattachedIdx = headings.findIndex((h) => h === 'Not attached to a system')
     expect(alphaIdx).toBeGreaterThanOrEqual(0)
     expect(unattachedIdx).toBeGreaterThan(alphaIdx)
+  })
+
+  // Fix round 1, "resolve display names": a credential can outlive its
+  // system by design (see credentials.ts), so a hostId/systemKey pair with
+  // no entry in `systemLabels` is a NORMAL, expected state, not corruption.
+  it('an attached credential whose system no longer exists reads as unattached, not under a raw-id heading', () => {
+    render(
+      <VaultPanel
+        initialised
+        unlocked
+        credentials={[cred({ id: 'c1', label: 'ghost-cred', hostId: 'h1', systemKey: 'deleted-system' })]}
+        systemLabels={{}}
+      />,
+    )
+    expect(screen.getByText('Not attached to a system')).toBeTruthy()
+    const headings = screen.getAllByRole('heading', { level: 3 }).map((h) => h.textContent ?? '')
+    // No heading should be built from the raw, meaningless-to-a-human ids --
+    // that would read as broken data rather than "we no longer know where
+    // this belongs".
+    expect(headings.some((h) => h.includes('h1'))).toBe(false)
+    expect(headings.some((h) => h.includes('deleted-system'))).toBe(false)
   })
 
   it('Lock now is always available while unlocked', () => {
@@ -164,6 +190,165 @@ describe('VaultPanel', () => {
       // The row must still offer Reveal again -- a failed attempt is not a
       // dead end.
       expect(screen.getByTestId('reveal-c1')).toBeTruthy()
+    })
+  })
+
+  // --- Fix round 1: the coordinator's ruling on design spec section 8
+  // ("Reveal shows one credential at a time, transiently") -- the stricter
+  // reading. Only one plaintext secret may be visible at any moment, and an
+  // individual reveal hides itself after a short interval even with no
+  // other action taken. Both use fake timers: `revealAction`'s mocked
+  // promise resolves on the microtask queue, which `vi.advanceTimersByTimeAsync`
+  // flushes correctly (plain `vi.advanceTimersByTime` does not await
+  // in-flight promises between ticks and was confirmed NOT to work here
+  // during prototyping).
+  describe('exposure limits on a revealed secret (fix round 1)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('revealing a second credential hides the first', async () => {
+      vi.mocked(revealAction).mockImplementation(async (id: string) =>
+        id === 'c1' ? { ok: true, secret: 'secret-one' } : { ok: true, secret: 'secret-two' },
+      )
+      render(
+        <VaultPanel
+          initialised
+          unlocked
+          credentials={[cred({ id: 'c1', label: 'first' }), cred({ id: 'c2', label: 'second' })]}
+        />,
+      )
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('reveal-c1'))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText('secret-one')).toBeTruthy()
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('reveal-c2'))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.queryByText('secret-one')).toBeNull()
+      expect(screen.getByText('secret-two')).toBeTruthy()
+      // c1's row goes back to offering Reveal -- it is not a dead row.
+      expect(within(screen.getByTestId('credential-row-c1')).getByTestId('reveal-c1')).toBeTruthy()
+    })
+
+    it('a revealed secret hides itself after a short interval, with no other action taken', async () => {
+      vi.mocked(revealAction).mockResolvedValue({ ok: true, secret: 'hunter2' })
+      render(<VaultPanel initialised unlocked credentials={[cred()]} />)
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('reveal-c1'))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText('hunter2')).toBeTruthy()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_001)
+      })
+      expect(screen.queryByText('hunter2')).toBeNull()
+      // Reveal is offered again -- auto-hide is not a dead end either.
+      expect(screen.getByTestId('reveal-c1')).toBeTruthy()
+    })
+  })
+
+  // --- Fix round 1: "a revealed secret outlives the auto-lock". The vault's
+  // session deadline is an ABSOLUTE instant (session.ts), passed down as
+  // `sessionExpiresAt`. The panel must clear any revealed secret and show
+  // Locked once that instant passes, without relying on a further reveal
+  // attempt to notice -- a timer alone is not enough (background-tab
+  // throttling, a suspended laptop), so visibilitychange/focus are also
+  // covered.
+  describe('auto-lock at the session deadline (fix round 1)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+      vi.setSystemTime(0)
+    })
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('clears a revealed secret and shows Locked once the deadline passes, via its own timer', async () => {
+      vi.mocked(revealAction).mockResolvedValue({ ok: true, secret: 'hunter2' })
+      // A short deadline (5s), well under the 20s reveal auto-hide interval,
+      // so what clears the secret here can only be the session-expiry path,
+      // not the unrelated per-reveal auto-hide timer.
+      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionExpiresAt={5000} />)
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('reveal-c1'))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText('hunter2')).toBeTruthy()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5001)
+      })
+      expect(screen.getByText('Locked', { exact: true })).toBeTruthy()
+      expect(screen.queryByText('hunter2')).toBeNull()
+    })
+
+    it('re-checks the deadline on visibilitychange even if its own timer has not fired', async () => {
+      vi.mocked(revealAction).mockResolvedValue({ ok: true, secret: 'hunter2' })
+      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionExpiresAt={5000} />)
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('reveal-c1'))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText('hunter2')).toBeTruthy()
+
+      // Simulate a laptop suspended past the deadline: the wall clock jumps,
+      // but the JS timer queue does not advance on its own (no
+      // advanceTimersByTime call) -- only a visibilitychange/focus event
+      // resuming the tab can notice.
+      vi.setSystemTime(6000)
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'))
+      })
+
+      expect(screen.getByText('Locked', { exact: true })).toBeTruthy()
+      expect(screen.queryByText('hunter2')).toBeNull()
+    })
+
+    it('re-checks the deadline on window focus', async () => {
+      vi.mocked(revealAction).mockResolvedValue({ ok: true, secret: 'hunter2' })
+      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionExpiresAt={5000} />)
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('reveal-c1'))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText('hunter2')).toBeTruthy()
+
+      vi.setSystemTime(6000)
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'))
+      })
+
+      expect(screen.getByText('Locked', { exact: true })).toBeTruthy()
+      expect(screen.queryByText('hunter2')).toBeNull()
+    })
+
+    it('does not lock early -- a secret survives right up to, but not past, the deadline', async () => {
+      vi.mocked(revealAction).mockResolvedValue({ ok: true, secret: 'hunter2' })
+      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionExpiresAt={5000} />)
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('reveal-c1'))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000)
+      })
+      expect(screen.getByText('hunter2')).toBeTruthy()
+      expect(screen.getByText('Unlocked', { exact: true })).toBeTruthy()
     })
   })
 

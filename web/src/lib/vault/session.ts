@@ -33,6 +33,31 @@ export function isUnlocked(now: () => Date = () => new Date()): boolean {
   return currentVaultKey(now) !== null
 }
 
+/**
+ * The absolute instant (epoch ms) the current unlock expires, or `null` if
+ * the vault is already locked. Exposed so a CLIENT (the vault page/panel)
+ * can schedule its OWN auto-lock against the exact same deadline the server
+ * enforces, instead of the two ever drifting apart or the client inventing
+ * its own guess -- see VaultPanel's use of this via `page.tsx`.
+ *
+ * Deliberately returns only the timestamp, never the key or anything
+ * derived from it -- this is scheduling bookkeeping, not key material, and
+ * must stay safe to hand to a Server Component prop and on into client JS.
+ *
+ * Shares `currentVaultKey`'s own expiry check (including the side effect of
+ * calling `lockSession()` once the deadline has passed) rather than
+ * duplicating it, so the two can never disagree about whether the session
+ * is still live.
+ */
+export function sessionExpiresAt(now: () => Date = () => new Date()): number | null {
+  if (!state) return null
+  if (now().getTime() > state.expiresAtMs) {
+    lockSession()
+    return null
+  }
+  return state.expiresAtMs
+}
+
 export function lockSession(): void {
   // Drop the reference outright rather than setting a flag, so nothing can
   // read the key back out of a "locked" object.

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, type FormEvent } from 'react'
+import { useState, useEffect, type FormEvent } from 'react'
 import type { CredentialSummary } from '../lib/vault/credentials.js'
 import {
   createVaultAction,
@@ -11,6 +11,9 @@ import {
   revealAction,
 } from '../app/vault/actions.js'
 
+/** A resolved, human-readable name for one `hostId`/`systemKey` pair. */
+export type SystemLabel = { hostName: string; systemName: string }
+
 export type VaultPanelProps = {
   initialised: boolean
   unlocked: boolean
@@ -18,6 +21,31 @@ export type VaultPanelProps = {
   /** From the board link: `/vault?host=<hostId>&system=<systemKey>`. Absent for a direct visit. */
   focusHostId?: string | null
   focusSystemKey?: string | null
+  /**
+   * The absolute instant (epoch ms) the server-side session expires, from
+   * `session.ts`'s `sessionExpiresAt()` via `page.tsx` -- `null` while
+   * locked. Drives this panel's own client-side auto-lock (fix round 1):
+   * without it, a secret revealed before the server re-locks stays on
+   * screen indefinitely under a header still reading "Unlocked", which is
+   * exactly the "dashboard left open on an unlocked laptop" scenario
+   * design spec section 6 introduces the auto-lock to close. This value is
+   * always treated as authoritative -- the panel schedules against it
+   * verbatim and never computes its own deadline (a client-computed guess
+   * could drift from what the server actually enforces, and the whole
+   * point of an absolute, non-sliding expiry is that nothing extends it).
+   */
+  sessionExpiresAt?: number | null
+  /**
+   * Resolved display names for every `hostId`/`systemKey` pair currently in
+   * the fleet table, keyed `${hostId}::${systemKey}` (built in `page.tsx`
+   * from `Host`/`System`). A credential whose pair has NO entry here still
+   * has non-null `hostId`/`systemKey` in the database (a credential can
+   * outlive its system by design, see `credentials.ts`), but is grouped
+   * with the unattached credentials rather than under a heading built from
+   * raw internal ids -- an unresolvable system reads as "we no longer know
+   * where this belongs", not as broken data.
+   */
+  systemLabels?: Record<string, SystemLabel>
 }
 
 // Exact strings, asserted on exactly by the test file -- kept as named
@@ -29,6 +57,14 @@ const UNLOCKED_LABEL = 'Unlocked'
 const UNATTACHED_HEADING = 'Not attached to a system'
 const EMPTY_MESSAGE = 'No credentials stored yet.'
 
+// How long a revealed secret stays on screen before hiding itself, absent
+// any other action. Chosen, not derived: long enough to read and click Copy
+// without racing the clock, short enough that "transient" (design spec
+// section 8) means something more than "until the 15-minute session TTL
+// happens to expire" -- the vault's own session window is a much coarser
+// backstop, not the mechanism "transient" is describing.
+const REVEAL_DISPLAY_MS = 20_000
+
 function copyToClipboard(text: string): void {
   // jsdom (the test environment) has no Clipboard API, and this must never
   // throw the click handler -- so this is best-effort, not load-bearing for
@@ -38,20 +74,22 @@ function copyToClipboard(text: string): void {
   }
 }
 
-type CredentialGroup = { key: string; hostId: string; systemKey: string; items: CredentialSummary[] }
+type CredentialGroup = { key: string; hostName: string; systemName: string; items: CredentialSummary[] }
 
 /**
  * Splits credentials into per-system groups plus an "unattached" bucket.
- * A credential counts as attached only when BOTH hostId and systemKey are
- * set -- addCredential always writes them together (see credentials.ts), so
- * one-set-one-null is not a shape this data actually produces, but treating
- * it as unattached rather than crashing is the safer read of a field this
- * function does not control the writer of.
+ *
+ * A credential counts as attached only when BOTH `hostId` and `systemKey`
+ * are set (addCredential always writes them together) AND that pair
+ * resolves to a real, currently-enrolled system via `systemLabels`. A
+ * credential whose system has since disappeared is deliberately folded into
+ * `unattached` rather than rendered under a heading built from raw ids --
+ * see `VaultPanelProps.systemLabels`.
  */
-function groupBySystem(credentials: readonly CredentialSummary[]): {
-  groups: CredentialGroup[]
-  unattached: CredentialSummary[]
-} {
+function groupBySystem(
+  credentials: readonly CredentialSummary[],
+  systemLabels: Readonly<Record<string, SystemLabel>>,
+): { groups: CredentialGroup[]; unattached: CredentialSummary[] } {
   const map = new Map<string, CredentialGroup>()
   const unattached: CredentialSummary[] = []
   for (const c of credentials) {
@@ -60,18 +98,33 @@ function groupBySystem(credentials: readonly CredentialSummary[]): {
       continue
     }
     const key = `${c.hostId}::${c.systemKey}`
+    const label = systemLabels[key]
+    if (label === undefined) {
+      unattached.push(c)
+      continue
+    }
     const existing = map.get(key)
     if (existing) {
       existing.items.push(c)
     } else {
-      map.set(key, { key, hostId: c.hostId, systemKey: c.systemKey, items: [c] })
+      map.set(key, { key, hostName: label.hostName, systemName: label.systemName, items: [c] })
     }
   }
-  const groups = Array.from(map.values()).sort((a, b) => a.key.localeCompare(b.key))
+  const groups = Array.from(map.values()).sort((a, b) =>
+    `${a.systemName}::${a.hostName}`.localeCompare(`${b.systemName}::${b.hostName}`),
+  )
   return { groups, unattached }
 }
 
-export function VaultPanel({ initialised, unlocked, credentials, focusHostId, focusSystemKey }: VaultPanelProps) {
+export function VaultPanel({
+  initialised,
+  unlocked,
+  credentials,
+  focusHostId,
+  focusSystemKey,
+  sessionExpiresAt,
+  systemLabels,
+}: VaultPanelProps) {
   // Mirrors the props but is updated locally from the AUTHORITATIVE result of
   // each action -- `ok: true` from createVaultAction/unlockAction/lockAction
   // means the server state genuinely changed, so it is safe to reflect that
@@ -86,6 +139,8 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
 
   const activeFocusHostId = focusHostId ?? null
   const activeFocusSystemKey = focusSystemKey ?? null
+  const labels = systemLabels ?? {}
+  const expiresAt = sessionExpiresAt ?? null
 
   // --- Create ---
   const [createPassphrase, setCreatePassphrase] = useState('')
@@ -159,7 +214,58 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
     }
   }
 
-  // --- Lock ---
+  // --- Reveal: exactly one credential's plaintext may be on screen at any
+  // moment (design spec section 8, "Reveal shows one credential at a time,
+  // transiently" -- the coordinator's ruling on the ambiguity between that
+  // and independent per-row toggles). A single slot makes "revealing a
+  // second credential hides the first" a structural property rather than
+  // something a future change could accidentally break by touching only
+  // one row's state. ---
+  const [revealedCredential, setRevealedCredential] = useState<{ id: string; secret: string } | null>(null)
+  const [revealPending, setRevealPending] = useState<Record<string, boolean>>({})
+  const [revealErrors, setRevealErrors] = useState<Record<string, string>>({})
+
+  // Auto-hide: a revealed secret disappears on its own after REVEAL_DISPLAY_MS,
+  // independent of the vault's own session expiry (below) -- this is what
+  // "transiently" asks for, and what a manual-only Hide does not deliver.
+  useEffect(() => {
+    if (revealedCredential === null) return
+    const timer = setTimeout(() => setRevealedCredential(null), REVEAL_DISPLAY_MS)
+    return () => clearTimeout(timer)
+  }, [revealedCredential])
+
+  // Auto-lock: the server enforces an ABSOLUTE (not sliding) session
+  // deadline -- see session.ts's own note on why a sliding window would
+  // defeat the control. This effect schedules the client against that exact
+  // same instant, so a revealed secret cannot outlive the server-side
+  // unlock it depended on. A single timer is not enough on its own:
+  // background tabs throttle timers, and a laptop suspended past the
+  // deadline wakes with the timer unfired -- exactly the walk-away cases
+  // this fix exists for -- so `visibilitychange` and `focus` re-check the
+  // same deadline against the real clock every time the tab could plausibly
+  // have been away.
+  useEffect(() => {
+    if (expiresAt === null) return
+    function checkAndLock() {
+      if (expiresAt !== null && Date.now() >= expiresAt) {
+        setLocalUnlocked(false)
+        setRevealedCredential(null)
+        setRevealErrors({})
+      }
+    }
+    checkAndLock() // in case the deadline has already passed by the time this effect runs
+    const remaining = expiresAt - Date.now()
+    const timer = remaining > 0 ? setTimeout(checkAndLock, remaining) : null
+    document.addEventListener('visibilitychange', checkAndLock)
+    window.addEventListener('focus', checkAndLock)
+    return () => {
+      if (timer !== null) clearTimeout(timer)
+      document.removeEventListener('visibilitychange', checkAndLock)
+      window.removeEventListener('focus', checkAndLock)
+    }
+  }, [expiresAt])
+
+  // --- Lock (manual) ---
   async function handleLock() {
     await lockAction()
     setLocalUnlocked(false)
@@ -167,14 +273,9 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
     // vault key it depended on is gone from the server, and leaving the text
     // on screen after the operator explicitly asked to lock is exactly the
     // kind of lingering exposure this feature exists to avoid.
-    setRevealed({})
+    setRevealedCredential(null)
     setRevealErrors({})
   }
-
-  // --- Reveal (per credential id, so one row's state can never leak into another's) ---
-  const [revealed, setRevealed] = useState<Record<string, string>>({})
-  const [revealPending, setRevealPending] = useState<Record<string, boolean>>({})
-  const [revealErrors, setRevealErrors] = useState<Record<string, string>>({})
 
   async function handleReveal(id: string) {
     setRevealPending((p) => ({ ...p, [id]: true }))
@@ -186,7 +287,7 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
     try {
       const r = await revealAction(id)
       if (r.ok) {
-        setRevealed((p) => ({ ...p, [id]: r.secret }))
+        setRevealedCredential({ id, secret: r.secret })
       } else {
         setRevealErrors((p) => ({ ...p, [id]: r.message }))
       }
@@ -195,12 +296,8 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
     }
   }
 
-  function handleHide(id: string) {
-    setRevealed((p) => {
-      const next = { ...p }
-      delete next[id]
-      return next
-    })
+  function handleHide() {
+    setRevealedCredential(null)
   }
 
   // --- Add a credential pre-attached to the focused system (Resolution 3) ---
@@ -246,6 +343,16 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
       setAddPending(false)
     }
   }
+
+  // The focused system's resolved display name, when known -- falls back to
+  // the raw key only for the "what do I call this in a sentence" purpose of
+  // these hint strings, which is a different situation from the group
+  // headings below (there, an unresolved system is folded into unattached
+  // rather than named at all).
+  const focusSystemLabel =
+    activeFocusHostId !== null && activeFocusSystemKey !== null
+      ? (labels[`${activeFocusHostId}::${activeFocusSystemKey}`]?.systemName ?? activeFocusSystemKey)
+      : null
 
   // --- Recovery-key gate: takes over the ENTIRE panel until acknowledged ---
   if (createdRecoveryKey !== null) {
@@ -297,7 +404,7 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
     )
   }
 
-  const { groups, unattached } = groupBySystem(credentialsState)
+  const { groups, unattached } = groupBySystem(credentialsState, labels)
 
   // --- Locked ---
   if (!localUnlocked) {
@@ -368,8 +475,8 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
 
         {activeFocusSystemKey !== null && !focusHasCredentials && (
           <p className="vault-hint">
-            No credentials stored yet for system &ldquo;{activeFocusSystemKey}&rdquo;. Unlock the vault to
-            add one.
+            No credentials stored yet for system &ldquo;{focusSystemLabel}&rdquo;. Unlock the vault to add
+            one.
           </p>
         )}
       </section>
@@ -385,7 +492,7 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
     activeFocusHostId !== null && activeFocusSystemKey !== null && focusGroupCredentials.length === 0
 
   function renderRow(c: CredentialSummary) {
-    const secret = revealed[c.id]
+    const secret = revealedCredential !== null && revealedCredential.id === c.id ? revealedCredential.secret : undefined
     const pending = revealPending[c.id] === true
     const error = revealErrors[c.id]
     return (
@@ -398,7 +505,7 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
             <button type="button" className="vault-button" onClick={() => copyToClipboard(secret)}>
               Copy
             </button>
-            <button type="button" className="vault-button" onClick={() => handleHide(c.id)}>
+            <button type="button" className="vault-button" onClick={handleHide}>
               Hide
             </button>
           </span>
@@ -439,7 +546,7 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
       {groups.map((g) => (
         <div key={g.key}>
           <h3 className="vault-group-heading">
-            System &ldquo;{g.systemKey}&rdquo; (host {g.hostId})
+            System &ldquo;{g.systemName}&rdquo; (host {g.hostName})
           </h3>
           <ul className="vault-credential-list">{g.items.map(renderRow)}</ul>
         </div>
@@ -454,9 +561,7 @@ export function VaultPanel({ initialised, unlocked, credentials, focusHostId, fo
 
       {focusHasNoCredentials && activeFocusHostId !== null && activeFocusSystemKey !== null && (
         <div className="vault-focus-add">
-          <h3 className="vault-group-heading">
-            Add a credential for system &ldquo;{activeFocusSystemKey}&rdquo;
-          </h3>
+          <h3 className="vault-group-heading">Add a credential for system &ldquo;{focusSystemLabel}&rdquo;</h3>
           <form onSubmit={handleAddFocused}>
             <label className="vault-field">
               Label
