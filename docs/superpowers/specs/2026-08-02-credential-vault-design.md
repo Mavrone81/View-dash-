@@ -42,8 +42,12 @@ Attribution is the one thing genuinely absent. With a single operator it is not 
 
 A random 32-byte **vault key** is generated once. It is never stored raw. It is wrapped twice:
 
-- by a key derived from the operator's **passphrase** (Argon2id, parameters stored alongside), and
+- by a key derived from the operator's **passphrase** (**scrypt**, N=65536 r=8 p=1, parameters stored alongside), and
 - by the **recovery key**.
+
+  This section originally specified Argon2id. It was changed during implementation and the reason is worth keeping: every Argon2 binding available to Node is a native module, and this project admits no new dependencies — a native addon would have to compile on the deployment host and would become a way for the dashboard to fail to start. scrypt is in the Node standard library, is memory-hard, and at these parameters costs roughly 64 MB per derivation. Argon2id is the better primitive in the abstract; scrypt without a native dependency is the better choice here, and the parameters are stored per-vault so they can be raised later without invalidating anything.
+
+  The stored parameters are validated on every unlock against a floor, not merely parsed — a `kdfParams` row edited to a weak work factor is rejected rather than honoured, and reported as a corrupt configuration rather than as a wrong passphrase.
 
 Unlocking derives the wrapping key in memory and unwraps the vault key; neither is ever written to disk. Changing the passphrase re-wraps the vault key — it does **not** re-encrypt every secret, so a passphrase change is instant regardless of vault size.
 
@@ -72,7 +76,16 @@ Each credential's secret is sealed with the existing envelope primitive (`web/sr
 - **`Credential`** — `id`, `label`, `username`, `secretSealed`, `notes`, optional `hostId` + `systemKey`, `createdAt`, `updatedAt`, `rotatedAt`.
   The system link is a plain pair, not a foreign key to `System`: systems are discovered and can vanish, and a credential must survive that. Attachment is resolved by matching, so a returning system re-attaches automatically.
 - **`VaultConfig`** — exactly one row: KDF parameters, the verifier, and both wrapped copies of the vault key. A partial-unique index enforces the single row.
-- **`CredentialAccess`** — append-only: `credentialId`, `action` (`reveal` | `create` | `update` | `delete`), `at`. Never records the secret itself.
+- **`CredentialAccess`** — append-only: `credentialId`, `action`, `at`. Never records the secret itself.
+
+  The actions actually written are `create`, `reveal`, `reveal-denied` and `reveal-failed`. The last two were added during implementation: an access log that records only the reveals that succeeded is backwards, because a reveal blocked by the lock, or one whose ciphertext failed its authentication check, is the event most worth seeing.
+
+  Two actions named in the original draft are **not** written, and each is a real limitation rather than an oversight:
+
+  - **`delete`** cannot be recorded. `CredentialAccess` rows cascade with the credential, so a row describing a deletion would be removed by the same statement that deletes the thing it describes. The audit trail therefore cannot record the one action that destroys its own evidence. Recording deletions would need a separate log not foreign-keyed to `Credential`.
+  - **`update`** has no code path, because there is no edit-in-place operation. Changing a stored secret means deleting the credential and adding a new one, which starts a fresh audit history and loses continuity with the old one. `rotatedAt` exists on the model for the same unbuilt operation and is written by nothing.
+
+  Both belong to the same follow-up: credential rotation with an audit trail that survives it.
 
 ## 8 · Interface
 
