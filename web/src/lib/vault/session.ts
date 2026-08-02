@@ -36,5 +36,11 @@ export function isUnlocked(now: () => Date = () => new Date()): boolean {
 export function lockSession(): void {
   // Drop the reference outright rather than setting a flag, so nothing can
   // read the key back out of a "locked" object.
+  //
+  // NOTE: The property that `state` is dropped (not flagged) is not externally
+  // observable through the public API—both approaches produce `null` from the
+  // getter. It is enforced by code inspection, not by automated test. This gap
+  // is admitted rather than obscured by a test that cannot actually distinguish
+  // the two implementations.
   state = null
 }

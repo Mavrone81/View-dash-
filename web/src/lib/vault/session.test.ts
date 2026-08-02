@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { randomBytes } from 'node:crypto'
 import { unlockSession, currentVaultKey, lockSession, isUnlocked, DEFAULT_TTL_MS } from './session.js'
 
@@ -35,11 +35,30 @@ describe('vault session', () => {
     expect(currentVaultKey(at(1000))).toBeNull()
   })
 
-  it('forgets the key on lock rather than merely flagging it locked', () => {
-    const vk = randomBytes(32)
-    unlockSession(vk, at(1000))
+  it('returns null after lock, then the new key after unlock', () => {
+    const vk1 = randomBytes(32)
+    const vk2 = randomBytes(32)
+    unlockSession(vk1, at(1000))
     lockSession()
-    unlockSession(randomBytes(32), at(2000))
-    expect(currentVaultKey(at(2000))?.equals(vk)).toBe(false)
+    expect(currentVaultKey(at(1000))).toBeNull()
+    unlockSession(vk2, at(2000))
+    expect(currentVaultKey(at(2000))?.equals(vk2)).toBe(true)
+  })
+
+  it('default clock is evaluated per-call, not frozen at module load', () => {
+    vi.useFakeTimers()
+    try {
+      const vk = randomBytes(32)
+      // Unlock with no clock argument (uses default per-call evaluation)
+      unlockSession(vk)
+      // Advance time past the TTL
+      vi.advanceTimersByTime(DEFAULT_TTL_MS + 1)
+      // Check with no clock argument (uses default per-call evaluation)
+      // If the default were frozen at module load, this would still see the old time
+      // and return the key. Since it's per-call, it sees the advanced time and returns null.
+      expect(currentVaultKey()).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
