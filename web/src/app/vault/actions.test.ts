@@ -203,14 +203,21 @@ describe('vault actions', () => {
     if (!r.ok) expect(r.message.toLowerCase()).not.toContain('passphrase')
   })
 
-  it('createVaultAction returns a plain failure, not a thrown error, when the underlying create fails', async () => {
+  it('createVaultAction returns a plain failure, not a thrown error, when the underlying create fails on a real singleton conflict', async () => {
     // Simulates the TOCTOU window between this action's own isInitialised()
     // check and createVault()'s write: two concurrent calls can both pass
     // the check, and the database's singleton constraint then rejects the
-    // second insert. Reproduced deterministically here by making the
-    // underlying prisma insert fail once, exactly as a lost race would.
+    // second insert. Reproduced deterministically here with the REAL Prisma
+    // error type and code (P2002 — confirmed empirically against this
+    // installed client to be what a genuine VaultConfig.id collision raises;
+    // see task-7-report.md "Fix round 4"), not a plain Error, so this proves
+    // the type/code check itself works rather than merely that some catch
+    // fired.
     const spy = vi.spyOn(prisma.vaultConfig, 'create').mockRejectedValueOnce(
-      new Error('Unique constraint failed on the fields: (`id`)'),
+      new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`id`)', {
+        code: 'P2002',
+        clientVersion: 'test',
+      }),
     )
     try {
       const r = await createVaultAction('right passphrase')
@@ -219,6 +226,51 @@ describe('vault actions', () => {
         expect(r.message.toLowerCase()).toContain('already exists')
         // The rejected insert's own message must not leak through.
         expect(r.message).not.toContain('Unique constraint')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('createVaultAction reports a database problem, not "already exists", when createVault() itself hits a real Prisma connectivity error', async () => {
+    // Distinct from the round-2 test above that injects the connectivity
+    // failure into isInitialised() itself — this one gets PAST that check
+    // (isInitialised() must resolve false first) and fails inside
+    // createVault()'s own write instead, which is the exact scenario this
+    // round's finding described: a transient database hiccup during the
+    // FIRST-ever setup, previously misreported as "a vault already exists".
+    const spy = vi.spyOn(prisma.vaultConfig, 'create').mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError("Can't reach database server", { code: 'P1001', clientVersion: 'test' }),
+    )
+    try {
+      const r = await createVaultAction('right passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+        expect(r.message.toLowerCase()).not.toContain('already exists')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+    expect(await prisma.vaultConfig.count()).toBe(0)
+  })
+
+  it('createVaultAction reports a neutral failure, not "already exists" or a database claim, for an error it cannot positively identify', async () => {
+    // A REAL PrismaClientKnownRequestError, but with a code that is neither
+    // the singleton-conflict code (P2002) nor a recognised connectivity code
+    // — this proves the classifier checks the SPECIFIC code in both
+    // directions, not just "any PrismaClientKnownRequestError is a conflict"
+    // or "any PrismaClientKnownRequestError is connectivity".
+    const spy = vi.spyOn(prisma.vaultConfig, 'create').mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError('unrelated failure', { code: 'P2025', clientVersion: 'test' }),
+    )
+    try {
+      const r = await createVaultAction('right passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).not.toContain('already exists')
+        expect(r.message.toLowerCase()).not.toMatch(/database|reach|connect/)
+        expect(r.message).not.toContain('unrelated failure')
       }
     } finally {
       spy.mockRestore()

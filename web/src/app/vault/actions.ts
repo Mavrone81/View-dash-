@@ -91,6 +91,37 @@ function classifyUnlockFailure(err: unknown, corruptConfigMessage: string): Err 
   return failed(UNLOCK_FAILED_MESSAGE)
 }
 
+const VAULT_ALREADY_EXISTS_MESSAGE = 'A vault already exists on this dashboard.'
+// Parallel to UNLOCK_FAILED_MESSAGE, worded for the create path rather than
+// the unlock path: a failure this file cannot positively identify at all.
+const CREATE_FAILED_MESSAGE = 'The vault could not be created right now. Try again in a moment.'
+
+// Same discipline as classifyUnlockFailure above, applied to createVault()'s
+// catch. A failure here used to be reported unconditionally as "a vault
+// already exists" — correct for the actual TOCTOU race between the
+// isInitialised() check above and this write, but wrong, and worse than it
+// looks, for a plain transient database hiccup on someone's very FIRST setup
+// attempt: unlockAction would then correctly say the opposite (no vault has
+// been created yet), leaving the operator with two authoritative,
+// contradicting claims and no prior knowledge to judge between them.
+//
+// Verified empirically against this installed Prisma client (see
+// task-7-report.md "Fix round 4") rather than assumed: the actual race
+// collides on VaultConfig's DEFAULT id ('singleton'), which Postgres reports
+// as a P2002 unique-constraint violation on the primary key — not the
+// separate `CHECK (id = 'singleton')` constraint, which surfaces completely
+// differently (a PrismaClientUnknownRequestError with no `code` at all) and
+// is never reachable through createVault() anyway, since it never supplies
+// an explicit id. P2002 is therefore the one case this function is entitled
+// to call "already exists".
+function classifyCreateVaultFailure(err: unknown): Err {
+  if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+    return failed(VAULT_ALREADY_EXISTS_MESSAGE)
+  }
+  if (isDatabaseConnectivityError(err)) return failed(DATABASE_UNAVAILABLE_MESSAGE)
+  return failed(CREATE_FAILED_MESSAGE)
+}
+
 export async function createVaultAction(passphrase: string): Promise<{ ok: true; recoveryKey: string } | Err> {
   if (passphrase.length < MIN_PASSPHRASE_LENGTH) {
     return failed(`Passphrase must be at least ${MIN_PASSPHRASE_LENGTH} characters.`)
@@ -101,21 +132,16 @@ export async function createVaultAction(passphrase: string): Promise<{ ok: true;
   } catch {
     return failed(DATABASE_UNAVAILABLE_MESSAGE)
   }
-  if (alreadyExists) return failed('A vault already exists on this dashboard.')
+  if (alreadyExists) return failed(VAULT_ALREADY_EXISTS_MESSAGE)
   try {
     const { recoveryKey } = await createVault(passphrase)
     revalidatePath('/vault')
     return { ok: true, recoveryKey }
-  } catch {
-    // The isInitialised() check above and createVault()'s own write are two
-    // separate round trips, so a second concurrent call can pass the check
-    // before either finishes — the database's singleton constraint on
-    // VaultConfig (see the migration CHECK, and vault.ts's own internal
-    // isInitialised() re-check) is what actually stops the second write,
-    // and it throws when that race is lost. The caught error's own message
-    // is discarded on purpose rather than surfaced: a rejected insert can
-    // echo back fragments of the row it tried to write.
-    return failed('A vault already exists on this dashboard.')
+  } catch (err) {
+    // The caught error's own text is discarded on purpose rather than
+    // surfaced in any branch: a rejected insert can echo back fragments of
+    // the row it tried to write.
+    return classifyCreateVaultFailure(err)
   }
 }
 
