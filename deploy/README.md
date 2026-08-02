@@ -397,3 +397,88 @@ reason to.
 | `INGEST_MAX_PAYLOAD_BYTES` | Largest accepted WebSocket message (default 1 MiB). `ws`'s own default is 100 MB, which on a 1 GB droplet is an out-of-memory condition anyone can request. |
 | `INGEST_MAX_CONNECTIONS` | Simultaneous connection ceiling (default `64`). Connections over the cap are closed *before* authentication, so an unauthenticated peer cannot drive a database round trip per connection. |
 | `BEVORA_PUBLIC_IP` | Read by `deploy/verify.sh` only. Set this if the dashboard host is behind NAT and has no globally-routable address on any of its own interfaces — otherwise the exposure checks fail rather than guess. |
+
+## The credential vault
+
+The vault stores admin logins for the systems on the board. Secrets are
+sealed with AES-256-GCM under a vault key that exists only in the `web`
+process's memory — never in the database, a file, an environment variable
+or a log line.
+
+### Deploying it
+
+Migrations run as their own step, never from an entrypoint: `web` and
+`ingest` share one image and would otherwise race each other to migrate.
+
+```bash
+cd /opt/bevora-ops && git fetch origin && git reset --hard origin/main
+export GHCR_OWNER=<owner> TAG=latest INGEST_BIND_ADDR=<this host's private address>
+docker compose run --rm web /deploy/with-database-url.sh \
+  npx prisma migrate deploy --schema web/prisma/schema.prisma
+docker compose pull web ingest && docker compose up -d web ingest
+bash deploy/verify-vault.sh
+```
+
+Run `verify-vault.sh` **before** deploying as well. Its value is in failing
+first: if it passes before the vault exists, it is not testing what it
+claims to. A recorded pre-deploy run should show the vault checks failing
+and the fleet-board check passing.
+
+### Creating the vault
+
+Do this yourself, in the browser, through the tunnel. Nobody else can do it
+for you and no automation should: the passphrase is never stored, so it
+exists only in your head from the moment you choose it.
+
+1. Open `/vault`.
+2. Choose a passphrase — minimum twelve characters. **It cannot be reset
+   or recovered.** If it is lost, the recovery key below is the only way
+   back to twenty production admin logins.
+3. The recovery key is shown **once**, immediately after creation, and
+   never again. Nothing in the system can redisplay it.
+
+### The recovery key: print it, then get it off this machine
+
+**Print it on paper and store it somewhere physical.**
+
+Do not put it in a file on the laptop that holds the SSH key to this
+dashboard, and do not put it in a synced folder. Both mistakes have the
+same shape: they place the key next to the thing it protects, so a single
+compromised or lost device takes both. Syncing additionally copies it to a
+provider you did not intend to trust with it, and deleting it later does
+not reliably unsync it.
+
+This estate already carries the mirror of this risk elsewhere — a sole
+backup encryption key living on one machine, where its loss stays invisible
+until a restore is attempted and fails. The recovery key has the same
+property: you will not discover it was lost at the moment you lose it, only
+at the moment you need it.
+
+### Proving the lock actually locks
+
+A lock that does not survive a restart is not a lock. After deploying:
+
+1. Unlock the vault and reveal one credential.
+2. `docker compose restart web`
+3. Reload `/vault`. It must report **Locked** and refuse to reveal without
+   the passphrase.
+
+This is a human step on purpose. It is the one check that proves the vault
+key really is held only in process memory — if the vault came back unlocked,
+the key survived the restart somewhere it should not have.
+
+### Two properties worth knowing before you rely on this
+
+**The lock is absolute, not idle-based.** It expires fifteen minutes after
+you unlock, and using the vault does not extend it. A sliding window would
+mean revealing a credential every fourteen minutes keeps the vault unlocked
+forever, so the session dispensing the most secrets would be the one that
+never re-locks. Expect to re-enter the passphrase mid-session; that is the
+design working.
+
+**The vault key lives in one process's memory.** This is correct only while
+`web` runs as a single Node process, which it does today. If this is ever
+scaled to multiple workers, an unlock in one worker will not unlock another
+and the symptom is a vault that appears to re-lock at random. Moving the key
+to a shared store would fix that symptom by removing the property the whole
+design rests on — so treat it as a constraint on scaling, not a bug to patch.
