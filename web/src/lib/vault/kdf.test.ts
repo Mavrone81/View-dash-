@@ -37,4 +37,34 @@ describe('kdf', () => {
     const k = deriveWrappingKey('x', newKdfParams())
     expect(checkVerifier(k, 'not-a-verifier')).toBe(false)
   })
+
+  it('REJECTS an empty salt instead of deriving from a zero-byte salt', () => {
+    const p = { ...newKdfParams(), saltB64: '' }
+    expect(() => deriveWrappingKey('x', p)).toThrow(/salt/)
+  })
+
+  it('REJECTS a salt shorter than 16 bytes', () => {
+    const p = { ...newKdfParams(), saltB64: Buffer.from('short').toString('base64') }
+    expect(() => deriveWrappingKey('x', p)).toThrow(/salt/)
+  })
+
+  it('REJECTS a downgraded N instead of silently deriving a weaker key', () => {
+    const p = { ...newKdfParams(), N: 2 }
+    expect(() => deriveWrappingKey('x', p)).toThrow(/N/)
+  })
+
+  it('REJECTS a non-integer or NaN N', () => {
+    const withNaN = { ...newKdfParams(), N: Number.NaN }
+    const withFloat = { ...newKdfParams(), N: 65536.5 }
+    expect(() => deriveWrappingKey('x', withNaN)).toThrow(/N/)
+    expect(() => deriveWrappingKey('x', withFloat)).toThrow(/N/)
+  })
+
+  it('still derives normally for valid params (happy path untouched)', () => {
+    const p = newKdfParams()
+    const a = deriveWrappingKey('correct horse battery staple', p)
+    const b = deriveWrappingKey('correct horse battery staple', p)
+    expect(a.length).toBe(32)
+    expect(a.equals(b)).toBe(true)
+  })
 })

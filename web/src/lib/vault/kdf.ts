@@ -12,11 +12,47 @@ const R = 8
 const P = 1
 const KEY_BYTES = 32
 
+// Floors matching what newKdfParams actually produces (N=65536, r=8, p=1,
+// 16-byte salt). These params are read back out of a database row, so a
+// corrupted row, a bad migration, or write access to that table must not be
+// able to silently weaken every future derivation — the only visible symptom
+// of a downgraded N would otherwise be that unlocking gets suspiciously fast.
+const MIN_SALT_BYTES = 16
+const MIN_N = 16384
+const MIN_R = 8
+const MIN_P = 1
+
+// Throws naming which parameter was rejected, but never includes the salt
+// value or the passphrase in the message — the salt is attacker-adjacent
+// data from the same row, and an error message is a plausible place for it
+// to leak into logs.
+function validateParams(params: KdfParams): void {
+  if (!Number.isInteger(params.N) || params.N < MIN_N || (params.N & (params.N - 1)) !== 0) {
+    throw new Error(`invalid kdf params: N must be an integer power of two >= ${MIN_N}`)
+  }
+  if (!Number.isInteger(params.r) || params.r < MIN_R) {
+    throw new Error(`invalid kdf params: r must be an integer >= ${MIN_R}`)
+  }
+  if (!Number.isInteger(params.p) || params.p < MIN_P) {
+    throw new Error(`invalid kdf params: p must be an integer >= ${MIN_P}`)
+  }
+  let salt: Buffer
+  try {
+    salt = Buffer.from(params.saltB64, 'base64')
+  } catch {
+    throw new Error(`invalid kdf params: salt is not valid base64`)
+  }
+  if (salt.length < MIN_SALT_BYTES) {
+    throw new Error(`invalid kdf params: salt must decode to at least ${MIN_SALT_BYTES} bytes`)
+  }
+}
+
 export function newKdfParams(): KdfParams {
   return { N, r: R, p: P, saltB64: randomBytes(16).toString('base64') }
 }
 
 export function deriveWrappingKey(passphrase: string, params: KdfParams): Buffer {
+  validateParams(params)
   // scryptSync refuses to allocate past its default maxmem (32MB) at these
   // parameters and throws — maxmem must be derived from the actual params
   // (128 * N * r, with headroom) rather than hardcoded, so a future params
