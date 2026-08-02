@@ -219,6 +219,18 @@ export async function createVault(passphrase: string): Promise<{ recoveryKey: st
  * stop applying. It also removes the spurious-40001 exposure that came with
  * the isolation level.
  *
+ * Be precise about what that protects, because the looser reading is how
+ * this went wrong twice. The lock covers a future writer to `Credential`
+ * THAT TAKES THIS SAME LOCK AS ITS FIRST STATEMENT, at any isolation level.
+ * A writer that skips the lock is invisible to the count below exactly as it
+ * was under the old mismatched-isolation scheme, and the credential it
+ * inserts ends up sealed under a vault key this function has already
+ * replaced — unreadable, with no error anywhere. So the coupling was not
+ * retired here, it was replaced with a cheaper and more robust one: every
+ * write path to `Credential` must take the singleton lock first. That is a
+ * standing constraint on new code, and it is on the fast-follow list because
+ * nothing enforces it.
+ *
  * When there is no config row at all, neither side has anything to lock —
  * and neither needs it, because `addCredential` refuses outright when its
  * own lock query finds no row.

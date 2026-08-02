@@ -116,21 +116,34 @@ export async function addCredential(input: {
       //
       // What holds it now is this lock, and it holds in both orderings:
       //
-      //  - Recreate counts first, then this transaction locks and commits:
-      //    recreate's own DELETE of the row must then wait on a lock taken by
-      //    a transaction that has since committed, and at its REPEATABLE
-      //    READ-or-stricter isolation that raises a serialization failure
-      //    instead of proceeding on the stale count.
-      //  - Recreate deletes the row first: this lock waits, and finds NO ROW
-      //    afterwards, because the tuple it was waiting on is gone. That is
-      //    the `rows.length === 0` branch below — it is not a paranoid
-      //    check, it is the second half of the fix.
+      //  - This transaction gets the lock first: recreate's own lock request
+      //    blocks until this one commits, and its `count()` then runs as a
+      //    statement BEGUN after that commit, so it takes a fresh snapshot
+      //    and sees the credential. It refuses with VaultNotEmptyError.
+      //  - Recreate gets the lock first and deletes the row: this lock waits,
+      //    and finds NO ROW afterwards, because the tuple it was waiting on
+      //    is gone. That is the `rows.length === 0` branch below — it is not
+      //    a paranoid check, it is the second half of the fix.
+      //
+      // Both legs depend on the lock being the FIRST statement on each side,
+      // before either transaction reads anything. Neither leg needs an
+      // isolation level, which is why both transactions are now plain READ
+      // COMMITTED. An earlier draft of this comment claimed the first leg was
+      // covered by recreate's "REPEATABLE READ-or-stricter" isolation; that
+      // was wrong twice over — recreate locks before it counts, and it is no
+      // longer serializable — and it was exactly the kind of stale assertion
+      // this block was rewritten to remove. Corrected rather than deleted so
+      // the trap stays visible.
       //
       // The lock is deliberately preferred over adding a read for
       // `recreateVault` to conflict with: a lock does not depend on either
-      // side's isolation level, so it still holds for a future writer to
-      // this table that opens a plain READ COMMITTED transaction. This
-      // transaction therefore no longer asks for SERIALIZABLE — it does not
+      // side's isolation level. Note precisely what that buys, because it is
+      // narrower than "future writers are safe": it protects a future writer
+      // to this table THAT TAKES THIS SAME LOCK FIRST, at any isolation
+      // level. One that skips the lock is invisible to recreate's count all
+      // over again. The coupling was replaced, not retired — see the
+      // fast-follow list. This transaction therefore no longer asks for
+      // SERIALIZABLE — it does not
       // need it, and asking would only add spurious 40001 failures.
       //
       // The same statement reads the acknowledgement, so it costs no extra
