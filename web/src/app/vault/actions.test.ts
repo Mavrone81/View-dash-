@@ -177,6 +177,44 @@ describe('vault actions', () => {
     }
   })
 
+  // --- Task 10 / finding I5: a kdfParams column that is VALID JSON but not
+  // usable KDF parameters is just as permanent as one that will not parse,
+  // and must report the same fact. Before the fix, validateParams threw a
+  // plain Error, classifyVaultConfigFailure could not identify it, and all
+  // three of these reported UNLOCK_FAILED_MESSAGE -- "try again in a
+  // moment" -- for damage that no amount of waiting repairs, never steering
+  // the operator to the recovery key that is the only way back in. ---
+
+  const permanentlyUnusableParams: ReadonlyArray<readonly [string, string]> = [
+    ['an empty object', '{}'],
+    ['a literal null', 'null'],
+    // The worst of the three: structurally valid, so nothing looks broken,
+    // but the work factor is below kdf.ts's floor -- the exact
+    // tampering/downgrade case those floors were added to catch.
+    ['a downgraded work factor', JSON.stringify({ N: 1024, r: 8, p: 1, saltB64: Buffer.alloc(16).toString('base64') })],
+  ]
+
+  for (const [description, stored] of permanentlyUnusableParams) {
+    it(`unlockAction reports ${description} in kdfParams as corrupt configuration, not as something to retry`, async () => {
+      const created = await createVaultAction('right passphrase')
+      expect(created.ok).toBe(true)
+      lockSession()
+      await prisma.vaultConfig.updateMany({ data: { kdfParams: stored } })
+      const r = await unlockAction('right passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toMatch(/corrupt|unreadable/)
+        // The specific misreport this fix removes: transient-sounding advice
+        // for permanent damage.
+        expect(r.message.toLowerCase()).not.toContain('try again in a moment')
+        // ...and it must point at the one route that still works.
+        expect(r.message.toLowerCase()).toContain('recovery key')
+        // The rejected value must never come back out in the message.
+        expect(r.message).not.toContain(stored)
+      }
+    })
+  }
+
   it('unlockWithRecoveryAction is unaffected by the same corrupt kdfParams, and never throws', async () => {
     const created = await createVaultAction('right passphrase')
     expect(created.ok).toBe(true)

@@ -8,6 +8,7 @@ import {
   isInitialised,
   VaultAlreadyExistsError,
 } from '../../lib/vault/vault.js'
+import { KdfParamsError } from '../../lib/vault/kdf.js'
 import { lockSession, remainingSessionMs, DEFAULT_TTL_MS } from '../../lib/vault/session.js'
 import {
   addCredential,
@@ -121,17 +122,35 @@ function isDatabaseConnectivityError(err: unknown): boolean {
   return false
 }
 
-// Only claims a corrupt VaultConfig when the evidence actually says so (a
-// JSON.parse failure surfaces as a SyntaxError — that is the one case where
-// the error's own type tells us what happened). A recognised connectivity
-// failure gets its own message instead of being folded into "corrupt", since
-// the correct next step (wait and retry) is the opposite of the corrupt-config
-// advice (use the recovery key). Anything else gets the neutral message
-// rather than a guess.
-function classifyUnlockFailure(err: unknown, corruptConfigMessage: string): Err {
-  if (err instanceof SyntaxError) return failed(corruptConfigMessage)
+// Only claims a corrupt VaultConfig when the evidence actually says so. Two
+// error types positively identify that, and they cover the two ways the
+// stored config is unusable:
+//
+//  - `SyntaxError` — the kdfParams column is not valid JSON at all.
+//  - `KdfParamsError` — the column parses, but what it parsed to is not
+//    usable KDF parameters: a non-object, a `null`, a missing field, or a
+//    work factor below the floor. That last one is the tampering/downgrade
+//    case the floors in kdf.ts exist to catch, and it used to reach the
+//    operator as UNLOCK_FAILED_MESSAGE ("try again in a moment") — advice
+//    that can never come true for a permanent condition, and which steers
+//    away from the recovery key that is the actual way back in.
+//
+// A recognised connectivity failure gets its own message instead of being
+// folded into "corrupt", since the correct next step (wait and retry) is the
+// opposite of the corrupt-config advice. Anything else gets the caller's
+// neutral message rather than a guess.
+//
+// Shared by the unlock, recovery-unlock and change-passphrase paths — all
+// three read the same VaultConfig row and can fail the same three ways —
+// with each caller supplying the wording appropriate to what it was doing.
+function classifyVaultConfigFailure(
+  err: unknown,
+  corruptConfigMessage: string,
+  neutralMessage: string = UNLOCK_FAILED_MESSAGE,
+): Err {
+  if (err instanceof SyntaxError || err instanceof KdfParamsError) return failed(corruptConfigMessage)
   if (isDatabaseConnectivityError(err)) return failed(DATABASE_UNAVAILABLE_MESSAGE)
-  return failed(UNLOCK_FAILED_MESSAGE)
+  return failed(neutralMessage)
 }
 
 const VAULT_ALREADY_EXISTS_MESSAGE = 'A vault already exists on this dashboard.'
@@ -218,11 +237,11 @@ export async function unlockAction(passphrase: string): Promise<{ ok: true; sess
     // throws a SyntaxError — retype-your-passphrase will never help, use
     // the recovery key) or a database connectivity blip mid-call (retrying
     // shortly is exactly right, and "corrupt configuration" would be a
-    // guess the evidence does not support). classifyUnlockFailure only
+    // guess the evidence does not support). classifyVaultConfigFailure only
     // claims corruption when the error type actually says so. The caught
     // error's own text (which can carry a fragment of the corrupt value) is
     // never surfaced either way.
-    return classifyUnlockFailure(err, CONFIG_UNREADABLE_MESSAGE)
+    return classifyVaultConfigFailure(err, CONFIG_UNREADABLE_MESSAGE)
   }
   if (!ok) return failed('That passphrase did not unlock the vault.')
   revalidatePath('/vault')
@@ -251,7 +270,7 @@ export async function unlockWithRecoveryAction(
     // unlockAction above). Shared classification, kept even where one
     // branch is currently dead, for the same defense-in-depth reason this
     // catch was added in fix round 1.
-    return classifyUnlockFailure(err, CONFIG_UNREADABLE_RECOVERY_MESSAGE)
+    return classifyVaultConfigFailure(err, CONFIG_UNREADABLE_RECOVERY_MESSAGE)
   }
   if (!ok) return failed('That recovery key did not unlock the vault.')
   revalidatePath('/vault')
