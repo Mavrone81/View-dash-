@@ -70,9 +70,41 @@ export async function credentialsForSystem(hostId: string, systemKey: string): P
 }
 
 export async function revealCredential(id: string): Promise<string> {
-  const key = requireKey()
-  const row = await prisma.credential.findUniqueOrThrow({ where: { id }, select: { id: true, secretSealed: true } })
-  const secret = open(row.secretSealed, aadFor(row.id), key)
+  // Order matters here, and each step exists to fix a specific failure mode:
+  //
+  // 1. Look the row up FIRST, before checking the lock. CredentialAccess.credentialId
+  //    is a foreign key into Credential, so an audit row can never be written for an
+  //    id that doesn't exist. Checking the lock first would mean a locked-vault reveal
+  //    of an unknown id dies on an FK violation instead of surfacing "not found" — the
+  //    real problem gets masked by an unrelated database error. A missing row writes
+  //    no audit row at all: there is nothing here to audit against.
+  // 2. Check the lock only once the row is known to exist, and write 'reveal-denied'
+  //    before throwing. A probe against a locked vault is exactly the kind of access
+  //    attempt an audit log exists to catch — recording only successes has it backwards.
+  // 3. Wrap `open()` so a decrypt failure (wrong key, tampered ciphertext, or the
+  //    moved-ciphertext/AAD-mismatch case) writes 'reveal-failed' and rethrows the
+  //    ORIGINAL error unchanged, rather than letting a bug in the audit write itself
+  //    mask why the reveal actually failed.
+  //
+  // In every failure path, the row written to the audit table is the id and an action
+  // string only — never the ciphertext, the key, or any fragment of a secret.
+  const row = await prisma.credential.findUnique({ where: { id }, select: { id: true, secretSealed: true } })
+  if (!row) throw new Error('credential not found')
+
+  const key = currentVaultKey()
+  if (!key) {
+    await prisma.credentialAccess.create({ data: { credentialId: id, action: 'reveal-denied' } })
+    throw new Error('vault is locked')
+  }
+
+  let secret: string
+  try {
+    secret = open(row.secretSealed, aadFor(row.id), key)
+  } catch (err) {
+    await prisma.credentialAccess.create({ data: { credentialId: id, action: 'reveal-failed' } })
+    throw err
+  }
+
   await prisma.credentialAccess.create({ data: { credentialId: id, action: 'reveal' } })
   return secret
 }

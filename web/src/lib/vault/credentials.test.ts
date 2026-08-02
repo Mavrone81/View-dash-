@@ -1,7 +1,8 @@
+import { randomUUID } from 'node:crypto'
 import { describe, it, expect, beforeEach } from 'vitest'
 import { prisma } from '../db.js'
 import { lockSession } from './session.js'
-import { createVault } from './vault.js'
+import { createVault, unlockWithPassphrase } from './vault.js'
 import {
   addCredential,
   listCredentials,
@@ -105,8 +106,57 @@ describe('credentials', () => {
   it('never records the secret in the audit row', async () => {
     const id = await addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
     await revealCredential(id)
+
+    // Also exercise the denied and failed paths: 'reveal-denied' and
+    // 'reveal-failed' rows must be just as clean as a successful 'reveal'
+    // row — an id and an action string, never the ciphertext or the secret.
+    lockSession()
+    await expect(revealCredential(id)).rejects.toThrow()
+    await unlockWithPassphrase('right')
+
+    const other = await addCredential({ label: 'other', username: 'u', secret: 'other-secret' })
+    const otherRow = await prisma.credential.findUniqueOrThrow({ where: { id: other } })
+    await prisma.credential.update({ where: { id }, data: { secretSealed: otherRow.secretSealed } })
+    await expect(revealCredential(id)).rejects.toThrow()
+
     const audit = await prisma.credentialAccess.findMany()
     expect(JSON.stringify(audit)).not.toContain('hunter2')
+    expect(JSON.stringify(audit)).not.toContain('other-secret')
+  })
+
+  it('a reveal attempted while locked writes exactly one reveal-denied row and still throws', async () => {
+    const id = await addCredential({ label: 'admin', username: 'operator', secret: 'hunter2' })
+    lockSession()
+    await expect(revealCredential(id)).rejects.toThrow('vault is locked')
+    const denied = await prisma.credentialAccess.findMany({ where: { credentialId: id, action: 'reveal-denied' } })
+    expect(denied).toHaveLength(1)
+  })
+
+  it('a reveal of a ciphertext moved from another row writes exactly one reveal-failed row and still throws', async () => {
+    const a = await addCredential({ label: 'a', username: 'u', secret: 'secret-a' })
+    const b = await addCredential({ label: 'b', username: 'u', secret: 'secret-b' })
+    const rowA = await prisma.credential.findUniqueOrThrow({ where: { id: a } })
+    await prisma.credential.update({ where: { id: b }, data: { secretSealed: rowA.secretSealed } })
+    await expect(revealCredential(b)).rejects.toThrow()
+    const failed = await prisma.credentialAccess.findMany({ where: { credentialId: b, action: 'reveal-failed' } })
+    expect(failed).toHaveLength(1)
+  })
+
+  it('a reveal of an id that does not exist writes no audit row at all', async () => {
+    // Locking the session here is what actually exercises the FK-ordering
+    // fix. In an unlocked vault, ANY ordering (lock check first or row
+    // lookup first) throws before ever reaching an audit write, so a
+    // missing id writes zero rows either way — that alone would not prove
+    // anything. Locking first is what would make a "check the lock before
+    // looking up the row" implementation report 'vault is locked' for an id
+    // that was never going to exist regardless of lock state — masking the
+    // real problem exactly as the finding describes. The fixed
+    // implementation must still say 'credential not found', not that.
+    lockSession()
+    const missingId = randomUUID()
+    await expect(revealCredential(missingId)).rejects.toThrow('credential not found')
+    const audit = await prisma.credentialAccess.findMany({ where: { credentialId: missingId } })
+    expect(audit).toHaveLength(0)
   })
 
   it('finds the credentials attached to a system', async () => {
