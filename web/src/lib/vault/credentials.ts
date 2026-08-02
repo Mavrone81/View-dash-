@@ -28,6 +28,17 @@ const aadFor = (id: string): string => `credential:${id}:secret`
 // assert on them keep passing.
 export class VaultLockedError extends Error {}
 export class CredentialNotFoundError extends Error {}
+// Thrown ONLY when `open()` itself fails (a GCM authentication-tag mismatch,
+// an unsupported envelope version, or a malformed envelope shape -- see
+// envelope.ts). This is deliberately the ONE thing revealCredential lets
+// escape that a caller may treat as "the stored ciphertext could not be
+// authenticated" -- every other failure in this function (a missing row, a
+// locked vault, a database connectivity blip while reading the row or
+// writing an audit record) is either one of the two error types above or an
+// untouched error from whatever actually threw it, precisely so a caller
+// is never left inferring "corrupted" from an error that could have come
+// from an unrelated database operation. See task-7-report.md "Fix round 5".
+export class CredentialDecryptError extends Error {}
 
 function requireKey(): Buffer {
   const key = currentVaultKey()
@@ -91,9 +102,19 @@ export async function revealCredential(id: string): Promise<string> {
   //    before throwing. A probe against a locked vault is exactly the kind of access
   //    attempt an audit log exists to catch — recording only successes has it backwards.
   // 3. Wrap `open()` so a decrypt failure (wrong key, tampered ciphertext, or the
-  //    moved-ciphertext/AAD-mismatch case) writes 'reveal-failed' and rethrows the
-  //    ORIGINAL error unchanged, rather than letting a bug in the audit write itself
-  //    mask why the reveal actually failed.
+  //    moved-ciphertext/AAD-mismatch case) writes 'reveal-failed' and always reports
+  //    itself as a CredentialDecryptError — a positively identified fact, not
+  //    inferred from whatever happened to be the last thing to throw.
+  //
+  // In steps 2 and 3, the audit write is wrapped in its OWN try/catch, deliberately
+  // swallowed on failure: a database blip while recording the audit row must not
+  // replace the real, already-established fact (the vault is locked; the ciphertext
+  // failed to authenticate) with an unrelated database error, nor silently turn that
+  // real fact into a misreported one at the caller. See task-7-report.md "Fix round 5"
+  // — this is what a database outage hitting revealCredential used to look like: a
+  // connectivity error indistinguishable, to the caller, from a genuine decrypt
+  // failure, which reported as "may indicate the stored data was altered or
+  // corrupted" instead of "could not reach the database".
   //
   // In every failure path, the row written to the audit table is the id and an action
   // string only — never the ciphertext, the key, or any fragment of a secret.
@@ -102,16 +123,31 @@ export async function revealCredential(id: string): Promise<string> {
 
   const key = currentVaultKey()
   if (!key) {
-    await prisma.credentialAccess.create({ data: { credentialId: id, action: 'reveal-denied' } })
+    try {
+      await prisma.credentialAccess.create({ data: { credentialId: id, action: 'reveal-denied' } })
+    } catch {
+      // Swallowed: see the block comment above. "The vault is locked" is
+      // true regardless of whether this audit write succeeded.
+    }
     throw new VaultLockedError('vault is locked')
   }
 
   let secret: string
   try {
     secret = open(row.secretSealed, aadFor(row.id), key)
-  } catch (err) {
-    await prisma.credentialAccess.create({ data: { credentialId: id, action: 'reveal-failed' } })
-    throw err
+  } catch (decryptErr) {
+    try {
+      await prisma.credentialAccess.create({ data: { credentialId: id, action: 'reveal-failed' } })
+    } catch {
+      // Swallowed: see the block comment above. The decrypt failure is what
+      // gets reported below either way.
+    }
+    // A new, named error rather than the original rethrown: the caller needs
+    // to know ONLY that this was a decrypt failure, positively, from open()
+    // itself — not any detail from the original error, which is discarded
+    // here rather than attached, consistent with never surfacing a caught
+    // error's own text.
+    throw new CredentialDecryptError('credential could not be decrypted')
   }
 
   await prisma.credentialAccess.create({ data: { credentialId: id, action: 'reveal' } })

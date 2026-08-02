@@ -5,6 +5,19 @@ import { unlockSession } from './session.js'
 
 const SINGLETON = 'singleton'
 
+// Named so a caller (the server-action layer, specifically) can distinguish
+// "a vault already exists" from any other failure with `instanceof`, rather
+// than matching on message text. This matters because createVault()'s own
+// internal isInitialised() re-check below is a REALISTIC way for the actual
+// concurrent-create race to surface: two racing calls both reading "not
+// initialised" from the action layer's check, and then the SLOWER one's own
+// internal re-check here observing the vault the faster one just created --
+// often before either ever reaches the database INSERT that would otherwise
+// raise a Prisma unique-constraint error. Without this named type, that path
+// throws a plain, unclassifiable Error and the action layer has no way to
+// tell it apart from a genuine unknown failure.
+export class VaultAlreadyExistsError extends Error {}
+
 async function config() {
   return prisma.vaultConfig.findUnique({ where: { id: SINGLETON } })
 }
@@ -14,7 +27,7 @@ export async function isInitialised(): Promise<boolean> {
 }
 
 export async function createVault(passphrase: string): Promise<{ recoveryKey: string }> {
-  if (await isInitialised()) throw new Error('vault already exists')
+  if (await isInitialised()) throw new VaultAlreadyExistsError('vault already exists')
 
   const params = newKdfParams()
   const wrappingKey = deriveWrappingKey(passphrase, params)

@@ -482,4 +482,179 @@ describe('vault actions', () => {
       spy.mockRestore()
     }
   })
+
+  // --- Fix round 5: revealAction must not turn a database outage into a
+  // tampering claim. revealCredential() touches the database at three
+  // separate points (the initial lookup, the locked-path audit write, and
+  // the decrypt-failure audit write) plus a fourth (the success audit
+  // write); a connectivity failure at ANY of them must be reported as a
+  // database problem or (where a fact was already established before that
+  // point) as that established fact — never as "may indicate the stored
+  // data was altered or corrupted", which is reserved for an ACTUAL
+  // CredentialDecryptError from open(). See task-7-report.md "Fix round 5". ---
+
+  it('revealAction reports a database problem, not tampering, when the initial credential lookup itself hits a real Prisma connectivity error', async () => {
+    await createVaultAction('right passphrase')
+    const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+    expect(add.ok).toBe(true)
+    if (!add.ok) return
+    const spy = vi.spyOn(prisma.credential, 'findUnique').mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError("Can't reach database server", { code: 'P1001', clientVersion: 'test' }),
+    )
+    try {
+      const r = await revealAction(add.id)
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+        expect(r.message.toLowerCase()).not.toMatch(/corrupt|altered|unreadable/)
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('revealAction still reports the vault as locked when the reveal-denied audit write itself hits a real Prisma connectivity error', async () => {
+    await createVaultAction('right passphrase')
+    const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+    expect(add.ok).toBe(true)
+    if (!add.ok) return
+    lockSession()
+    // credentials.ts swallows a failure of THIS specific audit write and
+    // still reports the already-established fact ("the vault is locked")
+    // rather than letting an unrelated database error replace or hide it.
+    const spy = vi.spyOn(prisma.credentialAccess, 'create').mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError("Can't reach database server", { code: 'P1001', clientVersion: 'test' }),
+    )
+    try {
+      const r = await revealAction(add.id)
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toContain('locked')
+        expect(r.message.toLowerCase()).not.toMatch(/database|reach|connect/)
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('revealAction still reports a tampered credential as unreadable when the reveal-failed audit write itself hits a real Prisma connectivity error', async () => {
+    await createVaultAction('right passphrase')
+    const a = await addCredentialAction({ label: 'a', username: 'u', secret: 'secret-a' })
+    const b = await addCredentialAction({ label: 'b', username: 'u', secret: 'secret-b' })
+    expect(a.ok).toBe(true)
+    expect(b.ok).toBe(true)
+    if (!a.ok || !b.ok) return
+    const rowA = await prisma.credential.findUniqueOrThrow({ where: { id: a.id } })
+    await prisma.credential.update({ where: { id: b.id }, data: { secretSealed: rowA.secretSealed } })
+    // A GENUINE decrypt failure (moved ciphertext, AAD mismatch) is set up
+    // above; the audit write that records it is then ALSO made to fail with
+    // a real connectivity error. The already-established fact (open() just
+    // failed) must survive that — this is the same swallow verified above,
+    // but on the path where masking it would hide a real security event
+    // rather than a merely inconvenient one.
+    const spy = vi.spyOn(prisma.credentialAccess, 'create').mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError("Can't reach database server", { code: 'P1001', clientVersion: 'test' }),
+    )
+    try {
+      const r = await revealAction(b.id)
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toContain('unreadable')
+        expect(r.message.toLowerCase()).not.toMatch(/database|reach|connect/)
+        expect(r.message).not.toContain('secret-a')
+        expect(r.message).not.toContain('secret-b')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('revealAction reports a database problem, not tampering, when the final success audit write hits a real Prisma connectivity error despite a genuinely successful decrypt', async () => {
+    await createVaultAction('right passphrase')
+    const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+    expect(add.ok).toBe(true)
+    if (!add.ok) return
+    // This is the exact case the finding described: the ciphertext is fine,
+    // open() would succeed, and the ONLY thing that fails is the final
+    // audit write recording the success -- yet the old code would have
+    // reported this as possible tampering, since the error reaching
+    // revealAction's catch was neither VaultLockedError nor
+    // CredentialNotFoundError.
+    const spy = vi.spyOn(prisma.credentialAccess, 'create').mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError('server has closed the connection', { code: 'P1017', clientVersion: 'test' }),
+    )
+    try {
+      const r = await revealAction(add.id)
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+        expect(r.message.toLowerCase()).not.toMatch(/corrupt|altered|unreadable/)
+        expect(r.message).not.toContain('hunter2')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('revealAction reports a neutral failure, not tampering or a database claim, for an error it cannot positively identify', async () => {
+    await createVaultAction('right passphrase')
+    const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+    expect(add.ok).toBe(true)
+    if (!add.ok) return
+    // A REAL PrismaClientKnownRequestError, but with a code that is neither
+    // a recognised connectivity code nor anything decrypt-related -- proves
+    // the classifier does not treat "any Prisma error" as either database
+    // or tampering.
+    const spy = vi.spyOn(prisma.credentialAccess, 'create').mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError('unrelated failure', { code: 'P2025', clientVersion: 'test' }),
+    )
+    try {
+      const r = await revealAction(add.id)
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).not.toMatch(/corrupt|altered|unreadable/)
+        expect(r.message.toLowerCase()).not.toMatch(/database|reach|connect/)
+        expect(r.message).not.toContain('unrelated failure')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  // --- Fix round 5 (minor): createVaultAction must also recognise
+  // vault.ts's own internal singleton guard (VaultAlreadyExistsError), not
+  // just the database's P2002 -- this is the MORE likely outcome of the
+  // real concurrent-create race in practice. ---
+
+  it('createVaultAction reports "already exists" when vault.ts\'s own internal singleton guard fires, not the neutral message', async () => {
+    // Simulates the interleaving where the slower of two racing calls
+    // observes (via its OWN internal isInitialised() re-check inside
+    // createVault()) that the vault now exists, before ever reaching the
+    // database insert that would otherwise raise P2002. The two
+    // findUnique() calls below are: (1) this action's own isInitialised()
+    // check, which must see "not yet initialised", and (2) createVault()'s
+    // internal re-check, which must see "now initialised".
+    const fakeRow = {
+      id: 'singleton',
+      kdfParams: '{}',
+      verifier: 'v',
+      wrappedByPassphrase: 'a',
+      wrappedByRecovery: 'b',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    const spy = vi.spyOn(prisma.vaultConfig, 'findUnique')
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(fakeRow)
+    try {
+      const r = await createVaultAction('right passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toContain('already exists')
+      }
+    } finally {
+      spy.mockRestore()
+    }
+    expect(await prisma.vaultConfig.count()).toBe(0)
+  })
 })

@@ -1,7 +1,13 @@
 'use server'
 
 import { Prisma } from '@prisma/client'
-import { createVault, unlockWithPassphrase, unlockWithRecoveryKey, isInitialised } from '../../lib/vault/vault.js'
+import {
+  createVault,
+  unlockWithPassphrase,
+  unlockWithRecoveryKey,
+  isInitialised,
+  VaultAlreadyExistsError,
+} from '../../lib/vault/vault.js'
 import { lockSession } from '../../lib/vault/session.js'
 import {
   addCredential,
@@ -9,6 +15,7 @@ import {
   removeCredential,
   VaultLockedError,
   CredentialNotFoundError,
+  CredentialDecryptError,
 } from '../../lib/vault/credentials.js'
 import { revalidatePath } from 'next/cache'
 
@@ -112,9 +119,20 @@ const CREATE_FAILED_MESSAGE = 'The vault could not be created right now. Try aga
 // separate `CHECK (id = 'singleton')` constraint, which surfaces completely
 // differently (a PrismaClientUnknownRequestError with no `code` at all) and
 // is never reachable through createVault() anyway, since it never supplies
-// an explicit id. P2002 is therefore the one case this function is entitled
-// to call "already exists".
+// an explicit id.
+//
+// P2002 is not the ONLY way this race is positively identifiable, though —
+// createVault() in vault.ts does its OWN internal isInitialised() re-check
+// before ever reaching the database insert, and throws a named
+// VaultAlreadyExistsError if THAT sees the vault as already created. In
+// practice this is the more likely of the two outcomes for the real race
+// (the redundant internal check adds just enough delay to often observe the
+// winner's write before either call reaches the insert), so it needed the
+// same treatment as P2002 — fixed here rather than left to fall through to
+// the neutral message and discard a cause the code could have known for
+// certain. See task-7-report.md "Fix round 5".
 function classifyCreateVaultFailure(err: unknown): Err {
+  if (err instanceof VaultAlreadyExistsError) return failed(VAULT_ALREADY_EXISTS_MESSAGE)
   if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
     return failed(VAULT_ALREADY_EXISTS_MESSAGE)
   }
@@ -222,11 +240,28 @@ export async function addCredentialAction(input: {
   }
 }
 
-// Three distinct failure facts, each with its own advice — collapsing them
+// For a reveal failure this file cannot positively identify at all: not
+// locked, not missing, not a confirmed decrypt failure, not a recognised
+// database connectivity error. Naming a cause without evidence is exactly
+// the defect fixed in "Fix round 5" — see below.
+const REVEAL_FAILED_MESSAGE = 'This credential could not be revealed right now. Try again in a moment.'
+
+// Four distinct failure facts, each with its own advice — collapsing them
 // into one message either hides that unlocking won't help (a missing
-// credential) or actively misdirects away from a security event (a failed
-// GCM tag check on a tampered or moved ciphertext). See task-7-brief.md
-// Resolution 1.
+// credential), actively misdirects away from a security event (calling a
+// database outage "may indicate the stored data was altered or corrupted"),
+// or actively misdirects AWAY from one (calling a real tampering event a
+// transient database problem). See task-7-brief.md Resolution 1 and
+// task-7-report.md "Fix round 5".
+//
+// revealCredential() in credentials.ts is deliberately narrow about what it
+// lets escape here: VaultLockedError and CredentialNotFoundError are always
+// positively identified; CredentialDecryptError is thrown ONLY when open()
+// itself fails a GCM authentication check; everything else (a database
+// connectivity blip at any of the three separate database operations inside
+// revealCredential) is an untouched error of whatever type actually caused
+// it, which is what lets isDatabaseConnectivityError() below recognise it
+// correctly regardless of which of those three operations failed.
 export async function revealAction(id: string): Promise<Ok<{ secret: string }> | Err> {
   try {
     return { ok: true, secret: await revealCredential(id) }
@@ -237,12 +272,16 @@ export async function revealAction(id: string): Promise<Ok<{ secret: string }> |
     if (err instanceof CredentialNotFoundError) {
       return failed('This credential no longer exists.')
     }
-    // Anything else — including a GCM authentication failure from open(), the
-    // tamper/moved-ciphertext case the AAD binding defends against — falls
-    // through here. This is a decrypt failure, not a missing value: show it
-    // as unreadable, never as an empty field, and never suggest unlocking
-    // again since the vault is already unlocked at this point.
-    return failed('This credential could not be decrypted and is unreadable. This may indicate the stored data was altered or corrupted.')
+    if (err instanceof CredentialDecryptError) {
+      // The ONE case positively identified as a decrypt failure — a GCM
+      // authentication-tag mismatch, the tamper/moved-ciphertext case the
+      // AAD binding defends against. Show it as unreadable, never as an
+      // empty field, and never suggest unlocking again since the vault is
+      // already unlocked at this point.
+      return failed('This credential could not be decrypted and is unreadable. This may indicate the stored data was altered or corrupted.')
+    }
+    if (isDatabaseConnectivityError(err)) return failed(DATABASE_UNAVAILABLE_MESSAGE)
+    return failed(REVEAL_FAILED_MESSAGE)
   }
 }
 
