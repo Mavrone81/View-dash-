@@ -467,6 +467,23 @@ This is a human step on purpose. It is the one check that proves the vault
 key really is held only in process memory — if the vault came back unlocked,
 the key survived the restart somewhere it should not have.
 
+### What the lock does not cover: the clipboard
+
+Copying a secret puts a plaintext copy somewhere the vault cannot see or
+reclaim. It survives the fifteen-minute auto-lock, the twenty-second
+auto-hide, and an explicit **Lock now**.
+
+The vault does not try to clear it. It cannot confirm the clear worked
+(a page cannot read the clipboard back), a background timer usually lacks
+the focus and user activation a clipboard write needs so the attempt fails
+silently, and on the occasions it does succeed it would wipe whatever the
+operator copied afterwards — destroying unrelated data to no benefit. A
+control that quietly fails most of the time and does harm when it works is
+worse than a documented limitation.
+
+**So: a copied secret is out of the vault's custody.** Paste it, use it,
+and clear the clipboard yourself if the machine is shared.
+
 ### Two properties worth knowing before you rely on this
 
 **The lock is absolute, not idle-based.** It expires fifteen minutes after

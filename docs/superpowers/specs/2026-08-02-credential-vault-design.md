@@ -61,6 +61,11 @@ Each credential's secret is sealed with the existing envelope primitive (`web/sr
 
   A revealed secret is cleared from the screen at that same deadline, not merely refused at the next reveal. Blocking new reveals while leaving an already-rendered secret on display would miss the unattended-laptop case this rule exists for.
 - The unwrapped vault key exists only in process memory, never in the database, a file, an environment variable, or a log line.
+- **The system clipboard is out of the lock's reach, and deliberately not swept.** Copying a secret puts a plaintext copy somewhere this application cannot see, cannot verify, and does not own. It survives the auto-lock, the auto-hide and an explicit *Lock now*.
+
+  Writing an empty string to the clipboard on lock was considered and rejected. It cannot be verified — the page cannot read the clipboard back to confirm the secret is gone — and it fails silently in the common case, because clipboard writes require document focus and user activation that a background timer does not have. Worse, it is wrong when it does work: the operator who copied a secret and has since copied something else would lose that instead, and the vault would have destroyed unrelated data to no benefit. A control that usually fails quietly, and does damage when it succeeds, is worse than a documented limitation — it converts a known gap into a false assurance, which is the failure mode this design keeps guarding against elsewhere.
+
+  So it is stated instead: **a copied secret is out of the vault's custody.** Paste it, use it, and clear the clipboard yourself if the machine is shared.
 
 ## 7 · Data model
 
