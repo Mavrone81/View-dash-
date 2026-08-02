@@ -8,7 +8,7 @@ import {
   isInitialised,
   VaultAlreadyExistsError,
 } from '../../lib/vault/vault.js'
-import { lockSession } from '../../lib/vault/session.js'
+import { lockSession, remainingSessionMs, DEFAULT_TTL_MS } from '../../lib/vault/session.js'
 import {
   addCredential,
   revealCredential,
@@ -35,6 +35,29 @@ type Ok<T> = { ok: true } & T
 type Err = { ok: false; message: string }
 
 const failed = (message: string): Err => ({ ok: false, message })
+
+// fix round 2: every action that leaves the vault unlocked (createVaultAction,
+// unlockAction, unlockWithRecoveryAction) hands the client a DURATION --
+// "N ms remain" -- rather than the absolute epoch instant a prior version of
+// this file's caller (VaultPanel, via page.tsx) used. The reason is the same
+// one documented on session.ts's `remainingSessionMs`: a client whose clock
+// disagrees with the server's would misjudge an absolute deadline for the
+// whole session, in either direction. Returning it directly from the action
+// that JUST unlocked the vault also closes a real window: without this, a
+// secret revealed immediately after a client-driven unlock (before Next's
+// next server render delivers a fresh `page.tsx`-computed value) would have
+// no deadline to schedule against at all.
+//
+// `remainingSessionMs()` is called on the SAME call stack as the
+// `unlockSession()` call that just set the state it reads (inside
+// createVault/unlockWithPassphrase/unlockWithRecoveryKey in vault.ts), so it
+// returning null here should be unreachable. The `?? DEFAULT_TTL_MS`
+// fallback is not a guess if it is ever hit: every call site in this
+// codebase calls `unlockSession()` without overriding its `ttlMs` parameter,
+// so DEFAULT_TTL_MS is the value that was actually just used.
+function sessionDurationForClient(): number {
+  return remainingSessionMs() ?? DEFAULT_TTL_MS
+}
 
 const MIN_PASSPHRASE_LENGTH = 12
 
@@ -140,7 +163,9 @@ function classifyCreateVaultFailure(err: unknown): Err {
   return failed(CREATE_FAILED_MESSAGE)
 }
 
-export async function createVaultAction(passphrase: string): Promise<{ ok: true; recoveryKey: string } | Err> {
+export async function createVaultAction(
+  passphrase: string,
+): Promise<{ ok: true; recoveryKey: string; sessionRemainingMs: number } | Err> {
   if (passphrase.length < MIN_PASSPHRASE_LENGTH) {
     return failed(`Passphrase must be at least ${MIN_PASSPHRASE_LENGTH} characters.`)
   }
@@ -154,7 +179,7 @@ export async function createVaultAction(passphrase: string): Promise<{ ok: true;
   try {
     const { recoveryKey } = await createVault(passphrase)
     revalidatePath('/vault')
-    return { ok: true, recoveryKey }
+    return { ok: true, recoveryKey, sessionRemainingMs: sessionDurationForClient() }
   } catch (err) {
     // The caught error's own text is discarded on purpose rather than
     // surfaced in any branch: a rejected insert can echo back fragments of
@@ -163,7 +188,7 @@ export async function createVaultAction(passphrase: string): Promise<{ ok: true;
   }
 }
 
-export async function unlockAction(passphrase: string): Promise<{ ok: true } | Err> {
+export async function unlockAction(passphrase: string): Promise<{ ok: true; sessionRemainingMs: number } | Err> {
   let initialised: boolean
   try {
     initialised = await isInitialised()
@@ -188,10 +213,12 @@ export async function unlockAction(passphrase: string): Promise<{ ok: true } | E
   }
   if (!ok) return failed('That passphrase did not unlock the vault.')
   revalidatePath('/vault')
-  return { ok: true }
+  return { ok: true, sessionRemainingMs: sessionDurationForClient() }
 }
 
-export async function unlockWithRecoveryAction(display: string): Promise<{ ok: true } | Err> {
+export async function unlockWithRecoveryAction(
+  display: string,
+): Promise<{ ok: true; sessionRemainingMs: number } | Err> {
   let initialised: boolean
   try {
     initialised = await isInitialised()
@@ -215,7 +242,7 @@ export async function unlockWithRecoveryAction(display: string): Promise<{ ok: t
   }
   if (!ok) return failed('That recovery key did not unlock the vault.')
   revalidatePath('/vault')
-  return { ok: true }
+  return { ok: true, sessionRemainingMs: sessionDurationForClient() }
 }
 
 export async function lockAction(): Promise<{ ok: true }> {

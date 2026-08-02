@@ -2,6 +2,7 @@
 
 import { useState, useEffect, type FormEvent } from 'react'
 import type { CredentialSummary } from '../lib/vault/credentials.js'
+import type { SystemLabel } from '../lib/vault/system-labels.js'
 import {
   createVaultAction,
   unlockAction,
@@ -11,9 +12,6 @@ import {
   revealAction,
 } from '../app/vault/actions.js'
 
-/** A resolved, human-readable name for one `hostId`/`systemKey` pair. */
-export type SystemLabel = { hostName: string; systemName: string }
-
 export type VaultPanelProps = {
   initialised: boolean
   unlocked: boolean
@@ -22,19 +20,35 @@ export type VaultPanelProps = {
   focusHostId?: string | null
   focusSystemKey?: string | null
   /**
-   * The absolute instant (epoch ms) the server-side session expires, from
-   * `session.ts`'s `sessionExpiresAt()` via `page.tsx` -- `null` while
-   * locked. Drives this panel's own client-side auto-lock (fix round 1):
-   * without it, a secret revealed before the server re-locks stays on
-   * screen indefinitely under a header still reading "Unlocked", which is
-   * exactly the "dashboard left open on an unlocked laptop" scenario
-   * design spec section 6 introduces the auto-lock to close. This value is
-   * always treated as authoritative -- the panel schedules against it
-   * verbatim and never computes its own deadline (a client-computed guess
-   * could drift from what the server actually enforces, and the whole
-   * point of an absolute, non-sliding expiry is that nothing extends it).
+   * How many milliseconds remain in the current server-side session AS OF
+   * THE MOMENT THIS VALUE WAS LEARNED -- `null` while locked. Drives this
+   * panel's own client-side auto-lock (fix round 1): without it, a secret
+   * revealed before the server re-locks stays on screen indefinitely under
+   * a header still reading "Unlocked", which is exactly the "dashboard left
+   * open on an unlocked laptop" scenario design spec section 6 introduces
+   * the auto-lock to close.
+   *
+   * Two sources feed this, both authoritative and neither ever estimated by
+   * this component:
+   *  1. `page.tsx`'s `remainingSessionMs()` on every server render.
+   *  2. The unlock/create actions' own `sessionRemainingMs` return value,
+   *     applied immediately on a client-driven unlock (fix round 2) --
+   *     closing the window where a secret revealed right after an unlock,
+   *     with no intervening server render, had no deadline to schedule
+   *     against at all.
+   *
+   * Deliberately a DURATION, not an absolute epoch instant (fix round 1
+   * shipped the latter as `sessionExpiresAt`; see fix round 2's report for
+   * why it was replaced): a client whose clock disagreed with the server's
+   * would misjudge an absolute deadline for the entire session, in either
+   * direction. A duration is converted to a LOCAL deadline (`Date.now() +`
+   * this value) the instant it is learned, in `localDeadlineMs` below --
+   * comparing THAT against `Date.now()` later only requires this client's
+   * own clock to stay self-consistent from that moment on, which the
+   * `visibilitychange`/`focus` re-checks exist to catch a violation of (a
+   * laptop suspended mid-session).
    */
-  sessionExpiresAt?: number | null
+  sessionRemainingMs?: number | null
   /**
    * Resolved display names for every `hostId`/`systemKey` pair currently in
    * the fleet table, keyed `${hostId}::${systemKey}` (built in `page.tsx`
@@ -122,7 +136,7 @@ export function VaultPanel({
   credentials,
   focusHostId,
   focusSystemKey,
-  sessionExpiresAt,
+  sessionRemainingMs,
   systemLabels,
 }: VaultPanelProps) {
   // Mirrors the props but is updated locally from the AUTHORITATIVE result of
@@ -140,7 +154,26 @@ export function VaultPanel({
   const activeFocusHostId = focusHostId ?? null
   const activeFocusSystemKey = focusSystemKey ?? null
   const labels = systemLabels ?? {}
-  const expiresAt = sessionExpiresAt ?? null
+
+  // The LOCAL absolute deadline this client schedules its own auto-lock
+  // against -- always derived by adding a server-issued DURATION to this
+  // client's own `Date.now()` at the moment that duration became known
+  // (see VaultPanelProps.sessionRemainingMs). Never the server's raw epoch
+  // instant, and never a duration this component invented on its own.
+  const [localDeadlineMs, setLocalDeadlineMs] = useState<number | null>(null)
+
+  // Syncs `localDeadlineMs` from the `sessionRemainingMs` PROP -- i.e. from
+  // page.tsx's `remainingSessionMs()` on every fresh server render. Runs on
+  // mount (establishing the initial deadline) and again whenever the prop
+  // VALUE changes (a later render delivering fresher data). A client-driven
+  // unlock/create sets `localDeadlineMs` directly from the action's own
+  // return value instead (see the three handlers below) -- that path does
+  // not wait for this effect, which is what closes the "revealed
+  // immediately after an unlock, before the next server render" window
+  // fix round 2 exists to fix.
+  useEffect(() => {
+    setLocalDeadlineMs(sessionRemainingMs != null ? Date.now() + sessionRemainingMs : null)
+  }, [sessionRemainingMs])
 
   // --- Create ---
   const [createPassphrase, setCreatePassphrase] = useState('')
@@ -161,6 +194,9 @@ export function VaultPanel({
         setCreatedRecoveryKey(r.recoveryKey)
         setLocalInitialised(true)
         setLocalUnlocked(true)
+        // Applied directly from the action's own result, not waited on the
+        // `sessionRemainingMs` prop's next server render -- see fix round 2.
+        setLocalDeadlineMs(Date.now() + r.sessionRemainingMs)
         setCreatePassphrase('')
       } else {
         setCreateError(r.message)
@@ -187,6 +223,7 @@ export function VaultPanel({
       const r = await unlockAction(passphrase)
       if (r.ok) {
         setLocalUnlocked(true)
+        setLocalDeadlineMs(Date.now() + r.sessionRemainingMs)
         setPassphrase('')
       } else {
         setUnlockError(r.message)
@@ -204,6 +241,7 @@ export function VaultPanel({
       const r = await unlockWithRecoveryAction(recoveryInput)
       if (r.ok) {
         setLocalUnlocked(true)
+        setLocalDeadlineMs(Date.now() + r.sessionRemainingMs)
         setRecoveryInput('')
         setUseRecoveryMode(false)
       } else {
@@ -234,27 +272,29 @@ export function VaultPanel({
     return () => clearTimeout(timer)
   }, [revealedCredential])
 
-  // Auto-lock: the server enforces an ABSOLUTE (not sliding) session
-  // deadline -- see session.ts's own note on why a sliding window would
-  // defeat the control. This effect schedules the client against that exact
-  // same instant, so a revealed secret cannot outlive the server-side
-  // unlock it depended on. A single timer is not enough on its own:
-  // background tabs throttle timers, and a laptop suspended past the
-  // deadline wakes with the timer unfired -- exactly the walk-away cases
-  // this fix exists for -- so `visibilitychange` and `focus` re-check the
-  // same deadline against the real clock every time the tab could plausibly
-  // have been away.
+  // Auto-lock: schedules against `localDeadlineMs` (see above) -- a value
+  // this client derived itself, once, from a server-issued DURATION, so
+  // comparing it to `Date.now()` here never depends on this client's clock
+  // agreeing with the server's, only on it being self-consistent since the
+  // deadline was set. The server remains the only thing that decides when
+  // the vault is ACTUALLY locked (`revealAction` etc. re-check the real
+  // session on every call); this effect only decides when the SCREEN
+  // clears. A single timer is not enough on its own: background tabs
+  // throttle timers, and a laptop suspended past the deadline wakes with
+  // the timer unfired -- exactly the walk-away cases this fix exists for --
+  // so `visibilitychange` and `focus` re-check the same deadline every time
+  // the tab could plausibly have been away.
   useEffect(() => {
-    if (expiresAt === null) return
+    if (localDeadlineMs === null) return
     function checkAndLock() {
-      if (expiresAt !== null && Date.now() >= expiresAt) {
+      if (localDeadlineMs !== null && Date.now() >= localDeadlineMs) {
         setLocalUnlocked(false)
         setRevealedCredential(null)
         setRevealErrors({})
       }
     }
     checkAndLock() // in case the deadline has already passed by the time this effect runs
-    const remaining = expiresAt - Date.now()
+    const remaining = localDeadlineMs - Date.now()
     const timer = remaining > 0 ? setTimeout(checkAndLock, remaining) : null
     document.addEventListener('visibilitychange', checkAndLock)
     window.addEventListener('focus', checkAndLock)
@@ -263,12 +303,13 @@ export function VaultPanel({
       document.removeEventListener('visibilitychange', checkAndLock)
       window.removeEventListener('focus', checkAndLock)
     }
-  }, [expiresAt])
+  }, [localDeadlineMs])
 
   // --- Lock (manual) ---
   async function handleLock() {
     await lockAction()
     setLocalUnlocked(false)
+    setLocalDeadlineMs(null)
     // A secret already revealed this session must not survive a lock -- the
     // vault key it depended on is gone from the server, and leaving the text
     // on screen after the operator explicitly asked to lock is exactly the

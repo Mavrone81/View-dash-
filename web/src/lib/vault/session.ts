@@ -58,6 +58,32 @@ export function sessionExpiresAt(now: () => Date = () => new Date()): number | n
   return state.expiresAtMs
 }
 
+/**
+ * How many milliseconds remain in the current unlock, or `null` if the
+ * vault is locked. Layered on `sessionExpiresAt()` (same expiry check, same
+ * `lockSession()` side effect) rather than duplicating it, so the two can
+ * never disagree about whether the session is still live.
+ *
+ * This exists specifically so a caller can hand a client a DURATION rather
+ * than the absolute epoch instant `sessionExpiresAt()` returns (fix round 2
+ * -- see `actions.ts`'s unlock/create actions and `VaultPanel`'s use of the
+ * value they return). A client comparing a server-issued epoch instant
+ * against its own `Date.now()` is trusting its own clock to agree with the
+ * server's -- a client clock skewed by even a few minutes would hold a
+ * secret past the real deadline, or lock early, for the ENTIRE session. A
+ * client that instead schedules a timer for a server-issued DURATION only
+ * needs its own clock to stay self-consistent from the moment it learns
+ * "N ms remain" onward, which is a much weaker and more realistic
+ * assumption -- the one place that can still go wrong (a laptop suspended
+ * mid-session) is exactly why `VaultPanel` also re-checks on
+ * `visibilitychange`/`focus` rather than trusting a single scheduled timer.
+ */
+export function remainingSessionMs(now: () => Date = () => new Date()): number | null {
+  const expiresAt = sessionExpiresAt(now)
+  if (expiresAt === null) return null
+  return expiresAt - now().getTime()
+}
+
 export function lockSession(): void {
   // Drop the reference outright rather than setting a flag, so nothing can
   // read the key back out of a "locked" object.

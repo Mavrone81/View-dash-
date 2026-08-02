@@ -257,13 +257,18 @@ describe('VaultPanel', () => {
     })
   })
 
-  // --- Fix round 1: "a revealed secret outlives the auto-lock". The vault's
-  // session deadline is an ABSOLUTE instant (session.ts), passed down as
-  // `sessionExpiresAt`. The panel must clear any revealed secret and show
-  // Locked once that instant passes, without relying on a further reveal
-  // attempt to notice -- a timer alone is not enough (background-tab
-  // throttling, a suspended laptop), so visibilitychange/focus are also
-  // covered.
+  // --- Fix round 1: "a revealed secret outlives the auto-lock". The panel
+  // must clear any revealed secret and show Locked once the session
+  // deadline passes, without relying on a further reveal attempt to notice
+  // -- a timer alone is not enough (background-tab throttling, a suspended
+  // laptop), so visibilitychange/focus are also covered.
+  //
+  // `sessionRemainingMs` is a DURATION (fix round 2 renamed this prop from
+  // `sessionExpiresAt`, an absolute instant -- see task-8-report.md "Fix
+  // round 2" for why). With `vi.setSystemTime(0)` in `beforeEach` below, a
+  // duration of 5000 and an absolute instant of 5000 land on the identical
+  // local deadline, so these tests' numbers did not need to change, only
+  // the prop name and what it now means.
   describe('auto-lock at the session deadline (fix round 1)', () => {
     beforeEach(() => {
       vi.useFakeTimers()
@@ -278,7 +283,7 @@ describe('VaultPanel', () => {
       // A short deadline (5s), well under the 20s reveal auto-hide interval,
       // so what clears the secret here can only be the session-expiry path,
       // not the unrelated per-reveal auto-hide timer.
-      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionExpiresAt={5000} />)
+      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionRemainingMs={5000} />)
 
       await act(async () => {
         fireEvent.click(screen.getByTestId('reveal-c1'))
@@ -295,7 +300,7 @@ describe('VaultPanel', () => {
 
     it('re-checks the deadline on visibilitychange even if its own timer has not fired', async () => {
       vi.mocked(revealAction).mockResolvedValue({ ok: true, secret: 'hunter2' })
-      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionExpiresAt={5000} />)
+      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionRemainingMs={5000} />)
 
       await act(async () => {
         fireEvent.click(screen.getByTestId('reveal-c1'))
@@ -318,7 +323,7 @@ describe('VaultPanel', () => {
 
     it('re-checks the deadline on window focus', async () => {
       vi.mocked(revealAction).mockResolvedValue({ ok: true, secret: 'hunter2' })
-      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionExpiresAt={5000} />)
+      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionRemainingMs={5000} />)
 
       await act(async () => {
         fireEvent.click(screen.getByTestId('reveal-c1'))
@@ -337,7 +342,7 @@ describe('VaultPanel', () => {
 
     it('does not lock early -- a secret survives right up to, but not past, the deadline', async () => {
       vi.mocked(revealAction).mockResolvedValue({ ok: true, secret: 'hunter2' })
-      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionExpiresAt={5000} />)
+      render(<VaultPanel initialised unlocked credentials={[cred()]} sessionRemainingMs={5000} />)
 
       await act(async () => {
         fireEvent.click(screen.getByTestId('reveal-c1'))
@@ -349,6 +354,70 @@ describe('VaultPanel', () => {
       })
       expect(screen.getByText('hunter2')).toBeTruthy()
       expect(screen.getByText('Unlocked', { exact: true })).toBeTruthy()
+    })
+
+    // --- Fix round 2: the window disclosed in the fix round 1 report.
+    // A client-driven unlock flips `localUnlocked` to true immediately, but
+    // (before this fix) the deadline used to come ONLY from the
+    // `sessionRemainingMs` PROP, which only updates on the NEXT server
+    // render -- so a secret revealed in the gap had no deadline scheduled
+    // against it at all, and would never auto-clear. This is the exact case
+    // the coordinator asked to be proven failing before the fix.
+    it('a secret revealed immediately after a client-driven unlock -- with no intervening server render -- still clears at the deadline', async () => {
+      vi.mocked(unlockAction).mockResolvedValue({ ok: true, sessionRemainingMs: 5000 })
+      vi.mocked(revealAction).mockResolvedValue({ ok: true, secret: 'hunter2' })
+
+      // No `sessionRemainingMs` prop at all: this is what a page that loaded
+      // locked looks like (there is no session to report a duration for).
+      // The unlock below happens ENTIRELY client-side; this prop is never
+      // supplied a value at any point in this test, so the only possible
+      // source of a deadline is `unlockAction`'s own return value.
+      render(<VaultPanel initialised unlocked={false} credentials={[cred()]} />)
+
+      await act(async () => {
+        fireEvent.change(screen.getByLabelText(/^passphrase$/i), { target: { value: 'right passphrase' } })
+        fireEvent.click(screen.getByRole('button', { name: /^unlock$/i }))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText('Unlocked', { exact: true })).toBeTruthy()
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('reveal-c1'))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText('hunter2')).toBeTruthy()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5001)
+      })
+      expect(screen.getByText('Locked', { exact: true })).toBeTruthy()
+      expect(screen.queryByText('hunter2')).toBeNull()
+    })
+
+    // Same gap, for the OTHER action that leaves the vault unlocked
+    // (createVaultAction calls unlockSession internally too).
+    it('arms the auto-lock from createVaultAction\'s own result, with no credentials involved yet', async () => {
+      vi.mocked(createVaultAction).mockResolvedValue({
+        ok: true,
+        recoveryKey: 'RK-EXAMPLE-VALUE',
+        sessionRemainingMs: 5000,
+      })
+      render(<VaultPanel initialised={false} unlocked={false} credentials={[]} />)
+
+      await act(async () => {
+        fireEvent.change(screen.getByLabelText(/passphrase/i), { target: { value: 'a very long passphrase' } })
+        fireEvent.click(screen.getByRole('button', { name: /^create vault$/i }))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /i have stored it/i }))
+      })
+      expect(screen.getByText('Unlocked', { exact: true })).toBeTruthy()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5001)
+      })
+      expect(screen.getByText('Locked', { exact: true })).toBeTruthy()
     })
   })
 
@@ -420,7 +489,11 @@ describe('VaultPanel', () => {
 
   describe('creating the vault', () => {
     it('shows the recovery key once after creation, with an instruction to store it off this machine, and never shows it again', async () => {
-      vi.mocked(createVaultAction).mockResolvedValue({ ok: true, recoveryKey: 'RK-EXAMPLE-VALUE' })
+      vi.mocked(createVaultAction).mockResolvedValue({
+        ok: true,
+        recoveryKey: 'RK-EXAMPLE-VALUE',
+        sessionRemainingMs: 900_000,
+      })
       render(<VaultPanel initialised={false} unlocked={false} credentials={[]} />)
 
       fireEvent.change(screen.getByLabelText(/passphrase/i), { target: { value: 'a very long passphrase' } })

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Prisma } from '@prisma/client'
 import { prisma } from '../../lib/db.js'
-import { lockSession } from '../../lib/vault/session.js'
+import { lockSession, DEFAULT_TTL_MS } from '../../lib/vault/session.js'
 
 // `revalidatePath` throws outside a real Next.js request context ("static
 // generation store missing" or similar) — which is exactly the situation
@@ -656,5 +656,51 @@ describe('vault actions', () => {
       spy.mockRestore()
     }
     expect(await prisma.vaultConfig.count()).toBe(0)
+  })
+
+  // --- Fix round 2 (task-8): every action that leaves the vault unlocked
+  // hands the client a DURATION ("N ms remain"), not the absolute epoch
+  // instant `session.ts`'s `sessionExpiresAt()` returns -- so a client whose
+  // clock disagrees with the server's cannot misjudge the deadline, and a
+  // client-driven unlock has an authoritative deadline to schedule against
+  // immediately, without waiting on the next server render of `page.tsx`.
+  // See VaultPanel's use of this value and task-8-report.md "Fix round 2".
+  describe('sessionRemainingMs (fix round 2)', () => {
+    it('createVaultAction returns a session duration close to the full TTL', async () => {
+      const r = await createVaultAction('right passphrase')
+      expect(r.ok).toBe(true)
+      if (!r.ok) return
+      // "Close to", not exactly equal: real wall-clock time elapses between
+      // unlockSession() (inside createVault()) and this action reading it
+      // back via remainingSessionMs() a few lines later. A 5-second window
+      // is generous for a single in-process function call and nowhere near
+      // enough to hide a bug that returned e.g. 0, a negative number, or the
+      // raw absolute instant instead.
+      expect(r.sessionRemainingMs).toBeGreaterThan(DEFAULT_TTL_MS - 5000)
+      expect(r.sessionRemainingMs).toBeLessThanOrEqual(DEFAULT_TTL_MS)
+    })
+
+    it('unlockAction returns a session duration close to the full TTL', async () => {
+      await createVaultAction('right passphrase')
+      lockSession()
+      const r = await unlockAction('right passphrase')
+      expect(r.ok).toBe(true)
+      if (!r.ok) return
+      expect(r.sessionRemainingMs).toBeGreaterThan(DEFAULT_TTL_MS - 5000)
+      expect(r.sessionRemainingMs).toBeLessThanOrEqual(DEFAULT_TTL_MS)
+    })
+
+    it('unlockWithRecoveryAction returns a session duration close to the full TTL', async () => {
+      const created = await createVaultAction('right passphrase')
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      lockSession()
+      const r = await unlockWithRecoveryAction(created.recoveryKey)
+      expect(r.ok).toBe(true)
+      if (!r.ok) return
+      expect(r.sessionRemainingMs).toBeGreaterThan(DEFAULT_TTL_MS - 5000)
+      expect(r.sessionRemainingMs).toBeLessThanOrEqual(DEFAULT_TTL_MS)
+    })
+
   })
 })
