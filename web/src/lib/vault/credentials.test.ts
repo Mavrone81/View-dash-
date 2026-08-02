@@ -36,4 +36,18 @@ describe('vault schema', () => {
       }),
     ).rejects.toThrow()
   })
+
+  it('refuses a VaultConfig row with an explicit non-singleton id', async () => {
+    await expect(
+      prisma.vaultConfig.create({
+        data: {
+          id: 'not-singleton',
+          kdfParams: '{}',
+          verifier: 'v',
+          wrappedByPassphrase: 'a',
+          wrappedByRecovery: 'b',
+        },
+      }),
+    ).rejects.toThrow()
+  })
 })
