@@ -11,10 +11,22 @@ import {
   removeCredential,
 } from './credentials.js'
 
+// Host.name is @unique and nothing in this suite truncates the Host table, so
+// a fixture host created with a shared name survives the run and collides on
+// the next one — this file failed on its own second consecutive run for
+// exactly that reason. The fix is ownership: this file uses a name no other
+// spec file uses, and deletes that one row before each test. deleteMany on a
+// name that isn't there is a no-op, so it is safe on a clean database, and
+// scoping the delete by name leaves every other file's fixtures untouched.
+const FIXTURE_HOST = 'vault-fixture-host'
+
 beforeEach(async () => {
   await prisma.credentialAccess.deleteMany()
   await prisma.credential.deleteMany()
   await prisma.vaultConfig.deleteMany()
+  // Cascades to the fixture host's systems, so a test that dies midway cannot
+  // leave a (hostId, key) row behind to break the next run.
+  await prisma.host.deleteMany({ where: { name: FIXTURE_HOST } })
 })
 
 describe('vault schema', () => {
@@ -27,7 +39,7 @@ describe('vault schema', () => {
   })
 
   it('keeps a credential when its linked system disappears', async () => {
-    const host = await prisma.host.create({ data: { name: 'host-a' } })
+    const host = await prisma.host.create({ data: { name: FIXTURE_HOST } })
     const sys = await prisma.system.create({ data: { hostId: host.id, key: 'alpha', displayName: 'alpha' } })
     await prisma.credential.create({
       data: { label: 'admin', username: 'operator', secretSealed: 'v1:x:y:z', hostId: host.id, systemKey: 'alpha' },
@@ -160,16 +172,7 @@ describe('credentials', () => {
   })
 
   it('finds the credentials attached to a system', async () => {
-    // 'vault-fixture-host' rather than 'host-a': Host.name is @unique, this
-    // file's own 'vault schema' describe above already creates 'host-a' and
-    // never cleans up the Host table, and several other spec files in this
-    // repo create 'host-a' too. upsert makes this safe to re-run regardless
-    // of file/test ordering.
-    const host = await prisma.host.upsert({
-      where: { name: 'vault-fixture-host' },
-      update: {},
-      create: { name: 'vault-fixture-host' },
-    })
+    const host = await prisma.host.create({ data: { name: FIXTURE_HOST } })
     await addCredential({ label: 'admin', username: 'operator', secret: 's', hostId: host.id, systemKey: 'alpha' })
     await addCredential({ label: 'other', username: 'operator', secret: 's' })
     expect(await credentialsForSystem(host.id, 'alpha')).toHaveLength(1)
