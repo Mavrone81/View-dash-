@@ -1,4 +1,5 @@
 import type { DisplayState } from '../lib/staleness.js'
+import type { Beat } from '../lib/beats.js'
 
 export type FleetRow = {
   /**
@@ -29,7 +30,9 @@ export type FleetRow = {
   // collapsing "never heard from" into that same text would let a system
   // that has been silent since it was enrolled look identical to one that
   // is live and simply empty, on the one page whose job is telling an
-  // operator which of those is true.
+  // operator which of those is true. (Not rendered in the table itself since
+  // the "Heartbeat" redesign — the trace strip carries that signal now — but
+  // kept on the row and enforced at the data layer, see fleet-query.test.ts.)
   containersRunning: number | null
   containersTotal: number | null
   deployedSha: string | null
@@ -54,6 +57,19 @@ export type FleetRow = {
    * before its first observation landed.
    */
   lastSeenAt: Date | null
+  /**
+   * The signature element: this system's recent reporting beats, oldest
+   * first, bucketed into fixed 30-second slots by `buildBeatTrace`
+   * (web/src/lib/beats.ts). A slot with no observation is a visible hole in
+   * the trace, not a red flag — see `BeatTrace` below for why.
+   *
+   * Empty (`[]`) means there is no system here to trace at all — the
+   * "enrolled host, no systems reported yet" placeholder row. That is
+   * DISTINCT from a real system with a fully-silent 20-minute window, which
+   * gets a full array of `absent` slots instead: both are "we heard
+   * nothing", but only one of them is a system that exists.
+   */
+  beats: Beat[]
 }
 
 const DASH = '—'
@@ -83,31 +99,113 @@ function stateLabel(row: FleetRow): string {
   return `${row.state} — agent unreachable, ${lastSeenLabel(row.receivedAt ?? row.lastSeenAt)}`
 }
 
+/**
+ * The trace strip's text alternative -- carries the SAME fact the beat
+ * colours do (how many of the last N beats were missed), so the trace is
+ * never colour-only. This is what a screen reader announces for the whole
+ * strip; the individual beat swatches are `aria-hidden` (see `BeatTrace`)
+ * because they are not independently meaningful, only this summary is.
+ */
+function beatSummary(beats: readonly Beat[]): string {
+  const missed = beats.filter((b) => b.state === 'absent').length
+  const alarms = beats.filter((b) => b.state === 'alarm').length
+  const received = beats.length - missed
+  let summary = `${received} of last ${beats.length} beats received`
+  if (missed > 0) summary += `, ${missed} missed`
+  if (alarms > 0) summary += `, ${alarms} reported a fault`
+  return summary
+}
+
+/**
+ * The signature element of the "Heartbeat" redesign: a horizontal strip of
+ * a system's recent reporting beats.
+ *
+ * A system that stopped reporting does NOT get a text label saying "stale"
+ * here -- it gets a visible hole in its trace, and the length of the hole
+ * shows how long it has been silent. Colour carries meaning, never
+ * decoration: `good` (we heard from it), `absent` (grey -- silence is not
+ * itself a fault, so it must never read as red), `alarm` (a beat that
+ * actually reported trouble). All three are rendered as a distinct
+ * `data-beat` state, not merely a CSS colour, and the whole strip carries an
+ * `aria-label` naming the same fact in words -- so none of it depends on
+ * colour perception to be understood.
+ *
+ * `beats.length === 0` means there is no system here to trace (see
+ * `FleetRow.beats`) -- rendered as the same em dash every other unknown
+ * value on this board gets, never a fabricated 40-slot silence.
+ */
+function BeatTrace({ beats }: { beats: readonly Beat[] }) {
+  if (beats.length === 0) {
+    return <span className="beat-trace beat-trace--empty">{DASH}</span>
+  }
+  return (
+    <span className="beat-trace" role="img" tabIndex={0} aria-label={beatSummary(beats)}>
+      {beats.map((beat, i) => (
+        // eslint-disable-next-line react/no-array-index-key -- fixed-length, positional slots; index IS the identity here
+        <span key={i} className="beat" data-beat={beat.state} aria-hidden="true" />
+      ))}
+    </span>
+  )
+}
+
+/** What the beat colours mean, spelled out below the table -- not left to be inferred from a single glance. */
+function BeatLegend() {
+  return (
+    <ul className="beat-legend">
+      <li>
+        <span className="beat" data-beat="good" aria-hidden="true" /> beat received
+      </li>
+      <li>
+        <span className="beat" data-beat="absent" aria-hidden="true" /> no beat — not a fault
+      </li>
+      <li>
+        <span className="beat" data-beat="alarm" aria-hidden="true" /> beat reported a fault
+      </li>
+    </ul>
+  )
+}
+
 export function FleetTable({ rows }: { rows: FleetRow[] }) {
   if (rows.length === 0) return <p>No systems reported yet.</p>
   return (
-    <table>
-      <thead>
-        <tr>
-          <th>Host</th><th>System</th><th>State</th><th>Containers</th>
-          <th>Version</th><th>Deployed</th><th>Latest change</th><th>Drift</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map((r) => (
-          // `r.id` (host + key), never `r.key`: see FleetRow.id.
-          <tr key={r.id} data-state={r.state} data-host={r.hostName}>
-            <td>{r.hostName}</td>
-            <td>{r.displayName}</td>
-            <td>{stateLabel(r)}</td>
-            <td>{r.containersRunning === null || r.containersTotal === null ? DASH : `${r.containersRunning}/${r.containersTotal}`}</td>
-            <td>{r.deployedSha ? r.deployedSha.slice(0, 7) : DASH}</td>
-            <td>{r.deployedAt ? r.deployedAt.toISOString() : DASH}</td>
-            <td>{r.deployedSubject ?? DASH}</td>
-            <td>{r.driftCommits === null ? DASH : r.driftCommits === 0 ? 'up to date' : `${r.driftCommits} behind`}</td>
+    <div className="fleet-board">
+      <table className="fleet-table">
+        <thead>
+          <tr>
+            <th scope="col">System</th>
+            <th scope="col">State</th>
+            <th scope="col">Last 40 beats</th>
+            <th scope="col">Version</th>
+            <th scope="col">Deployed</th>
+            <th scope="col">Latest change</th>
+            <th scope="col">Drift</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            // `r.id` (host + key), never `r.key`: see FleetRow.id.
+            <tr key={r.id} data-state={r.state} data-host={r.hostName}>
+              <td className="col-system">
+                <span className="host-name">{r.hostName}</span>
+                <span className="sys-name">{r.displayName}</span>
+              </td>
+              <td className="col-state" data-state={r.state}>
+                {stateLabel(r)}
+              </td>
+              <td className="col-trace">
+                <BeatTrace beats={r.beats} />
+              </td>
+              <td className="col-version">{r.deployedSha ? r.deployedSha.slice(0, 7) : DASH}</td>
+              <td className="col-deployed">{r.deployedAt ? r.deployedAt.toISOString() : DASH}</td>
+              <td className="col-change">{r.deployedSubject ?? DASH}</td>
+              <td className="col-drift">
+                {r.driftCommits === null ? DASH : r.driftCommits === 0 ? 'up to date' : `${r.driftCommits} behind`}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <BeatLegend />
+    </div>
   )
 }

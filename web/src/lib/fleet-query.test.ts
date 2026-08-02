@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { PrismaClient, type Prisma } from '@prisma/client'
 import { prisma } from './db.js'
 import { latestPerSystem, NO_SYSTEMS_LABEL } from './fleet-query.js'
+import { BEAT_COUNT, BEAT_INTERVAL_MS } from './beats.js'
 
 beforeEach(async () => {
   await prisma.systemObservation.deleteMany()
@@ -355,6 +356,184 @@ describe('latestPerSystem', () => {
       // Host-major: alpha's `zzz` precedes bravo's `aaa`. A system-key sort
       // would put them the other way round and interleave the machines.
       expect(rows.map((r) => r.hostName)).toEqual(['host-alpha', 'host-bravo'])
+    })
+  })
+
+  // The trace strip: `beats` on each row is 40 slots (BEAT_COUNT) covering
+  // the last 20 minutes (BEAT_WINDOW_MS), oldest first. These tests exercise
+  // the DB-backed fetch feeding `buildBeatTrace` (unit-tested in isolation in
+  // beats.test.ts) -- specifically that the fetch is bounded to a time
+  // window, never "every historical observation", the same scale hazard the
+  // per-system-latest query above was written to avoid.
+  describe('beat trace', () => {
+    it('renders a visible gap for a system that has stopped reporting partway through the window', async () => {
+      const host = await prisma.host.create({ data: { name: 'host-gap' } })
+      const system = await prisma.system.create({
+        data: { hostId: host.id, key: 'sys-gap', displayName: 'sys-gap' },
+      })
+      const now = new Date('2026-08-01T12:00:00Z')
+      // Reports every 30s from 10 minutes ago up to 5 minutes ago, then
+      // nothing -- a real hole in the middle of the trace, not just at one end.
+      for (let msAgo = 10 * 60_000; msAgo >= 5 * 60_000; msAgo -= BEAT_INTERVAL_MS) {
+        await prisma.systemObservation.create({
+          data: { systemId: system.id, receivedAt: new Date(now.getTime() - msAgo), health: 'healthy', containersTotal: 1, containersRunning: 1 },
+        })
+      }
+
+      const rows = await latestPerSystem(now)
+
+      expect(rows).toHaveLength(1)
+      const beats = rows[0]!.beats
+      expect(beats).toHaveLength(BEAT_COUNT)
+      expect(beats.some((b) => b.state === 'absent')).toBe(true)
+      expect(beats.some((b) => b.state === 'good')).toBe(true)
+    })
+
+    it('renders no gaps for a system that reported on every tick throughout the window', async () => {
+      const host = await prisma.host.create({ data: { name: 'host-solid' } })
+      const system = await prisma.system.create({
+        data: { hostId: host.id, key: 'sys-solid', displayName: 'sys-solid' },
+      })
+      const now = new Date('2026-08-01T12:00:00Z')
+      // One observation per 30s slot, for all BEAT_COUNT slots -- offset half
+      // an interval into each slot so it lands unambiguously inside it.
+      for (let i = 0; i < BEAT_COUNT; i++) {
+        const msAgo = i * BEAT_INTERVAL_MS + BEAT_INTERVAL_MS / 2
+        await prisma.systemObservation.create({
+          data: { systemId: system.id, receivedAt: new Date(now.getTime() - msAgo), health: 'healthy', containersTotal: 1, containersRunning: 1 },
+        })
+      }
+
+      const rows = await latestPerSystem(now)
+
+      expect(rows).toHaveLength(1)
+      const beats = rows[0]!.beats
+      expect(beats).toHaveLength(BEAT_COUNT)
+      expect(beats.every((b) => b.state === 'good')).toBe(true)
+    })
+
+    it('shows alarm, not good, for a beat that reported a fault', async () => {
+      const host = await prisma.host.create({ data: { name: 'host-fault' } })
+      const system = await prisma.system.create({
+        data: { hostId: host.id, key: 'sys-fault', displayName: 'sys-fault' },
+      })
+      const now = new Date('2026-08-01T12:00:00Z')
+      await prisma.systemObservation.create({
+        data: { systemId: system.id, receivedAt: new Date(now.getTime() - 30_000), health: 'down', containersTotal: 1, containersRunning: 0 },
+      })
+
+      const rows = await latestPerSystem(now)
+
+      expect(rows[0]!.beats.filter((b) => b.state === 'alarm')).toHaveLength(1)
+      expect(rows[0]!.beats.filter((b) => b.state === 'good')).toHaveLength(0)
+    })
+
+    it('gives an enrolled-but-never-reported host row an empty beat list, not a fabricated full trace', async () => {
+      await prisma.host.create({ data: { name: 'host-notrace' } })
+
+      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.beats).toEqual([])
+    })
+
+    it('renders a full 40-slot hole for a system whose last observation fell outside the trace window', async () => {
+      // The window is BEAT_COUNT * BEAT_INTERVAL_MS = 20 minutes; this
+      // system last reported 30 minutes ago, well outside it, so the trace
+      // must show 40 absent slots -- not the last real observation dredged
+      // up from further back, and not a crash.
+      const host = await prisma.host.create({ data: { name: 'host-longsilent' } })
+      const system = await prisma.system.create({
+        data: { hostId: host.id, key: 'sys-longsilent', displayName: 'sys-longsilent' },
+      })
+      const now = new Date('2026-08-01T12:00:00Z')
+      await prisma.systemObservation.create({
+        data: { systemId: system.id, receivedAt: new Date(now.getTime() - 30 * 60_000), health: 'healthy', containersTotal: 1, containersRunning: 1 },
+      })
+
+      const rows = await latestPerSystem(now)
+
+      expect(rows).toHaveLength(1)
+      // The row's own STATE still comes from the single-latest-row query, so
+      // this must not accidentally read as healthy either.
+      expect(rows[0]!.state).toBe('stale')
+      const beats = rows[0]!.beats
+      expect(beats).toHaveLength(BEAT_COUNT)
+      expect(beats.every((b) => b.state === 'absent')).toBe(true)
+    })
+
+    it('does not fetch observations older than the beat window, even when far more history exists', async () => {
+      // The scale-safety test for the trace fetch, mirroring the one above
+      // for the per-system-latest fetch: bounded by TIME, so it must not
+      // grow with total history. 200 old rows exist per system, all older
+      // than the window, plus a handful of genuinely recent ones.
+      const host = await prisma.host.create({ data: { name: 'host-scale-beats' } })
+      const system = await prisma.system.create({
+        data: { hostId: host.id, key: 'sys-scale-beats', displayName: 'sys-scale-beats' },
+      })
+      const now = new Date('2026-08-01T12:00:00Z')
+      const oldRowCount = 200
+      for (let i = 0; i < oldRowCount; i++) {
+        await prisma.systemObservation.create({
+          data: {
+            systemId: system.id,
+            // Well outside the 20-minute window: hours to days back.
+            receivedAt: new Date(now.getTime() - (30 * 60_000 + i * 60_000)),
+            health: 'healthy',
+            containersTotal: 1,
+            containersRunning: 1,
+          },
+        })
+      }
+      const recentRowCount = 3
+      for (let i = 0; i < recentRowCount; i++) {
+        await prisma.systemObservation.create({
+          data: {
+            systemId: system.id,
+            receivedAt: new Date(now.getTime() - i * BEAT_INTERVAL_MS - 1_000),
+            health: 'healthy',
+            containersTotal: 1,
+            containersRunning: 1,
+          },
+        })
+      }
+
+      const logging = new PrismaClient({ log: [{ emit: 'event', level: 'query' }] })
+      const queries: Prisma.QueryEvent[] = []
+      logging.$on('query', (e) => queries.push(e))
+
+      try {
+        const totalStored = await prisma.systemObservation.count({ where: { systemId: system.id } })
+        expect(totalStored).toBe(oldRowCount + recentRowCount)
+
+        const rows = await latestPerSystem(now, logging)
+        expect(rows).toHaveLength(1)
+
+        // Directly measure the row volume the beat fetch pulls: a query
+        // bounded to the trace window returns only the recent rows, never
+        // the 200 old ones, regardless of how the SQL is phrased.
+        const beatWindowStart = new Date(now.getTime() - BEAT_COUNT * BEAT_INTERVAL_MS)
+        const directRows = await prisma.systemObservation.findMany({
+          where: { systemId: system.id, receivedAt: { gte: beatWindowStart } },
+        })
+        expect(directRows).toHaveLength(recentRowCount)
+        expect(directRows).not.toHaveLength(oldRowCount + recentRowCount)
+
+        // And the query this code path actually issued for the beat fetch
+        // must carry a lower bound on receivedAt -- confirming the fetch
+        // itself is time-bounded, not merely that a bounded row count could
+        // theoretically be derived some other way afterwards. `>=` is the
+        // discriminating marker: the pre-existing per-system-latest query
+        // above (DISTINCT ON ... ORDER BY receivedAt DESC) also mentions
+        // "SystemObservation" and "receivedAt" but carries no lower-bound
+        // comparison at all, so checking for those two alone would pass
+        // even with the beat fetch entirely unimplemented -- confirmed
+        // below by temporarily reverting the fetch and re-running.
+        const beatQuery = queries.find((q) => q.query.includes('SystemObservation') && q.query.includes('receivedAt') && q.query.includes('>='))
+        expect(beatQuery).toBeDefined()
+      } finally {
+        await logging.$disconnect()
+      }
     })
   })
 })

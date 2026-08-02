@@ -2,6 +2,10 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { FleetTable } from './FleetTable.js'
+import type { Beat } from '../lib/beats.js'
+
+/** A trace with every slot reporting a clean beat -- the "fully reporting" fixture. */
+const goodBeats = (n = 40): Beat[] => Array.from({ length: n }, () => ({ state: 'good' as const }))
 
 const row = (over = {}) => ({
   id: 'host-1:alpha', hostName: 'host-1',
@@ -10,7 +14,7 @@ const row = (over = {}) => ({
   deployedSha: 'abcdef1234567890abcdef1234567890abcdef12',
   deployedSubject: 'fix: the thing', deployedAt: new Date('2026-08-01T10:00:00Z'),
   driftCommits: 0, receivedAt: new Date('2026-08-01T12:00:00Z'),
-  lastSeenAt: new Date('2026-08-01T12:00:00Z'), ...over,
+  lastSeenAt: new Date('2026-08-01T12:00:00Z'), beats: goodBeats(), ...over,
 })
 
 describe('FleetTable', () => {
@@ -41,22 +45,67 @@ describe('FleetTable', () => {
     expect(screen.getByText(/no systems reported/i)).toBeTruthy()
   })
 
-  it('shows an em dash for container counts on a system that has never reported', () => {
-    render(<FleetTable rows={[row({ containersRunning: null, containersTotal: null })]} />)
-    // Singular getByText: every other field in this fixture is non-null, so
-    // this dash can only be coming from the Containers column — if the
-    // fabricated-`0/0` bug were present, this dash would not exist at all.
-    expect(screen.getByText('—')).toBeTruthy()
-    expect(screen.queryByText('0/0')).toBeNull()
-  })
+  // The redesign ("Heartbeat") drops the Containers column from the visual
+  // layout entirely -- the spec's column list is System, State, Last 40
+  // beats, Version, Deployed, Latest change, Drift, with no Containers among
+  // them. The never-vs-zero-containers distinction this used to guard is
+  // still enforced, just one layer down: fleet-query.test.ts asserts
+  // `row.containersRunning`/`containersTotal` stay null vs. real 0 at the
+  // data layer, which is the only layer that still surfaces them.
 
-  it('renders 0/0 for a system that genuinely reports zero containers, distinct from never having reported', () => {
-    render(<FleetTable rows={[row({ containersRunning: 0, containersTotal: 0 })]} />)
-    expect(screen.getByText('0/0')).toBeTruthy()
-    // Every other field in this fixture is non-null, so a dash appearing
-    // here would mean the zero-container case is being confused with the
-    // never-reported case rather than kept distinct from it.
-    expect(screen.queryByText('—')).toBeNull()
+  describe('the trace strip (Last 40 beats)', () => {
+    // Scoped to `.beat-trace` (the strip itself), NOT the whole rendered
+    // container: `BeatLegend` below the table reuses the same `data-beat`
+    // attribute on its swatches, so an unscoped query over-counts by
+    // whatever the legend happens to render -- confirmed by first writing
+    // these unscoped and watching them fail with counts off by exactly the
+    // legend's one swatch per state.
+    it('renders a visible gap for a silent slot, not just a colour', () => {
+      const beats: Beat[] = [...goodBeats(39), { state: 'absent' }]
+      const { container } = render(<FleetTable rows={[row({ beats })]} />)
+      expect(container.querySelectorAll('.beat-trace [data-beat="absent"]')).toHaveLength(1)
+    })
+
+    it('renders no gaps at all for a fully-reporting system', () => {
+      const { container } = render(<FleetTable rows={[row({ beats: goodBeats() })]} />)
+      expect(container.querySelectorAll('.beat-trace [data-beat="absent"]')).toHaveLength(0)
+      expect(container.querySelectorAll('.beat-trace [data-beat="good"]')).toHaveLength(40)
+    })
+
+    it('colours a beat that reported a fault distinctly from a merely missed one', () => {
+      const beats: Beat[] = [...goodBeats(38), { state: 'absent' }, { state: 'alarm' }]
+      const { container } = render(<FleetTable rows={[row({ beats })]} />)
+      expect(container.querySelectorAll('.beat-trace [data-beat="alarm"]')).toHaveLength(1)
+      expect(container.querySelectorAll('.beat-trace [data-beat="absent"]')).toHaveLength(1)
+    })
+
+    it('gives the trace a text alternative naming how many beats were missed -- not colour-only', () => {
+      const beats: Beat[] = [...goodBeats(38), { state: 'absent' }, { state: 'absent' }]
+      render(<FleetTable rows={[row({ beats })]} />)
+      // A screen-reader user gets the same fact ("2 missed") a sighted user
+      // reads off the grey gaps in the strip -- this must be real text, not
+      // conveyed by colour/CSS alone.
+      expect(screen.getByRole('img', { name: /2 missed/i })).toBeTruthy()
+    })
+
+    it('renders an em dash rather than a fabricated full trace when there is no beat data at all', () => {
+      render(<FleetTable rows={[row({ beats: [] })]} />)
+      // Every other field on this fixture is non-empty, so this dash can
+      // only be coming from the trace column.
+      expect(screen.getAllByText('—').length).toBeGreaterThan(0)
+      // No trace widget at all -- rendering 40 absent slots here would be
+      // inventing a "totally silent for 20 minutes" claim this row never
+      // made (it simply carries no beat data, e.g. the "no systems enrolled
+      // on this host" placeholder row).
+      expect(screen.queryByRole('img')).toBeNull()
+    })
+
+    it('is keyboard-focusable, so the trace can carry a visible focus state', () => {
+      const { container } = render(<FleetTable rows={[row()]} />)
+      const trace = container.querySelector('.beat-trace')
+      expect(trace).not.toBeNull()
+      expect(trace?.getAttribute('tabindex')).toBe('0')
+    })
   })
 
   describe('host scoping', () => {
@@ -98,16 +147,16 @@ describe('FleetTable', () => {
         const { container } = render(
           <FleetTable
             rows={[
-              row({ id: 'host-1:web', hostName: 'host-1', key: 'web', containersRunning: 1, containersTotal: 1 }),
-              row({ id: 'host-2:web', hostName: 'host-2', key: 'web', containersRunning: 2, containersTotal: 2 }),
+              row({ id: 'host-1:web', hostName: 'host-1', key: 'web', deployedSubject: 'change on host-1' }),
+              row({ id: 'host-2:web', hostName: 'host-2', key: 'web', deployedSubject: 'change on host-2' }),
             ]}
           />,
         )
         const complaints = spy.mock.calls.map((c) => c.map(String).join(' ')).join('\n')
         expect(complaints).not.toMatch(/same key/i)
         expect(container.querySelectorAll('tbody tr')).toHaveLength(2)
-        expect(screen.getByText('1/1')).toBeTruthy()
-        expect(screen.getByText('2/2')).toBeTruthy()
+        expect(screen.getByText('change on host-1')).toBeTruthy()
+        expect(screen.getByText('change on host-2')).toBeTruthy()
       } finally {
         spy.mockRestore()
       }

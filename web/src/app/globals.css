@@ -1,0 +1,294 @@
+/*
+ * "Heartbeat" -- the fleet board's instrument-panel redesign.
+ *
+ * Tokens are defined ONCE here as custom properties and never hardcoded
+ * inside a component or a media query -- every rule below reads `var(--x)`,
+ * so light/dark is entirely a matter of which block of tokens is active.
+ *
+ * The dark palette is a deliberate re-derivation, not an inversion of the
+ * light one: plain 1:1 inverted hues (e.g. simply lightening #1C7C6B) read
+ * muddy or washed out against a near-black field, so `--good`, `--warn` and
+ * `--alarm` are independently brightened/saturated for the dark ground,
+ * and `--absent` is pulled to a mid slate that still sits clearly between
+ * the dark surface and dark text -- neither vanishing into the background
+ * nor reading as "good".
+ */
+
+:root {
+  --ink: #0f1519;
+  --ink-muted: #5b6770;
+  --paper: #ffffff;
+  --field: #f4f6f7;
+  --rule: #dde3e6;
+  --good: #1c7c6b;
+  --absent: #b9c3c9;
+  --warn: #b8863a;
+  --alarm: #b5432c;
+  --focus-ring: var(--ink);
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e6ecef;
+    --ink-muted: #93a0a6;
+    --paper: #0b1012;
+    --field: #12181b;
+    --rule: #232b2f;
+    --good: #35b39b;
+    --absent: #5b6770;
+    --warn: #d9a54e;
+    --alarm: #e2604a;
+    --focus-ring: var(--good);
+
+    color-scheme: dark;
+  }
+}
+
+/* Explicit theme override, independent of the OS preference above -- for a
+   future manual theme switch. Whichever of these two blocks applies (an
+   explicit `data-theme` always wins over the media query, since it is more
+   specific), the token NAMES are identical, so every component rule below
+   never needs to know which mode is active. */
+:root[data-theme='dark'] {
+  --ink: #e6ecef;
+  --ink-muted: #93a0a6;
+  --paper: #0b1012;
+  --field: #12181b;
+  --rule: #232b2f;
+  --good: #35b39b;
+  --absent: #5b6770;
+  --warn: #d9a54e;
+  --alarm: #e2604a;
+  --focus-ring: var(--good);
+
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  --ink: #0f1519;
+  --ink-muted: #5b6770;
+  --paper: #ffffff;
+  --field: #f4f6f7;
+  --rule: #dde3e6;
+  --good: #1c7c6b;
+  --absent: #b9c3c9;
+  --warn: #b8863a;
+  --alarm: #b5432c;
+  --focus-ring: var(--ink);
+
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.mono {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+main {
+  padding: 20px 24px;
+}
+
+h1 {
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  margin: 0 0 12px;
+}
+
+.fleet-board {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Dense -- all 20 systems fit without scrolling: small type, tight vertical
+   padding, no decorative whitespace. */
+.fleet-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+
+.fleet-table thead th {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--field);
+  color: var(--ink-muted);
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+}
+
+.fleet-table tbody td {
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: middle;
+}
+
+.fleet-table tbody tr:nth-child(even) {
+  background: var(--field);
+}
+
+.col-system {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.host-name {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 0.6875rem;
+  color: var(--ink-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.sys-name {
+  font-weight: 600;
+}
+
+/* State is a label AND a number-adjacent fact (it's read alongside the last
+   beat's timestamp), so it gets mono + tabular-nums like every other number,
+   sha and timestamp on the board. */
+.col-state {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.75rem;
+}
+
+.col-state[data-state='healthy'] {
+  color: var(--good);
+}
+
+.col-state[data-state='degraded'] {
+  color: var(--warn);
+}
+
+.col-state[data-state='down'] {
+  color: var(--alarm);
+}
+
+.col-state[data-state='stale'],
+.col-state[data-state='unknown'] {
+  color: var(--ink-muted);
+}
+
+.col-version,
+.col-deployed,
+.col-drift {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.75rem;
+  color: var(--ink);
+}
+
+.col-change {
+  color: var(--ink-muted);
+}
+
+/* --- The trace strip: the signature element --- */
+
+.beat-trace {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 3px;
+  border-radius: 3px;
+}
+
+.beat-trace--empty {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  color: var(--ink-muted);
+}
+
+/* Visible focus state: the trace is a `tabIndex={0}` widget precisely so a
+   keyboard user can land on it and get its `aria-label` read out. */
+.beat-trace:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.beat {
+  display: inline-block;
+  width: 4px;
+  height: 14px;
+  border-radius: 1px;
+  /* `--absent` by default: a beat with no data behind it is a silent gap
+     unless a state overrides it below. Grey, deliberately -- see the module
+     doc in FleetTable.tsx for why silence must never default to red. */
+  background: var(--absent);
+}
+
+.beat[data-beat='good'] {
+  background: var(--good);
+}
+
+.beat[data-beat='alarm'] {
+  background: var(--alarm);
+}
+
+/* A subtle "it's alive" pulse on the most recent beat, ONLY when it's a
+   clean one and ONLY when the viewer hasn't asked for reduced motion. No
+   animation is defined at all outside this media query, so the default,
+   motion-safe state of the page is completely static. */
+@media (prefers-reduced-motion: no-preference) {
+  .beat-trace .beat:last-child[data-beat='good'] {
+    animation: heartbeat-pulse 2.4s ease-in-out infinite;
+  }
+}
+
+@keyframes heartbeat-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.beat-legend {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin: 0;
+  padding: 8px 10px;
+  font-size: 0.75rem;
+  color: var(--ink-muted);
+}
+
+.beat-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.beat-legend .beat {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
