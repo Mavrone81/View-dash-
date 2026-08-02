@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { Prisma } from '@prisma/client'
 import { prisma } from '../db.js'
 import { seal, open } from '../crypto/envelope.js'
 import { currentVaultKey } from './session.js'
@@ -83,21 +84,32 @@ export async function addCredential(input: {
   // creation nothing witnessed. Rolling back makes the failure the operator
   // is shown TRUE, which is what stops the retry from silently storing a
   // second copy of the same production password.
-  await prisma.$transaction(async (tx) => {
-    await tx.credential.create({
-      data: {
-        id,
-        label: input.label,
-        username: input.username,
-        secretSealed: sealed,
-        notes: input.notes ?? null,
-        hostId: input.hostId ?? null,
-        systemKey: input.systemKey ?? null,
-      },
-      select: { id: true },
-    })
-    await tx.credentialAccess.create({ data: { credentialId: id, action: 'create' } })
-  })
+  //
+  // SERIALIZABLE, and not merely for the two writes below. `recreateVault`
+  // destroys the vault key after taking a count of THIS table, and Postgres
+  // only applies its serializable checks between transactions that are both
+  // serializable — so a plain READ COMMITTED insert here would be invisible
+  // to that count and could commit under it, leaving a credential sealed
+  // with a key that no longer exists. Both sides opt in, or neither is
+  // protected.
+  await prisma.$transaction(
+    async (tx) => {
+      await tx.credential.create({
+        data: {
+          id,
+          label: input.label,
+          username: input.username,
+          secretSealed: sealed,
+          notes: input.notes ?? null,
+          hostId: input.hostId ?? null,
+          systemKey: input.systemKey ?? null,
+        },
+        select: { id: true },
+      })
+      await tx.credentialAccess.create({ data: { credentialId: id, action: 'create' } })
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+  )
   return id
 }
 

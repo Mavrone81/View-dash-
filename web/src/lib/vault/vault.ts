@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client'
 import { prisma } from '../db.js'
 import { newKdfParams, deriveWrappingKey, makeVerifier, checkVerifier, type KdfParams } from './kdf.js'
 import { newVaultKey, newRecoveryKey, wrapVaultKey, unwrapVaultKey, recoveryKeyFromDisplay } from './keyring.js'
@@ -18,11 +19,68 @@ const SINGLETON = 'singleton'
 // tell it apart from a genuine unknown failure.
 export class VaultAlreadyExistsError extends Error {}
 
+/**
+ * Refuses to recreate a vault that still holds credentials. Named for the
+ * same reason as `VaultAlreadyExistsError`: recreation destroys the wrapped
+ * vault key, and with it every sealed secret in the table, so the caller
+ * must be able to tell this refusal apart from an unrelated failure by
+ * `instanceof` and never by message text.
+ */
+export class VaultNotEmptyError extends Error {}
+
 async function config() {
   return prisma.vaultConfig.findUnique({ where: { id: SINGLETON } })
 }
 
 export async function isInitialised(): Promise<boolean> {
+  return (await config()) !== null
+}
+
+export type VaultStatus = {
+  initialised: boolean
+  /**
+   * Whether the operator ever confirmed storing the recovery key. `false`
+   * for a vault that has none of its own row (there is nothing to
+   * acknowledge) AND for one whose `recoveryKeyAcknowledgedAt` is NULL --
+   * the two are distinguished by `initialised`, and the caller needs both
+   * facts from one read.
+   */
+  recoveryKeyAcknowledged: boolean
+}
+
+/**
+ * One read of the singleton row answering both questions the vault page asks
+ * of it. Deliberately not two calls: `isInitialised()` followed by a separate
+ * acknowledgement read could observe the row in two different states on one
+ * page render, and "initialised but we somehow could not read its
+ * acknowledgement" is not a state this page should be able to render.
+ */
+export async function readVaultStatus(): Promise<VaultStatus> {
+  const c = await config()
+  return {
+    initialised: c !== null,
+    recoveryKeyAcknowledged: c !== null && c.recoveryKeyAcknowledgedAt !== null,
+  }
+}
+
+/**
+ * Records that the operator confirmed storing the recovery key. Returns
+ * `false` when there is no vault to record it against, so the caller reports
+ * that rather than a silent success.
+ *
+ * Idempotent by choice: acknowledging twice keeps the FIRST timestamp. The
+ * value answers "when was this confirmed", and a second click (or a retry
+ * after a failed write) must not move it forward and quietly rewrite that
+ * history.
+ */
+export async function acknowledgeRecoveryKey(now: Date = new Date()): Promise<boolean> {
+  const updated = await prisma.vaultConfig.updateMany({
+    where: { id: SINGLETON, recoveryKeyAcknowledgedAt: null },
+    data: { recoveryKeyAcknowledgedAt: now },
+  })
+  if (updated.count > 0) return true
+  // Nothing was updated: either there is no vault, or it was already
+  // acknowledged. Only the first is a failure.
   return (await config()) !== null
 }
 
@@ -47,6 +105,62 @@ export async function createVault(passphrase: string): Promise<{ recoveryKey: st
   unlockSession(vaultKey)
   // Returned once. Nothing stores the printable form; only the wrapping it
   // produced is persisted, and that cannot be reversed without the key.
+  return { recoveryKey: recovery.display }
+}
+
+/**
+ * Throws away the existing vault configuration and builds a new one, with a
+ * new vault key and a new recovery key. This is the ONLY route back for a
+ * vault whose one-time recovery key was displayed and never stored.
+ *
+ * It is destructive by construction: the old vault key is unrecoverable
+ * afterwards, so every sealed secret in `Credential` would become permanently
+ * unreadable. That is why it refuses unless the vault holds ZERO credentials
+ * — and why the count is taken INSIDE the transaction that does the
+ * replacing, not before it. A check-then-act would leave a window in which a
+ * credential is stored between the two, and the destructive half would then
+ * proceed against a vault that is no longer empty; this file has already been
+ * bitten by that shape twice around `createVault`'s own existence check.
+ *
+ * The transaction runs at SERIALIZABLE, which is what makes the count
+ * meaningful rather than decorative: a plain `count()` under READ COMMITTED
+ * does not lock the rows it did not find, so a concurrent INSERT could still
+ * commit underneath it. `addCredential` runs at the same level for the same
+ * reason — Postgres's serializable checks only apply between transactions
+ * that are BOTH serializable, so one of the pair opting out would silently
+ * remove the guarantee from both.
+ */
+export async function recreateVault(passphrase: string): Promise<{ recoveryKey: string }> {
+  const params = newKdfParams()
+  const wrappingKey = deriveWrappingKey(passphrase, params)
+  const vaultKey = newVaultKey()
+  const recovery = newRecoveryKey()
+
+  await prisma.$transaction(
+    async (tx) => {
+      const held = await tx.credential.count()
+      if (held > 0) throw new VaultNotEmptyError('vault holds credentials')
+      // deleteMany, not delete: a row with an unexpected id cannot be left
+      // behind to collide with the create below. The CHECK constraint makes
+      // 'singleton' the only possible id, so this removes exactly the one row.
+      await tx.vaultConfig.deleteMany({})
+      await tx.vaultConfig.create({
+        data: {
+          id: SINGLETON,
+          kdfParams: JSON.stringify(params),
+          verifier: makeVerifier(wrappingKey),
+          wrappedByPassphrase: wrapVaultKey(vaultKey, wrappingKey, 'passphrase'),
+          wrappedByRecovery: wrapVaultKey(vaultKey, recovery.key, 'recovery'),
+          // Explicitly unacknowledged: this key has been shown and not yet
+          // stored, which is the whole state this function exists to escape.
+          recoveryKeyAcknowledgedAt: null,
+        },
+      })
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+  )
+
+  unlockSession(vaultKey)
   return { recoveryKey: recovery.display }
 }
 

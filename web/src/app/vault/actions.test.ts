@@ -837,6 +837,7 @@ describe('vault actions', () => {
       verifier: 'v',
       wrappedByPassphrase: 'a',
       wrappedByRecovery: 'b',
+      recoveryKeyAcknowledgedAt: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     }
