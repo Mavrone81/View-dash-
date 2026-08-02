@@ -73,6 +73,23 @@ export type FleetRow = {
 const DASH = '—'
 
 /**
+ * `/vault?host=<hostId>&system=<systemKey>` for this row, so the board is a
+ * way IN to the credential vault for a specific system, not just a status
+ * display. Links even when the system carries no credentials yet -- the
+ * vault page itself is responsible for offering to add one rather than
+ * showing a dead end, per task-8-brief.md Resolution 3.
+ *
+ * `r.id` is `${hostId}:${key}` (see `FleetRow.id`'s doc comment) and is
+ * parsed by trimming the known `:${r.key}` suffix rather than splitting on
+ * the first colon, so a system key that happened to contain one would not
+ * corrupt the extracted host id.
+ */
+function vaultHref(r: Pick<FleetRow, 'id' | 'key'>): string {
+  const hostId = r.id.slice(0, r.id.length - r.key.length - 1)
+  return `/vault?host=${encodeURIComponent(hostId)}&system=${encodeURIComponent(r.key)}`
+}
+
+/**
  * `HH:MM` in UTC, explicitly labelled.
  *
  * UTC rather than the viewer's locale on purpose: this string is read off a
@@ -200,7 +217,9 @@ export function FleetTable({ rows }: { rows: FleetRow[] }) {
             <tr key={r.id} data-state={r.state} data-host={r.hostName}>
               <td className="col-system">
                 <span className="host-name">{r.hostName}</span>
-                <span className="sys-name">{r.displayName}</span>
+                <a className="sys-name" href={vaultHref(r)}>
+                  {r.displayName}
+                </a>
               </td>
               <td className="col-state" data-state={r.state}>
                 {stateLabel(r)}
