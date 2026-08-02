@@ -55,7 +55,11 @@ Each credential's secret is sealed with the existing envelope primitive (`web/sr
 
 - The vault is **locked at process start**. A restart always locks.
 - Unlock is required before any reveal.
-- **Automatic re-lock after 15 minutes of inactivity.** A dashboard left open on an unlocked laptop stops being a credential dispenser.
+- **Automatic re-lock 15 minutes after unlocking**, measured from the unlock itself and never extended by use. A dashboard left open on an unlocked laptop stops being a credential dispenser.
+
+  This corrects the original wording, "after 15 minutes of inactivity", which described a sliding idle window. That would have been the weaker control: revealing a credential every fourteen minutes would keep the vault unlocked indefinitely, so the session most actively dispensing secrets would be the one that never re-locked. An absolute deadline costs an occasional re-entry mid-task and buys a guarantee — no unlock outlives its 15 minutes, whatever the operator does. The implementation was already absolute; the wording was wrong, not the behaviour.
+
+  A revealed secret is cleared from the screen at that same deadline, not merely refused at the next reveal. Blocking new reveals while leaving an already-rendered secret on display would miss the unattended-laptop case this rule exists for.
 - The unwrapped vault key exists only in process memory, never in the database, a file, an environment variable, or a log line.
 
 ## 7 · Data model
