@@ -177,6 +177,15 @@ export async function revealCredential(id: string): Promise<string> {
 }
 
 export async function removeCredential(id: string): Promise<void> {
+  // Requires the vault to be unlocked, even though deleting a row needs no
+  // key. Until task 10 this function was reachable from no UI at all; wiring
+  // a Remove control to it makes it a destructive, irreversible operation
+  // exposed on an unauthenticated server action, where the vault's own lock
+  // is the only control standing in front of it (see actions.ts's note).
+  // Refusing while locked costs the operator one unlock and removes the case
+  // where a caller who cannot read a single credential can still destroy
+  // every one of them.
+  requireKey()
   // NOTE: CredentialAccess.credentialId cascades on Credential delete, so
   // this cannot also write a 'delete' audit row — it would be removed by the
   // same statement it belongs to. See task-6-report.md for the discussion;

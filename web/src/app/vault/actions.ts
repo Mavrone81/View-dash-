@@ -5,6 +5,7 @@ import {
   createVault,
   unlockWithPassphrase,
   unlockWithRecoveryKey,
+  changePassphrase,
   isInitialised,
   VaultAlreadyExistsError,
 } from '../../lib/vault/vault.js'
@@ -277,6 +278,69 @@ export async function unlockWithRecoveryAction(
   return { ok: true, sessionRemainingMs: sessionDurationForClient() }
 }
 
+// The change-passphrase path reads the SAME VaultConfig row the two unlock
+// paths do, so it can fail the same three ways and gets the same treatment —
+// but with its own wording, because the advice differs. "Try the recovery
+// key" here has to also say what did NOT happen: the passphrase is
+// unchanged, and an operator who believes it changed would lock themselves
+// out by using the new one.
+const CONFIG_UNREADABLE_CHANGE_MESSAGE = 'The stored vault configuration could not be read and may be corrupt. The passphrase was NOT changed; unlock with the recovery key.'
+const PASSPHRASE_CHANGE_FAILED_MESSAGE = 'The passphrase could not be changed right now. It is unchanged — try again in a moment.'
+// changePassphrase() returns false for exactly one reason it can positively
+// identify: the current passphrase failed the verifier (or the wrapped copy
+// it guards would not unwrap). Worded so it cannot be mistaken for "the new
+// passphrase was rejected".
+const PASSPHRASE_CHANGE_REJECTED_MESSAGE = 'That current passphrase is not the one this vault was locked with. The passphrase is unchanged.'
+
+/**
+ * Changing the passphrase deliberately does NOT require the vault to be
+ * unlocked. It authenticates itself: `changePassphrase` verifies the current
+ * passphrase against the stored verifier before touching anything, which is
+ * the same proof `unlockAction` demands, so requiring a live session on top
+ * would add no control — it would only strand an operator whose 15-minute
+ * deadline expired while they were typing.
+ *
+ * It re-wraps ONLY the passphrase copy of the vault key. Every sealed secret
+ * is untouched (so this costs the same for one credential or ten thousand),
+ * and so is `wrappedByRecovery` — the printed recovery key keeps working.
+ * That last point is not a footnote: an operator who believes a passphrase
+ * change invalidated their recovery key may destroy it, and it is the only
+ * way back into this vault if the new passphrase is forgotten. The UI says
+ * so on success.
+ */
+export async function changePassphraseAction(
+  current: string,
+  next: string,
+): Promise<{ ok: true } | Err> {
+  if (next.length < MIN_PASSPHRASE_LENGTH) {
+    return failed(`Passphrase must be at least ${MIN_PASSPHRASE_LENGTH} characters.`)
+  }
+  let initialised: boolean
+  try {
+    initialised = await isInitialised()
+  } catch {
+    return failed(DATABASE_UNAVAILABLE_MESSAGE)
+  }
+  if (!initialised) return failed(NOT_INITIALISED_MESSAGE)
+  let ok: boolean
+  try {
+    ok = await changePassphrase(current, next)
+  } catch (err) {
+    // Same discipline as the unlock paths: positively identify the cause or
+    // name none, and never surface the caught error's own text — a rejected
+    // update can echo back a fragment of the row it tried to write, and the
+    // corrupt-config errors carry the rejected parameters.
+    return classifyVaultConfigFailure(
+      err,
+      CONFIG_UNREADABLE_CHANGE_MESSAGE,
+      PASSPHRASE_CHANGE_FAILED_MESSAGE,
+    )
+  }
+  if (!ok) return failed(PASSPHRASE_CHANGE_REJECTED_MESSAGE)
+  revalidatePath('/vault')
+  return { ok: true }
+}
+
 export async function lockAction(): Promise<{ ok: true }> {
   lockSession()
   revalidatePath('/vault')
@@ -350,6 +414,12 @@ export async function removeCredentialAction(id: string): Promise<{ ok: true } |
     revalidatePath('/vault')
     return { ok: true }
   } catch (err) {
+    // A locked vault is its own fact, and the one with a useful next step:
+    // unlock and try again. Folding it into "could not delete" would send the
+    // operator looking for a database problem that isn't there.
+    if (err instanceof VaultLockedError) {
+      return failed('The vault is locked. Unlock it and try again.')
+    }
     // Prisma's delete throws P2025 ("Record to delete does not exist") when
     // the id is already gone — a distinguishable, non-alarming fact (the
     // caller's goal, "this credential should not exist", is already true)

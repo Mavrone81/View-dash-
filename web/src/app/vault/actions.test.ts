@@ -19,6 +19,7 @@ import {
   addCredentialAction,
   revealAction,
   removeCredentialAction,
+  changePassphraseAction,
 } from './actions.js'
 
 beforeEach(async () => {
@@ -151,6 +152,164 @@ describe('vault actions', () => {
     const removed = await removeCredentialAction(add.id)
     expect(removed.ok).toBe(true)
     expect(await prisma.credential.count()).toBe(0)
+  })
+
+  // --- Task 10 / finding C1: removeCredentialAction is now reachable from
+  // the UI, which makes it a destructive, irreversible operation on an
+  // unauthenticated server action. It refuses while locked. ---
+
+  it('removeCredentialAction REFUSES to delete while the vault is locked, and the credential survives', async () => {
+    await createVaultAction('right passphrase')
+    const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+    expect(add.ok).toBe(true)
+    if (!add.ok) return
+    lockSession()
+    const r = await removeCredentialAction(add.id)
+    expect(r.ok).toBe(false)
+    // Distinct from "no longer exists": it very much does still exist, and
+    // saying otherwise would be a lie the operator could act on.
+    if (!r.ok) {
+      expect(r.message.toLowerCase()).toContain('locked')
+      expect(r.message.toLowerCase()).not.toMatch(/no longer exists/)
+    }
+    expect(await prisma.credential.count()).toBe(1)
+  })
+
+  // --- Task 10 / finding C1: changePassphrase() has existed in vault.ts,
+  // tested, since the feature was built, with no action and no UI in front of
+  // it -- so the passphrase could never be changed at all. ---
+
+  describe('changePassphraseAction (C1)', () => {
+    it('changes the passphrase: the old one stops working and the new one starts', async () => {
+      await createVaultAction('right passphrase')
+      const r = await changePassphraseAction('right passphrase', 'a different passphrase')
+      expect(r.ok).toBe(true)
+
+      lockSession()
+      expect((await unlockAction('right passphrase')).ok).toBe(false)
+      lockSession()
+      expect((await unlockAction('a different passphrase')).ok).toBe(true)
+    })
+
+    it('leaves every stored credential readable under the new passphrase', async () => {
+      await createVaultAction('right passphrase')
+      const add = await addCredentialAction({ label: 'a', username: 'u', secret: 'hunter2' })
+      expect(add.ok).toBe(true)
+      if (!add.ok) return
+      expect((await changePassphraseAction('right passphrase', 'a different passphrase')).ok).toBe(true)
+      lockSession()
+      await unlockAction('a different passphrase')
+      const revealed = await revealAction(add.id)
+      expect(revealed.ok).toBe(true)
+      if (revealed.ok) expect(revealed.secret).toBe('hunter2')
+    })
+
+    it('leaves the RECOVERY key working, which is what the UI promises the operator', async () => {
+      const created = await createVaultAction('right passphrase')
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      expect((await changePassphraseAction('right passphrase', 'a different passphrase')).ok).toBe(true)
+      lockSession()
+      expect((await unlockWithRecoveryAction(created.recoveryKey)).ok).toBe(true)
+    })
+
+    it('REFUSES a wrong current passphrase and leaves the old one working', async () => {
+      await createVaultAction('right passphrase')
+      const r = await changePassphraseAction('not the passphrase', 'a different passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toContain('unchanged')
+        expect(r.message).not.toContain('not the passphrase')
+        expect(r.message).not.toContain('a different passphrase')
+      }
+      lockSession()
+      expect((await unlockAction('right passphrase')).ok).toBe(true)
+    })
+
+    it('REFUSES a new passphrase shorter than 12 characters, matching vault creation', async () => {
+      await createVaultAction('right passphrase')
+      const r = await changePassphraseAction('right passphrase', 'eleven-char')
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.message.toLowerCase()).toContain('12')
+      lockSession()
+      expect((await unlockAction('right passphrase')).ok).toBe(true)
+    })
+
+    it('reports no vault distinctly, rather than as a wrong passphrase', async () => {
+      const r = await changePassphraseAction('right passphrase', 'a different passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.message.toLowerCase()).not.toContain('unchanged')
+    })
+
+    it('reports a database problem, not a thrown rejection, when isInitialised() itself rejects', async () => {
+      const spy = vi.spyOn(prisma.vaultConfig, 'findUnique').mockRejectedValueOnce(new Error('connection refused'))
+      try {
+        const r = await changePassphraseAction('right passphrase', 'a different passphrase')
+        expect(r.ok).toBe(false)
+        if (!r.ok) {
+          expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+          expect(r.message).not.toContain('connection refused')
+        }
+      } finally {
+        spy.mockRestore()
+      }
+    })
+
+    it('reports a database problem, not "corrupt configuration", when the change itself hits a real Prisma connectivity error', async () => {
+      await createVaultAction('right passphrase')
+      const spy = vi.spyOn(prisma.vaultConfig, 'update').mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError("Can't reach database server", { code: 'P1001', clientVersion: 'test' }),
+      )
+      try {
+        const r = await changePassphraseAction('right passphrase', 'a different passphrase')
+        expect(r.ok).toBe(false)
+        if (!r.ok) {
+          expect(r.message.toLowerCase()).toMatch(/database|reach|connect/)
+          expect(r.message.toLowerCase()).not.toContain('corrupt')
+        }
+      } finally {
+        spy.mockRestore()
+      }
+    })
+
+    it('reports a neutral failure, naming no cause, for an error it cannot positively identify', async () => {
+      await createVaultAction('right passphrase')
+      const spy = vi.spyOn(prisma.vaultConfig, 'update').mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError('unrelated failure', { code: 'P2025', clientVersion: 'test' }),
+      )
+      try {
+        const r = await changePassphraseAction('right passphrase', 'a different passphrase')
+        expect(r.ok).toBe(false)
+        if (!r.ok) {
+          expect(r.message.toLowerCase()).not.toContain('corrupt')
+          expect(r.message.toLowerCase()).not.toMatch(/database|reach|connect/)
+          expect(r.message).not.toContain('unrelated failure')
+        }
+      } finally {
+        spy.mockRestore()
+      }
+    })
+
+    it('reports a corrupt configuration, not something to retry, when the stored KDF params are unusable', async () => {
+      await createVaultAction('right passphrase')
+      await prisma.vaultConfig.updateMany({ data: { kdfParams: '{}' } })
+      const r = await changePassphraseAction('right passphrase', 'a different passphrase')
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.message.toLowerCase()).toMatch(/corrupt|unreadable/)
+        expect(r.message.toLowerCase()).toContain('recovery key')
+      }
+    })
+
+    it('never throws to the client, whatever the failure', async () => {
+      // Every failing shape above returns a plain object; this asserts the
+      // property directly on the one that reaches deepest into vault.ts.
+      await createVaultAction('right passphrase')
+      await prisma.vaultConfig.updateMany({ data: { kdfParams: 'not-json-at-all' } })
+      await expect(changePassphraseAction('right passphrase', 'a different passphrase')).resolves.toMatchObject({
+        ok: false,
+      })
+    })
   })
 
   // --- Fix round 1: unlockAction / unlockWithRecoveryAction / createVaultAction
