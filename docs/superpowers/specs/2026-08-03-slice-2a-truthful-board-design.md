@@ -49,6 +49,19 @@ Addressing the container port directly also removes a second fault: the scheme n
 
 The `Host` header is required, not cosmetic: an application behind a name-based vhost may redirect or refuse a request that arrives without the name it expects.
 
+**And it cannot be sent with `fetch`.** `Host` is a forbidden header name in the WHATWG fetch specification, and Node's global `fetch` (undici) silently discards it — no error, no warning. Measured on Node 22:
+
+```
+global fetch      -> server saw  host: 127.0.0.1:<port>      (a non-forbidden header passed fine)
+node:http.request -> server saw  host: alpha.example.invalid
+```
+
+So the on-box probe uses `node:http.request`. This is recorded in the spec rather than left as a code comment because the failure is invisible from the calling side: the request succeeds, the header is simply not there, and an application doing host-based routing answers as its default tenant. A green row would then say nothing about the hostname it claims to describe.
+
+The first implementation shipped tests that injected a fake `fetch` and asserted on the headers *argument*. They passed. They pinned what was handed to the transport, never what reached the wire — so **any test for this property must exercise the real transport against a real listener** and assert on the received request. That requirement is part of the design, not an implementation detail.
+
+**Only probe a port that something vouches for.** A hostname-mapped port is safe by construction: it appears in the map only because a vhost proxies to it, so the reverse proxy is itself the evidence that the port is loopback-bound and speaks HTTP. A published port with no vhost carries no such evidence — it may be a database, a cache, a mail relay, a UDP service, or bound to a non-loopback address. Probing one is still worthwhile, because it catches a stack deployed before its vhost exists, but it is **evidence that can only be positive**: an answer counts, and a failure is `not-probed`, never `not-answering`. We never had grounds to expect an HTTP answer from it, so its silence proves nothing and must not redden a healthy row.
+
 One consequence worth stating plainly, because it changes what the second row of the table means: the on-box axis no longer exercises the reverse proxy at all. That makes the diagnosis **sharper**, not weaker. "App port answers, external fails" now isolates the fault to everything between the application and the visitor — the proxy, its configuration, TLS, DNS, the firewall — which is what that row was always trying to say.
 
 ## 4 · Discovery, not a maintained list
