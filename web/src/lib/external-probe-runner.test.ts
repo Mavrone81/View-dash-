@@ -273,10 +273,59 @@ describe('runExternalProbes', () => {
       expect(runs[0]?.reachedAnything).toBe(true)
     })
 
-    it('records nothing for an empty target list -- "nothing to attempt" is not the same fact as "attempted and failed"', async () => {
+    // Fix round 1 (Task 9 review), M4: this used to assert the OPPOSITE --
+    // that an empty target list recorded NOTHING. That was the defect: a
+    // fleet with zero currently-configured hostnames (no system has an HTTP
+    // surface yet -- legitimate and common, not a failing scheduler) then
+    // never got a single row, so `shouldRunExternalProbe` stayed permanently
+    // "nothing has ever run" and `deploy/verify-board.sh`'s "the scheduler
+    // has run at least once" check would fail FOREVER against a healthy
+    // scheduler. `targetCount: 0` is what lets this row be written safely --
+    // it is the field, not the row's mere existence, that says "swept
+    // nothing because there was nothing to sweep."
+    it('records a run even for an empty target list, with targetCount: 0 and reachedAnything: true -- "nothing to attempt" is not "attempted and failed"', async () => {
       await runExternalProbes([], depsFor({}))
 
-      expect(await prisma.externalProbeRun.count()).toBe(0)
+      const runs = await prisma.externalProbeRun.findMany()
+      expect(runs).toHaveLength(1)
+      expect(runs[0]?.targetCount).toBe(0)
+      expect(runs[0]?.reachedAnything).toBe(true)
+    })
+
+    // The discriminating half of the pair above: `reachedAnything` alone
+    // cannot tell "0 targets, nothing to sweep" apart from "targets probed,
+    // all reached" -- both read `true`. `targetCount` is what separates
+    // them, and this test pins that it reflects the REAL number probed, not
+    // a constant.
+    it('records the real targetCount for a non-empty sweep, not just 0 or a placeholder', async () => {
+      await runExternalProbes(
+        [target(HOST_A), target(HOST_B), target(HOST_C)],
+        depsFor({
+          [HOST_A]: { status: 200, certExpiresAt: null },
+          [HOST_B]: { status: 200, certExpiresAt: null },
+          [HOST_C]: { status: 200, certExpiresAt: null },
+        }),
+      )
+
+      const run = await prisma.externalProbeRun.findFirst()
+      expect(run?.targetCount).toBe(3)
+    })
+
+    // The other discriminating half: a FLEET-WIDE FAILURE (targets probed,
+    // none reached) must record `targetCount > 0` alongside
+    // `reachedAnything: false` -- distinct from the empty-list case above,
+    // which records `targetCount: 0` alongside `reachedAnything: true`. A
+    // reader that only looked at `reachedAnything` could not tell "nothing
+    // configured" apart from "everything down"; a reader with `targetCount`
+    // can.
+    it('records targetCount > 0 alongside reachedAnything: false for a genuine fleet-wide failure, distinct from the empty-list case', async () => {
+      const deps = depsFor({ [HOST_A]: networkFailure(), [HOST_B]: tlsFailure() })
+
+      await runExternalProbes([target(HOST_A), target(HOST_B)], deps)
+
+      const run = await prisma.externalProbeRun.findFirst()
+      expect(run?.targetCount).toBe(2)
+      expect(run?.reachedAnything).toBe(false)
     })
 
     it('carries an observation time set by this server\'s own clock', async () => {

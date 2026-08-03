@@ -85,23 +85,44 @@ export async function runExternalProbes(
   const fleetWide = isFleetWideExternalFailure(results)
 
   // Task 8 fix round 1 (C2b): a run-level record, written EVERY time this
-  // ran with at least one hostname to probe -- including (especially) a
-  // fleet-wide failure, which is exactly when `ExternalProbeResult` below
-  // writes NOTHING. Without this, the board's fleet-wide banner had no
-  // honest signal to read: `isFleetWideExternalFailure` over
-  // `latestExternalResultsByHostname`'s per-hostname rows has no time
-  // bound, so it could fire (or fail to fire) based on results from
-  // cycles unrelated to "this sweep". `ExternalProbeRun` answers "when did
-  // the last sweep run, and did it reach anything" directly, independent
-  // of whatever the per-hostname history happens to contain.
+  // runs -- including (especially) a fleet-wide failure, which is exactly
+  // when `ExternalProbeResult` below writes NOTHING. Without this, the
+  // board's fleet-wide banner had no honest signal to read:
+  // `isFleetWideExternalFailure` over `latestExternalResultsByHostname`'s
+  // per-hostname rows has no time bound, so it could fire (or fail to fire)
+  // based on results from cycles unrelated to "this sweep". `ExternalProbeRun`
+  // answers "when did the last sweep run, and did it reach anything"
+  // directly, independent of whatever the per-hostname history happens to
+  // contain.
   //
-  // Skipped for an EMPTY hostname list: there was nothing to attempt, which
-  // is a different fact from "attempted and reached nothing" -- recording
-  // a run here would let a board with no hostnames yet (nothing configured,
-  // not a fault) read as a sweep that failed.
-  if (targets.length > 0) {
-    await client.externalProbeRun.create({ data: { reachedAnything: !fleetWide } })
-  }
+  // Fix round 1 (Task 9 review), M4: this used to be SKIPPED entirely for an
+  // empty target list, reasoning that "nothing to attempt" is a different
+  // fact from "attempted and reached nothing" -- true, but "never write a
+  // row" was the wrong fix for that distinction. A fleet with zero
+  // currently-configured hostnames (no system has an HTTP surface deployed
+  // yet -- a legitimate, common state, not a failing scheduler) then NEVER
+  // got a single `ExternalProbeRun` row, so `shouldRunExternalProbe`
+  // (probe-scheduler.ts) kept seeing `lastRunAt: null` forever, rediscovery
+  // re-ran on every scheduler tick with nothing to show for it, and
+  // `deploy/verify-board.sh`'s "the scheduler has run at least once" check
+  // would fail PERMANENTLY against a scheduler working exactly as designed
+  // -- the opposite misreport from C1 (a check that could never turn green
+  // on a healthy system, rather than one that could never turn red on a
+  // dead one). `targetCount` is what makes it safe to always write the row
+  // instead: a reader can tell "0 targets, swept nothing because there was
+  // nothing to sweep" (`targetCount: 0`) apart from "swept N targets and
+  // reached none of them" (`targetCount: N > 0`, `reachedAnything: false`) --
+  // `reachedAnything` alone cannot distinguish those, since both currently
+  // read `true`/`false` from the exact same `isFleetWideExternalFailure`
+  // computation below.
+  //
+  // `reachedAnything` needs no special case for the empty-target run:
+  // `isFleetWideExternalFailure([])` already returns `false` (an empty
+  // `attempted` list proves nothing failed, per that function's own
+  // "absence is not evidence" rule -- see answers.ts), so `!fleetWide` is
+  // already `true` here, and the board's fleet-wide-failure fallback
+  // correctly does not trigger for a zero-hostname fleet.
+  await client.externalProbeRun.create({ data: { reachedAnything: !fleetWide, targetCount: targets.length } })
 
   if (fleetWide) {
     return { results, stored: false }

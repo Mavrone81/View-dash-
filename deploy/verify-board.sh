@@ -77,13 +77,29 @@ fi
 check "fleet board still answers on loopback" \
   '[ "$(curl -s -o /dev/null -w %{http_code} "$BASE/")" = 200 ]'
 
-# --- Has the scheduler actually run? ---
+# --- Has the scheduler run RECENTLY? ---
 #
-# `ExternalProbeRun` (schema.prisma) is written on EVERY sweep, including one
-# that reached nothing -- see `external-probe-runner.ts`'s own docstring --
-# so its row count answers "did the scheduler in
-# `web/src/server/ingest-server.ts` actually fire" directly, independent of
-# whatever `ExternalProbeResult` does or does not hold.
+# Fix round 1 (review), C1 -- CRITICAL, and confirmed live: the first version
+# of this check counted `ExternalProbeRun` with NO time bound. `ExternalProbeRun`
+# is append-only (a fresh row per sweep, never updated or deleted -- see its
+# own docstring in schema.prisma), so once ANY sweep has ever succeeded, even
+# once, that unbounded count is permanently >0 -- a scheduler dead for a month
+# (`ingest` crash-looping, the scheduler silently removed from
+# `ingest-server.ts`, whatever) still reads "PASS ... found: 47 sweep(s))"
+# forever, off the memory of a single sweep that ran once. Reproduced exactly
+# against a stubbed `docker`/real HTTP listener with a month-old row: printed
+# `PASS ... found: 47 sweep(s)) / All 3 checks passed. EXIT=0` on a scheduler
+# that had been dead the whole time. That is the THIRD verification script in
+# this project that could not fail (see this file's own header) -- found
+# before it shipped, not after.
+#
+# The fix is a WHERE clause, bounded to the same 15 minutes
+# `EXTERNAL_RESULT_STALE_AFTER_MS` (web/src/lib/fleet-query.ts) uses to decide
+# whether a stored external result is still a CURRENT opinion -- three missed
+# 5-minute cadences. Using the same number here is deliberate, not a
+# coincidence: this check and the board's own staleness rule should agree
+# about what "current" means, or an operator could see this script pass while
+# the board is already discounting every reading as stale, or the reverse.
 #
 # THIS CHECK IS EXPECTED TO FAIL for up to one cadence interval (5 minutes,
 # `EXTERNAL_PROBE_INTERVAL_MS` in `web/src/lib/fleet-query.ts`) after a fresh
@@ -93,13 +109,16 @@ check "fleet board still answers on loopback" \
 # until the first sweep completes, exactly as it does on a fresh install with
 # no agents enrolled yet. If this fails immediately after `docker compose up
 # -d web ingest`, wait five minutes and re-run this script before treating it
-# as a real problem.
+# as a real problem. (A fleet with zero hostnames configured anywhere still
+# writes a run row every cadence -- see `external-probe-runner.ts`'s M4 fix --
+# so this check passing does not depend on any system actually having an HTTP
+# surface yet, only on the scheduler itself being alive.)
 RUN_COUNT="$(docker compose exec -T "$DB_SERVICE" \
   psql -U "$DB_USER" -d "$DB_NAME" -tAc \
-  'SELECT count(*) FROM "ExternalProbeRun"' \
+  "SELECT count(*) FROM \"ExternalProbeRun\" WHERE \"ranAt\" > now() - interval '15 minutes'" \
   2>/dev/null | tr -d '[:space:]')"
 
-check "the external probe scheduler has run at least once (found: ${RUN_COUNT:-<unreadable>} sweep(s))" \
+check "the external probe scheduler has run recently, within the last 15 minutes (found: ${RUN_COUNT:-<unreadable>} sweep(s))" \
   '[ -n "$RUN_COUNT" ] && [ "$RUN_COUNT" -gt 0 ]'
 
 RESULT_COUNT="$(docker compose exec -T "$DB_SERVICE" \

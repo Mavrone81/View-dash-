@@ -41,8 +41,21 @@ export function shouldRunExternalProbe(lastRunAt: Date | null, now: Date): boole
  * whatever `probeExternally` decided from this hostname's own `listensTls`.
  * This is the one call site in the whole codebase where a live probe
  * actually leaves this box.
+ *
+ * EXPORTED (fix round 1, Task 9 review, H2) specifically so a test can call
+ * `productionDeps.request` directly and confirm `scheme` actually survives
+ * this handoff -- before this export existed, nothing in the suite invoked
+ * this object at all (every test built its OWN `deps`), so dropping `scheme`
+ * from the line below (`httpsExternalRequest(hostname, signal, {})`) left
+ * all 826 tests passing and `tsc -b` clean. That is the exact "asserted on
+ * the argument, not the wire" shape this slice already paid a Critical for
+ * in `external-probe.test.ts`, relocated one layer up -- and the defect it
+ * would silently reintroduce is the dangerous one: a plain-HTTP vhost
+ * dialled over TLS on 443, answered by a different tenant's server block,
+ * recorded as `answering`, the row goes green on someone else's response.
+ * See `probe-scheduler.test.ts`'s test against this exact export.
  */
-const productionDeps: ExternalDeps = {
+export const productionDeps: ExternalDeps = {
   request: (hostname, signal, scheme) => httpsExternalRequest(hostname, signal, { scheme }),
 }
 

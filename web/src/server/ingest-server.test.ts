@@ -3,7 +3,7 @@ import { WebSocket, type WebSocketServer } from 'ws'
 import type { AddressInfo } from 'node:net'
 import { prisma } from '../lib/db.js'
 import { enrolAgent, revokeAgent } from './auth-agent.js'
-import { startIngestServer } from './ingest-server.js'
+import { startIngestServer, startIngestProcess } from './ingest-server.js'
 
 let wss: WebSocketServer
 let url: string
@@ -296,6 +296,56 @@ describe('ingest-server', () => {
         for (const c of open) c.terminate()
         for (const c of capped.clients) c.terminate()
         await new Promise<void>((resolve) => capped.close(() => resolve()))
+      }
+    })
+  })
+
+  // H3 (fix round 1, Task 9 review): the external probe scheduler's ONLY
+  // production call site is this file's `import.meta.url` self-start guard,
+  // which is unreachable from any test that merely imports this module (the
+  // guard is only true when the file is run as a script). Before
+  // `startIngestProcess` was split out and exported, commenting out
+  // `startExternalProbeScheduler()` from that guard left every test in the
+  // suite passing. This test calls the REAL exported function (not a
+  // reimplementation of the guard's body) and substitutes a spy for the
+  // scheduler parameter, so mutating the real call away is caught here
+  // rather than nowhere.
+  describe('startIngestProcess (H3)', () => {
+    it('starts the external probe scheduler as part of starting the real ingest process', async () => {
+      let schedulerCalls = 0
+      const spyScheduler = (): (() => void) => {
+        schedulerCalls += 1
+        return () => {}
+      }
+
+      const ingestProc = startIngestProcess(
+        { host: '127.0.0.1', port: 0, maxPayloadBytes: 1024 * 1024, maxConnections: 64 },
+        spyScheduler,
+      )
+      try {
+        await new Promise<void>((resolve) => ingestProc.once('listening', resolve))
+        expect(schedulerCalls).toBe(1)
+      } finally {
+        await new Promise<void>((resolve) => ingestProc.close(() => resolve()))
+      }
+    })
+
+    it('returns the same live WebSocketServer startIngestServer would, still reachable for real connections', async () => {
+      const wss2 = startIngestProcess(
+        { host: '127.0.0.1', port: 0, maxPayloadBytes: 1024 * 1024, maxConnections: 64 },
+        () => () => {},
+      )
+      try {
+        await new Promise<void>((resolve) => wss2.once('listening', resolve))
+        const { port } = wss2.address() as AddressInfo
+        const client = new WebSocket(`ws://127.0.0.1:${port}`)
+        const { code } = await waitForClose(client)
+        // No Authorization header -- rejected, same as any other connection
+        // to this listener. Proves this is a genuine, working ingest
+        // listener, not a stub.
+        expect(code).toBe(4001)
+      } finally {
+        await new Promise<void>((resolve) => wss2.close(() => resolve()))
       }
     })
   })

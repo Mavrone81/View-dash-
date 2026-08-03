@@ -1,12 +1,34 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { PrismaClient } from '@prisma/client'
 import { prisma } from './db.js'
+
+// H2 (fix round 1, Task 9 review): mocks ONLY `httpsExternalRequest` from
+// the real `external-probe.js` module -- every other export (`probeExternally`,
+// types, ...) passes through UNCHANGED via `importOriginal`, so every other
+// test in this file (which builds its OWN `deps` and never touches
+// `httpsExternalRequest`) is completely unaffected. `vi.hoisted` is required
+// here, not optional style: `vi.mock`'s factory is hoisted to the very top
+// of this file by Vitest, ABOVE ordinary `const` declarations, so a mock
+// function referenced inside the factory must itself be created inside
+// `vi.hoisted` or the reference would hit the temporal-dead-zone before its
+// own declaration ever ran.
+const { httpsExternalRequestMock } = vi.hoisted(() => {
+  return {
+    httpsExternalRequestMock: vi.fn(async () => ({ status: 200, certExpiresAt: null as Date | null })),
+  }
+})
+vi.mock('./external-probe.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./external-probe.js')>()
+  return { ...actual, httpsExternalRequest: httpsExternalRequestMock }
+})
+
 import {
   shouldRunExternalProbe,
   EXTERNAL_PROBE_INTERVAL_MS,
   runExternalProbeCycle,
+  productionDeps,
   type SchedulerLogger,
 } from './probe-scheduler.js'
 import { EXTERNAL_PROBE_INTERVAL_MS as FLEET_QUERY_EXTERNAL_PROBE_INTERVAL_MS } from './fleet-query.js'
@@ -177,5 +199,37 @@ describe('runExternalProbeCycle', () => {
     await expect(runExternalProbeCycle(new Date(), deps, brokenClient, log)).resolves.toBeUndefined()
     expect(entries.length).toBeGreaterThan(0)
     await brokenClient.$disconnect()
+  })
+})
+
+// H2 (fix round 1, Task 9 review): the seam joining `probeExternally`'s
+// well-pinned scheme DECISION to `httpsExternalRequest`'s well-pinned scheme
+// BRANCHES was itself untested -- `productionDeps` is the one production line
+// that actually wires them together, and every prior test built its own
+// `deps`, so this exact line was free to drop `scheme` with the whole suite
+// staying green. This test calls `productionDeps.request` directly (the real
+// export, not a stand-in) and asserts on the argument the mocked
+// `httpsExternalRequest` actually received.
+describe('productionDeps forwards the decided scheme to httpsExternalRequest unchanged (H2)', () => {
+  it('passes scheme: "http" straight through for a plain-HTTP hostname', async () => {
+    httpsExternalRequestMock.mockClear()
+    const controller = new AbortController()
+
+    await productionDeps.request('plain.example.invalid', controller.signal, 'http')
+
+    expect(httpsExternalRequestMock).toHaveBeenCalledWith('plain.example.invalid', controller.signal, {
+      scheme: 'http',
+    })
+  })
+
+  it('passes scheme: "https" straight through for a TLS hostname, and never defaults it away', async () => {
+    httpsExternalRequestMock.mockClear()
+    const controller = new AbortController()
+
+    await productionDeps.request('secure.example.invalid', controller.signal, 'https')
+
+    expect(httpsExternalRequestMock).toHaveBeenCalledWith('secure.example.invalid', controller.signal, {
+      scheme: 'https',
+    })
   })
 })
