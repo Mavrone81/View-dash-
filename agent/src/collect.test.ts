@@ -4,10 +4,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { collectSnapshot } from './collect.js'
-import { FleetSnapshotSchema } from '@bevora-ops/shared'
+import { FleetSnapshotSchema, type ProbeOutcome } from '@bevora-ops/shared'
 
 const deps = (over: Partial<Parameters<typeof collectSnapshot>[0]> = {}) => ({
-  listContainers: async () => [{ names: ['/a'], project: 'alpha', state: 'running', health: null }],
+  listContainers: async () => [{ names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [] }],
   readDeployLog: async () => '2026-08-01T10:00:00Z  === Deploy OK: abc1234 ===',
   repoDirFor: () => '/nonexistent',
   now: () => new Date('2026-08-01T12:00:00Z'),
@@ -66,8 +66,8 @@ describe('collectSnapshot', () => {
       const snap = await collectSnapshot(
         deps({
           listContainers: async () => [
-            { names: ['/a'], project: 'alpha', state: 'running', health: null },
-            { names: ['/b'], project: 'beta', state: 'running', health: null },
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [] },
+            { names: ['/b'], project: 'beta', state: 'running', health: null, publishedPorts: [] },
           ],
           readDeployLog: async (key: string) => {
             if (key === 'alpha') throw new Error('permission denied')
@@ -90,14 +90,14 @@ describe('collectSnapshot', () => {
   // whose job is to say whether things are up.
   describe('HTTP probe folded into health (spec §4.1 worst-of)', () => {
     const twoRunningContainers = async () => [
-      { names: ['/a'], project: 'alpha', state: 'running', health: null },
-      { names: ['/b'], project: 'beta', state: 'running', health: null },
+      { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [] },
+      { names: ['/b'], project: 'beta', state: 'running', health: null, publishedPorts: [] },
     ]
 
     it('does not render green when every container is up but the app 502s', async () => {
       const snap = await collectSnapshot(
         deps({
-          listContainers: async () => [{ names: ['/a'], project: 'alpha', state: 'running', health: null }],
+          listContainers: async () => [{ names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [] }],
           urlFor: () => 'https://alpha.example.invalid/',
           probe: async () => 'down' as const,
         }),
@@ -116,7 +116,7 @@ describe('collectSnapshot', () => {
       const probe = vi.fn()
       const snap = await collectSnapshot(
         deps({
-          listContainers: async () => [{ names: ['/a'], project: 'alpha', state: 'running', health: null }],
+          listContainers: async () => [{ names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [] }],
           urlFor: () => null,
           probe,
         }),
@@ -128,7 +128,7 @@ describe('collectSnapshot', () => {
     it('does not upgrade a down container set just because the URL answers', async () => {
       const snap = await collectSnapshot(
         deps({
-          listContainers: async () => [{ names: ['/a'], project: 'alpha', state: 'exited', health: null }],
+          listContainers: async () => [{ names: ['/a'], project: 'alpha', state: 'exited', health: null, publishedPorts: [] }],
           urlFor: () => 'https://alpha.example.invalid/',
           probe: async () => 'healthy' as const,
         }),
@@ -139,7 +139,7 @@ describe('collectSnapshot', () => {
     it('treats a configured URL whose probe throws as down, never as healthy', async () => {
       const snap = await collectSnapshot(
         deps({
-          listContainers: async () => [{ names: ['/a'], project: 'alpha', state: 'running', health: null }],
+          listContainers: async () => [{ names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [] }],
           urlFor: () => 'https://alpha.example.invalid/',
           probe: async () => {
             throw new Error('probe blew up')
@@ -186,6 +186,195 @@ describe('collectSnapshot', () => {
       expect(snap.systems).toHaveLength(2)
       // beta must have STARTED before the slow alpha probe ENDED.
       expect(events.indexOf('start:beta')).toBeLessThan(events.indexOf('end:alpha'))
+    })
+  })
+
+  // This is the seam this task exists to close: a system's published
+  // container ports resolved to hostnames via the host's OWN reverse-proxy
+  // config (agent/src/vhosts.ts), and each of those hostnames probed
+  // on-box, through loopback (agent/src/probe.ts) -- with NO operator
+  // configuration, unlike the urlFor/probe block above. `hostnamesByPort`
+  // and `probeOnBoxHostname` are the two seams; see their docstrings on
+  // CollectDeps.
+  describe('on-box probing of derived hostnames folded into health', () => {
+    it('does not render green when every container is up but the on-box probe finds the proxy has no upstream', async () => {
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
+          ],
+          hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+          probeOnBoxHostname: async () => ({ outcome: 'proxy-no-upstream' as const, status: 502 }),
+        }),
+      )
+      const alpha = snap.systems.find((s) => s.key === 'alpha')!
+      // Containers alone say `healthy` -- one container, running, no
+      // healthcheck. Only the on-box probe can move this row.
+      expect(alpha.health).toBe('down')
+      expect(alpha.health).not.toBe('healthy')
+    })
+
+    it('leaves a system whose published ports match no vhost exactly as its containers describe it, and never probes', async () => {
+      // A system with no vhost legitimately has no HTTP surface (a worker,
+      // a database, a background job) -- this must not be reported as a
+      // failure, and hostnamesForSystem returning [] must not lead to a
+      // probe call at all.
+      const probeOnBoxHostname = vi.fn()
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [9999] },
+          ],
+          hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
+          probeOnBoxHostname,
+        }),
+      )
+      expect(snap.systems[0]!.health).toBe('healthy')
+      expect(probeOnBoxHostname).not.toHaveBeenCalled()
+    })
+
+    it('does not downgrade anything when the vhost directory could not be read this tick', async () => {
+      // `hostnamesByPort` returning `null` means the read FAILED -- not
+      // "read successfully and found zero vhosts". Collapsing those two
+      // would report a diagnostic failure as a fact about the host (every
+      // system reads "no HTTP surface"), which is exactly the false claim
+      // this task's brief calls out by name.
+      //
+      // Honestly labelled: this is a CONTRACT test, not a discriminating
+      // one. At the collectSnapshot layer, `null` and an empty `Map` both
+      // already produce "no on-box probing, health untouched" -- a naive
+      // implementation that collapsed the two would pass this exact
+      // assertion too, because this fixture's port (8081) is absent from
+      // an empty map in exactly the same way it is absent given `null`.
+      // The distinction that DOES discriminate lives one layer down, in
+      // `discoverHostnamesFromDir`'s own test in vhosts.test.ts ("returns
+      // null, not an empty map, when the directory cannot be read at
+      // all"), which is mutation-verified. This test exists to document
+      // and pin collectSnapshot's side of the contract, not to prove it.
+      const probeOnBoxHostname = vi.fn()
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
+          ],
+          hostnamesByPort: async () => null,
+          probeOnBoxHostname,
+        }),
+      )
+      expect(snap.systems[0]!.health).toBe('healthy')
+      expect(probeOnBoxHostname).not.toHaveBeenCalled()
+    })
+
+    it('probes only the hostnames that resolve from THIS system\'s own published ports, never another system\'s', async () => {
+      const probed: string[] = []
+      const byPort = new Map([
+        [8081, ['alpha.example.invalid']],
+        [9001, ['beta.example.invalid']],
+      ])
+      await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
+            { names: ['/b'], project: 'beta', state: 'running', health: null, publishedPorts: [9001] },
+          ],
+          hostnamesByPort: async () => byPort,
+          probeOnBoxHostname: async (hostname: string) => {
+            probed.push(hostname)
+            return { outcome: 'answering' as const, status: 200 }
+          },
+        }),
+      )
+      expect(probed.sort()).toEqual(['alpha.example.invalid', 'beta.example.invalid'])
+    })
+
+    it('runs a system\'s hostname probes concurrently, so one slow hostname cannot stall the others', async () => {
+      const events: string[] = []
+      const byPort = new Map([
+        [8081, ['slow.example.invalid']],
+        [9001, ['fast.example.invalid']],
+      ])
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081, 9001] },
+          ],
+          hostnamesByPort: async () => byPort,
+          probeOnBoxHostname: async (hostname: string) => {
+            events.push(`start:${hostname}`)
+            await new Promise((r) => setTimeout(r, hostname.startsWith('slow') ? 80 : 5))
+            events.push(`end:${hostname}`)
+            return { outcome: 'answering' as const, status: 200 }
+          },
+        }),
+      )
+      expect(snap.systems).toHaveLength(1)
+      expect(events.indexOf('start:fast.example.invalid')).toBeLessThan(events.indexOf('end:slow.example.invalid'))
+    })
+
+    it('treats an on-box probe function that throws outright as evidence of failure, never as healthy', async () => {
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
+          ],
+          hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+          probeOnBoxHostname: async () => {
+            throw new Error('boom')
+          },
+        }),
+      )
+      expect(snap.systems[0]!.health).toBe('down')
+    })
+
+    it('never lets the whole snapshot fail when a probe function throws synchronously instead of rejecting, and never takes down another system with it', async () => {
+      // Deliberately violates probeOnBoxHostname's declared Promise-returning
+      // type -- a defensive case, not a supported contract. `.catch()` only
+      // guards a REJECTED promise; a synchronous throw would otherwise
+      // escape it, reject this system's own Promise.all callback, and (left
+      // uncaught) propagate out of collectSnapshot's OUTER Promise.all,
+      // failing the entire snapshot for every system, not just this one.
+      const syncThrow = (() => {
+        throw new Error('boom')
+      }) as unknown as (hostname: string) => Promise<{ outcome: ProbeOutcome; status: number | null }>
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
+            { names: ['/b'], project: 'beta', state: 'running', health: null, publishedPorts: [] },
+          ],
+          hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+          probeOnBoxHostname: syncThrow,
+        }),
+      )
+      expect(snap.systems).toHaveLength(2)
+      expect(snap.systems.find((s) => s.key === 'alpha')!.health).toBe('down')
+      // beta has no published ports, so it is never probed at all, and must
+      // not be caught in alpha's failure.
+      expect(snap.systems.find((s) => s.key === 'beta')!.health).toBe('healthy')
+    })
+
+    it('does not upgrade a down container set just because the on-box probe answers', async () => {
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'exited', health: null, publishedPorts: [8081] },
+          ],
+          hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+          probeOnBoxHostname: async () => ({ outcome: 'answering' as const, status: 200 }),
+        }),
+      )
+      expect(snap.systems[0]!.health).toBe('down')
+    })
+
+    it('is inert with no hostnamesByPort/probeOnBoxHostname configured, matching every deployment today', async () => {
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
+          ],
+        }),
+      )
+      expect(snap.systems[0]!.health).toBe('healthy')
     })
   })
 })

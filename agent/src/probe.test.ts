@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { worstOf, probeUrl, type FetchLike } from './probe.js'
+import { worstOf, probeUrl, hostnamesForSystem, probeHostnameOnBox, type FetchLike } from './probe.js'
 
 /** A fetch stand-in that answers with a fixed status and records what it was called with. */
 function respondWith(status: number): FetchLike & { calls: string[] } {
@@ -58,9 +58,19 @@ describe('probeUrl', () => {
     expect(f.calls).toEqual(['https://app.example.invalid/'])
   })
 
-  it('reports degraded for a 4xx: something answered, but this URL is not evidence the app works', async () => {
+  it('reports degraded for a 4xx that is not a login wall: something answered, but this URL is not evidence the app works', async () => {
     expect(await probeUrl('https://app.example.invalid/', respondWith(404))).toBe('degraded')
-    expect(await probeUrl('https://app.example.invalid/', respondWith(401))).toBe('degraded')
+  })
+
+  // Reconciled with classifyHttpStatus (Task 1): this used to fold ALL 4xx,
+  // including 401/403, into 'degraded'. A login wall is an application
+  // working -- measured across the live host, an all-4xx-is-degraded rule
+  // would have marked 19 of 42 hostnames broken while they were fine. This
+  // is the deliberate behaviour CHANGE task-4-report.md documents: the old
+  // assertion here was `expect(...401...).toBe('degraded')`.
+  it('reports healthy for 401/403: a login wall is the app working, not the app degraded', async () => {
+    expect(await probeUrl('https://app.example.invalid/', respondWith(401))).toBe('healthy')
+    expect(await probeUrl('https://app.example.invalid/', respondWith(403))).toBe('healthy')
   })
 
   it('reports down, and does not throw, when the connection fails outright', async () => {
@@ -104,5 +114,60 @@ describe('probeUrl', () => {
     } finally {
       spy.mockRestore()
     }
+  })
+})
+
+describe('mapping ports to hostnames', () => {
+  it('collects every hostname across all of a system\'s published ports', () => {
+    const byPort = new Map([
+      [8081, ['alpha.example.invalid']],
+      [9001, ['gamma.example.invalid']],
+    ])
+    expect(hostnamesForSystem([8081, 9001], byPort)).toEqual([
+      'alpha.example.invalid',
+      'gamma.example.invalid',
+    ])
+  })
+
+  it('returns nothing for a system with no vhost, rather than guessing one', () => {
+    expect(hostnamesForSystem([7777], new Map([[8081, ['alpha.example.invalid']]]))).toEqual([])
+  })
+})
+
+describe('on-box probing', () => {
+  it('reports the status it saw alongside the outcome', async () => {
+    const r = await probeHostnameOnBox('alpha.example.invalid', async () => ({ status: 301 }))
+    expect(r).toEqual({ hostname: 'alpha.example.invalid', outcome: 'answering', status: 301 })
+  })
+
+  it('names a 502 as the proxy having no upstream', async () => {
+    const r = await probeHostnameOnBox('alpha.example.invalid', async () => ({ status: 502 }))
+    expect(r.outcome).toBe('proxy-no-upstream')
+  })
+
+  it('distinguishes a TLS failure from a dead application', async () => {
+    const r = await probeHostnameOnBox('alpha.example.invalid', async () => {
+      throw Object.assign(new Error('handshake'), { code: 'ERR_TLS_CERT_ALTNAME_INVALID' })
+    })
+    expect(r.outcome).toBe('tls-failed')
+    expect(r.status).toBeNull()
+  })
+
+  it('never throws, whatever the fetch does', async () => {
+    const r = await probeHostnameOnBox('alpha.example.invalid', async () => {
+      throw new Error('boom')
+    })
+    expect(r.outcome).toBe('not-answering')
+  })
+
+  it('is bounded in time, does not hang the collection loop', async () => {
+    const neverReplies: FetchLike = (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(new Error('aborted')))
+      })
+    const startedAt = Date.now()
+    const r = await probeHostnameOnBox('alpha.example.invalid', neverReplies, 50)
+    expect(r.outcome).toBe('not-answering')
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
   })
 })

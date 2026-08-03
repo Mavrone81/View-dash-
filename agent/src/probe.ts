@@ -1,4 +1,4 @@
-import type { HealthState } from '@bevora-ops/shared'
+import { classifyHttpStatus, classifyProbeFailure, probeOutcomeToHealth, type HealthState, type ProbeOutcome } from '@bevora-ops/shared'
 
 /**
  * Spec §4.1 defines a system's health as the **worst-of** every
@@ -57,17 +57,27 @@ export const DEFAULT_PROBE_TIMEOUT_MS = 5_000
 /**
  * Probes one system's public URL and maps the outcome onto a health state.
  *
- *   - 2xx / 3xx  -> `healthy`. The app answered.
- *   - 4xx        -> `degraded`. Something answered, but not with the app
- *                   working: a 404 on a system's own front door is a real
- *                   misconfiguration, and a 401/403 means this URL is not
- *                   a usable liveness signal and the operator should point
- *                   the probe somewhere that is. Amber, not red -- an
- *                   answer came back, so the stack is not simply dead.
- *   - 5xx        -> `down`. This is the case the spec names explicitly:
- *                   nginx returning 502 while every container reads `Up`.
- *   - no answer  -> `down`. A connection refused, a DNS failure, a TLS
- *                   error, or a timeout all mean a visitor gets nothing.
+ * The status -> outcome mapping is `classifyHttpStatus` (from
+ * `@bevora-ops/shared`) -- the SAME rule `probeHostnameOnBox` below uses for
+ * the on-box probe, so a status is never judged two different ways
+ * depending which probe saw it. In particular: 401 and 403 count as
+ * `answering` (a login wall is an application working), NOT as `degraded`
+ * the way every OTHER 4xx does. This function used to fold ALL 4xx --
+ * including 401/403 -- into `degraded` itself, before `classifyHttpStatus`
+ * existed to state the rule once; that inline copy is gone now, not kept
+ * alongside it.
+ *
+ *   - 2xx / 3xx     -> `healthy`. The app answered.
+ *   - 401 / 403     -> `healthy`. A login wall is the app working.
+ *   - other 4xx     -> `degraded`. Something answered, but not with the app
+ *                      working: a 404 on a system's own front door is a real
+ *                      misconfiguration. Amber, not red -- an answer came
+ *                      back, so the stack is not simply dead.
+ *   - 502 / 504     -> `down`. This is the case the spec names explicitly:
+ *                      nginx returning 502 while every container reads `Up`.
+ *   - other 5xx     -> `down`.
+ *   - no answer     -> `down`. A connection refused, a DNS failure, a TLS
+ *                      error, or a timeout all mean a visitor gets nothing.
  *
  * NEVER throws. A probe is a diagnostic; a failure in it is a datum, not
  * an error to propagate into collection.
@@ -92,9 +102,13 @@ export async function probeUrl(
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const { status } = await fetchImpl(url, { signal: controller.signal, redirect: 'manual' })
-    if (status >= 500) return 'down'
-    if (status >= 400) return 'degraded'
-    return 'healthy'
+    const health = probeOutcomeToHealth(classifyHttpStatus(status))
+    // `probeOutcomeToHealth` returns null only for the `not-probed` outcome,
+    // which `classifyHttpStatus` -- fed a real completed-response status, as
+    // it always is here -- can never produce. Unreachable in practice; a
+    // fallback here documents probeOutcomeToHealth's full range honestly
+    // rather than asserting past it with a cast.
+    return health ?? 'down'
   } catch {
     // Includes the timeout above firing: either way, nothing usable came
     // back from the URL an operator told us this system serves.
@@ -102,6 +116,55 @@ export async function probeUrl(
   } finally {
     // Without this, a fast successful probe still holds a pending timer,
     // which keeps the Node event loop alive for the full timeout.
+    clearTimeout(timer)
+  }
+}
+
+export function hostnamesForSystem(publishedPorts: number[], byPort: Map<number, string[]>): string[] {
+  const out: string[] = []
+  for (const p of publishedPorts) out.push(...(byPort.get(p) ?? []))
+  return out
+}
+
+/** Node's TLS errors all carry a code beginning ERR_TLS_, or ERR_SSL_ from OpenSSL. */
+function isTlsError(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code
+  return typeof code === 'string' && (code.startsWith('ERR_TLS_') || code.startsWith('ERR_SSL_'))
+}
+
+/**
+ * Probes one hostname from ON the monitored host, through loopback.
+ *
+ * This proves the application and the proxy are working. It cannot prove
+ * DNS, routing or the certificate a real visitor is handed -- that is the
+ * external probe's job, and the disagreement between the two is what
+ * locates a fault.
+ *
+ * NEVER throws, for the same reason as `probeUrl`: a probe is a diagnostic
+ * running inside the collection loop of an agent watching nine businesses'
+ * production, and a failure to reach a hostname is a datum this function
+ * reports, not an exception it raises.
+ */
+export async function probeHostnameOnBox(
+  hostname: string,
+  fetchImpl: FetchLike,
+  timeoutMs: number = DEFAULT_PROBE_TIMEOUT_MS,
+): Promise<{ hostname: string; outcome: ProbeOutcome; status: number | null }> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const { status } = await fetchImpl(`https://${hostname}/`, {
+      signal: controller.signal,
+      redirect: 'manual',
+    })
+    return { hostname, outcome: classifyHttpStatus(status), status }
+  } catch (err) {
+    return {
+      hostname,
+      outcome: classifyProbeFailure(isTlsError(err) ? 'tls' : 'network'),
+      status: null,
+    }
+  } finally {
     clearTimeout(timer)
   }
 }

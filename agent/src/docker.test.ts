@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import { discoverSystems, toSummary } from './docker.js'
 
-const c = (project: string | null, state: string, health: string | null = null) =>
-  ({ names: ['/x'], project, state, health })
+const c = (project: string | null, state: string, health: string | null = null, publishedPorts: number[] = []) =>
+  ({ names: ['/x'], project, state, health, publishedPorts })
 
 describe('discoverSystems', () => {
   it('groups containers by compose project', () => {
@@ -48,6 +48,17 @@ describe('discoverSystems', () => {
   it('returns systems sorted by key regardless of input order', () => {
     const out = discoverSystems([c('zeta', 'running'), c('alpha', 'running'), c('mid', 'running')])
     expect(out.map((s) => s.key)).toEqual(['alpha', 'mid', 'zeta'])
+  })
+
+  it('unions published ports across every container in the same system, deduplicated', () => {
+    // A compose project's web and worker containers can each publish their
+    // own port; a hostname mapped to either must reach this one system.
+    const out = discoverSystems([c('a', 'running', null, [8081]), c('a', 'running', null, [8081, 9001])])
+    expect(out[0]!.publishedPorts).toEqual([8081, 9001])
+  })
+
+  it('reports no published ports for a system whose containers publish none', () => {
+    expect(discoverSystems([c('a', 'running')])[0]!.publishedPorts).toEqual([])
   })
 })
 
@@ -102,5 +113,34 @@ describe('toSummary', () => {
     const out = toSummary({ Names: ['/beta-web-1'], State: 'exited', Status: 'Exited (0) 3 minutes ago' })
     expect(out.names).toEqual(['/beta-web-1'])
     expect(out.state).toBe('exited')
+  })
+
+  it('reports no published ports when Ports is absent', () => {
+    expect(toSummary(raw('Up 2 hours')).publishedPorts).toEqual([])
+  })
+
+  it('keeps only entries that carry a PublicPort, dropping an internal-only port', () => {
+    // A port with no PublicPort is not reachable from outside the daemon at
+    // all -- attaching a hostname to it would be worse than reporting none,
+    // because nothing a probe does could ever reach it.
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [
+        { PrivatePort: 80, PublicPort: 8088, Type: 'tcp' },
+        { PrivatePort: 9000, Type: 'tcp' }, // internal only -- no PublicPort
+      ],
+    })
+    expect(out.publishedPorts).toEqual([8088])
+  })
+
+  it('deduplicates a PublicPort reported twice, once per IPv4 and IPv6 host binding', () => {
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [
+        { IP: '0.0.0.0', PrivatePort: 80, PublicPort: 8088, Type: 'tcp' },
+        { IP: '::', PrivatePort: 80, PublicPort: 8088, Type: 'tcp' },
+      ],
+    })
+    expect(out.publishedPorts).toEqual([8088])
   })
 })

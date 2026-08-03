@@ -5,8 +5,9 @@ import { collectSnapshot } from './collect.js'
 import { toSummary } from './docker.js'
 import { AgentTransport } from './transport.js'
 import { createTickRunner } from './loop.js'
-import { probeUrl } from './probe.js'
+import { probeHostnameOnBox, probeUrl } from './probe.js'
 import { resolveDeployLogPath, resolveRepoDir } from './paths.js'
+import { discoverHostnamesFromDir, nodeVhostFs } from './vhosts.js'
 
 const cfg = loadConfig()
 const docker = new Docker()
@@ -14,6 +15,27 @@ const docker = new Docker()
 // holds that connection open across ticks. Nothing in this file, or in
 // AgentTransport, ever binds a listening socket on this host.
 const transport = new AgentTransport(cfg)
+
+/**
+ * Reads the host's own reverse-proxy config and derives which hostnames
+ * serve which loopback port -- see `agent/src/vhosts.ts`'s module docstring
+ * for why this is derived rather than configured.
+ *
+ * Logs (never throws) when the vhost directory itself could not be read
+ * this tick: that is a diagnostic failure worth an operator seeing, quite
+ * different from "read it fine, this host has zero vhosts" -- collapsing
+ * the two would render every system on the board as having no HTTP surface,
+ * which is the false claim `discoverHostnamesFromDir`'s `null` return
+ * exists to prevent. See its docstring and agent/src/collect.ts's
+ * `hostnamesByPort` for the contract this satisfies.
+ */
+async function hostnamesByPort(): Promise<Map<number, string[]> | null> {
+  const byPort = await discoverHostnamesFromDir(cfg.vhostDir, nodeVhostFs)
+  if (byPort === null) {
+    console.warn(`[agent] vhost directory unreadable (${cfg.vhostDir}); on-box hostname probing skipped this tick`)
+  }
+  return byPort
+}
 
 async function tick(): Promise<void> {
   const snapshot = await collectSnapshot({
@@ -34,6 +56,11 @@ async function tick(): Promise<void> {
     // empty in every deployment today.
     urlFor: (key) => cfg.systemUrls[key] ?? null,
     probe: (url) => probeUrl(url, fetch, cfg.probeTimeoutMs),
+    // The on-box probe: no operator configuration required at all, unlike
+    // urlFor/probe above -- every hostname comes from the host's own proxy
+    // config, and every system's published ports come from Docker itself.
+    hostnamesByPort,
+    probeOnBoxHostname: (hostname) => probeHostnameOnBox(hostname, fetch, cfg.probeTimeoutMs),
   })
   // A failed send never throws (see AgentTransport.send): losing the
   // dashboard must never stop this loop from continuing to collect and

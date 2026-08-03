@@ -86,6 +86,14 @@ describe('loadConfig', () => {
     expect(cfg.probeTimeoutMs).toBeGreaterThan(0)
   })
 
+  it('defaults the vhost directory to the standard nginx sites-enabled path', () => {
+    expect(loadConfig(validEnv()).vhostDir).toBe('/etc/nginx/sites-enabled')
+  })
+
+  it('honours an overridden vhost directory', () => {
+    expect(loadConfig(validEnv({ AGENT_VHOST_DIR: '/custom/vhosts' })).vhostDir).toBe('/custom/vhosts')
+  })
+
   it('loads configured system URLs and a custom probe timeout', () => {
     const cfg = loadConfig(
       validEnv({

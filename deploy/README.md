@@ -271,6 +271,7 @@ AGENT_REPO_ROOT=<root directory this host's system checkouts live under>
 # AGENT_INTERVAL_MS=30000   # optional; default shown
 # AGENT_SYSTEM_URLS=<key>=https://...,<key>=https://...   # optional; see below
 # AGENT_PROBE_TIMEOUT_MS=5000                             # optional; default shown
+# AGENT_VHOST_DIR=/etc/nginx/sites-enabled                # optional; default shown; see below
 ```
 
 **`AGENT_HOST_NAME` does not identify this agent, and cannot.** Identity
@@ -303,6 +304,19 @@ that a malformed entry makes the agent refuse to start, deliberately:
 silently skipping it would leave a system unprobed while you believed it
 was covered. 4xx reads as `degraded` and 5xx (or no answer at all) as
 `down`, so point this at a URL that returns 2xx when the app is well.
+
+**`AGENT_VHOST_DIR` (optional) turns on the on-box probe -- and needs no
+per-system configuration at all**, unlike `AGENT_SYSTEM_URLS` above. It
+points at this host's ENABLED reverse-proxy vhosts (the nginx
+`sites-enabled` convention is the default). The agent reads every file
+there, derives which hostnames map to which loopback port from
+`server_name` / `proxy_pass`, joins that to each system's published
+container ports, and probes each resulting hostname from ON this host,
+through loopback -- so a new stack is covered the day it deploys, with
+nothing to edit here. If this path does not exist or cannot be read (a host
+running a different proxy, or none), the agent logs it once per tick and
+simply skips on-box probing -- it never treats that as "every system has no
+HTTP surface".
 
 `AGENT_DASHBOARD_URL`'s path (`/agent/ingest` above) must match whatever
 `location` you configured in `deploy/nginx-ingest.conf` -- the listener
@@ -392,7 +406,8 @@ the one most worth re-proving live rather than trusting from tests alone.
 | `AGENT_REPO_ROOT` | Root directory this host's system checkouts live under. |
 | `AGENT_INTERVAL_MS` | Optional. Poll interval in milliseconds (default `30000`). |
 | `AGENT_SYSTEM_URLS` | Optional. `key=url` pairs, comma separated, enabling the HTTP health probe per system (see §9). Unset ⇒ nothing is probed and nothing is downgraded. |
-| `AGENT_PROBE_TIMEOUT_MS` | Optional. Per-probe timeout in milliseconds (default `5000`). |
+| `AGENT_PROBE_TIMEOUT_MS` | Optional. Per-probe timeout in milliseconds (default `5000`), shared by both the external URL probe and the on-box hostname probe. |
+| `AGENT_VHOST_DIR` | Optional. Directory of this host's enabled reverse-proxy vhosts, read to derive and on-box-probe each system's hostnames (see §9). Default `/etc/nginx/sites-enabled`. Unreadable ⇒ on-box probing is skipped and logged, never treated as "no HTTP surface". |
 
 ## Reference: dashboard-side environment variables
 

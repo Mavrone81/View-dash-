@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest'
-import { parseVhost, parseServerBlocks, discoverHostnamesByPort, parseUpstreams, readVhostDir } from './vhosts.js'
+import {
+  parseVhost,
+  parseServerBlocks,
+  discoverHostnamesByPort,
+  parseUpstreams,
+  readVhostDir,
+  nodeVhostFs,
+  isVhostDirReachable,
+  discoverHostnamesFromDir,
+} from './vhosts.js'
 import { mkdtemp, mkdir, writeFile, symlink, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -284,5 +293,80 @@ describe('reading the vhost directory', () => {
       readFile: async () => '',
     })
     expect(files).toEqual([])
+  })
+})
+
+describe('isVhostDirReachable', () => {
+  // readVhostDir returns [] both when the directory holds no vhosts AND
+  // when it cannot be read at all -- these two tests exist so a caller can
+  // tell those apart before believing an empty scan.
+  it('reports true when the directory can be listed, even if it is empty', async () => {
+    expect(await isVhostDirReachable('/enabled', { readdir: async () => [] })).toBe(true)
+  })
+
+  it('reports false when the directory cannot be listed', async () => {
+    expect(
+      await isVhostDirReachable('/enabled', {
+        readdir: async () => {
+          throw new Error('ENOENT')
+        },
+      }),
+    ).toBe(false)
+  })
+})
+
+describe('discoverHostnamesFromDir', () => {
+  it('discovers hostnames by port when the directory is reachable', async () => {
+    const byPort = await discoverHostnamesFromDir('/enabled', {
+      readdir: async () => ['a.conf'],
+      readFile: async () => 'server { server_name found.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }',
+    })
+    expect(byPort?.get(8081)).toEqual(['found.example.invalid'])
+  })
+
+  // The discriminating case: a directory that cannot be listed must come
+  // back as null, never as an empty Map -- readVhostDir alone cannot tell
+  // the two apart (both are `[]`), so a naive implementation that skips the
+  // reachability check and just calls readVhostDir + discoverHostnamesByPort
+  // would silently produce an empty Map here instead, which is
+  // indistinguishable downstream from "this host genuinely has no vhosts".
+  it('returns null, not an empty map, when the directory cannot be read at all', async () => {
+    const byPort = await discoverHostnamesFromDir('/enabled', {
+      readdir: async () => {
+        throw new Error('EACCES')
+      },
+      readFile: async () => '',
+    })
+    expect(byPort).toBeNull()
+  })
+})
+
+describe('the production VhostFs', () => {
+  // This runs the EXACT object main.ts hands to readVhostDir on a real
+  // host -- not a lookalike lambda written inline in a test. The earlier
+  // "follows symlinks" suite above proves node:fs/promises' readFile
+  // follows a symlink (an OS guarantee, not something this module decides);
+  // this suite proves the shipped nodeVhostFs object itself doesn't
+  // reintroduce the grep -r failure through a plausible-looking rewrite
+  // (readdir with withFileTypes + an isFile() filter), which would return
+  // false for every symlinked entry even though its target is an ordinary
+  // file.
+  it('reads a real vhost file through a real symlink using the shipped production adapter', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'vhosts-prod-fs-'))
+    try {
+      const available = join(root, 'available')
+      const enabled = join(root, 'enabled')
+      await mkdir(available)
+      await mkdir(enabled)
+      await writeFile(join(available, 'a.conf'), 'server { server_name prodfs.example.invalid; }')
+      await symlink(join(available, 'a.conf'), join(enabled, 'a.conf'))
+
+      const files = await readVhostDir(enabled, nodeVhostFs)
+
+      expect(files).toHaveLength(1)
+      expect(files[0]!.text).toContain('prodfs.example.invalid')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

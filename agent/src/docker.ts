@@ -5,6 +5,18 @@ export type ContainerSummary = {
   project: string | null
   state: string
   health: string | null
+  /**
+   * The container's HOST-reachable ports only -- i.e. every entry Docker's
+   * own `Ports` array reported that carries a `PublicPort`. An entry with no
+   * `PublicPort` is a container-internal port nothing outside the daemon can
+   * reach; treating it as published would let a vhost's proxy_pass target
+   * attach a hostname to a port no probe can actually hit from the host,
+   * which is worse than reporting no hostname at all -- it is the same
+   * false-attribution shape this slice's vhost parser was fixed three times
+   * over. Deduplicated: the same PublicPort is reported twice when a
+   * container binds both an IPv4 and an IPv6 host address to it.
+   */
+  publishedPorts: number[]
 }
 
 export type DiscoveredSystem = {
@@ -12,6 +24,13 @@ export type DiscoveredSystem = {
   displayName: string
   health: HealthState
   containers: { total: number; running: number }
+  /** The union, deduplicated, of every one of this system's containers' `publishedPorts`. */
+  publishedPorts: number[]
+}
+
+/** Dedupes and sorts for a deterministic, order-independent result. */
+function dedupeSortedPorts(ports: number[]): number[] {
+  return [...new Set(ports)].sort((a, b) => a - b)
 }
 
 // Health values a container can carry once parsed from Docker's Status string.
@@ -39,7 +58,8 @@ export function discoverSystems(list: ContainerSummary[]): DiscoveredSystem[] {
     const notHealthy = cs.some((c) => c.health !== null && NOT_HEALTHY.has(c.health))
     const health: HealthState =
       running === 0 ? 'down' : running < cs.length || notHealthy ? 'degraded' : 'healthy'
-    return { key, displayName: key, health, containers: { total: cs.length, running } }
+    const publishedPorts = dedupeSortedPorts(cs.flatMap((c) => c.publishedPorts))
+    return { key, displayName: key, health, containers: { total: cs.length, running }, publishedPorts }
   })
 
   // Map iteration order follows whatever order the container list happened to arrive
@@ -77,17 +97,34 @@ function parseHealth(status: string | undefined): string | null {
   return 'unknown'
 }
 
+/**
+ * A single entry of Docker's own `Ports` array on a container summary. Only
+ * `PublicPort` is optional -- an entry with no `PublicPort` is a container
+ * port that is exposed but not published to the host, e.g. a bare `EXPOSE`
+ * or a port shared only over an internal compose network.
+ */
+type RawPort = { PrivatePort: number; PublicPort?: number; Type: string; IP?: string }
+
+function toPublishedPorts(ports: RawPort[] | undefined): number[] {
+  if (!ports) return []
+  return dedupeSortedPorts(
+    ports.flatMap((p) => (p.PublicPort === undefined ? [] : [p.PublicPort])),
+  )
+}
+
 /** Maps the Docker API shape onto ContainerSummary. */
 export function toSummary(raw: {
   Names: string[]
   State: string
   Labels?: Record<string, string>
   Status?: string
+  Ports?: RawPort[]
 }): ContainerSummary {
   return {
     names: raw.Names,
     project: raw.Labels?.['com.docker.compose.project'] ?? null,
     state: raw.State,
     health: parseHealth(raw.Status),
+    publishedPorts: toPublishedPorts(raw.Ports),
   }
 }

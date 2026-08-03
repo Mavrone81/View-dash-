@@ -1,8 +1,9 @@
-import type { FleetSnapshot, HealthState, SystemState } from '@bevora-ops/shared'
+import type { FleetSnapshot, HealthState, ProbeOutcome, SystemState } from '@bevora-ops/shared'
+import { probeOutcomeToHealth } from '@bevora-ops/shared'
 import { discoverSystems, type ContainerSummary } from './docker.js'
 import { parseDeployLog } from './deploy-log.js'
 import { readGitState } from './git.js'
-import { worstOf } from './probe.js'
+import { hostnamesForSystem, worstOf } from './probe.js'
 
 export type CollectDeps = {
   listContainers: () => Promise<ContainerSummary[]>
@@ -25,10 +26,47 @@ export type CollectDeps = {
    * as `urlFor` -- with no URLs configured it is never called.
    */
   probe?: (url: string) => Promise<HealthState>
+  /**
+   * Every hostname the host's reverse-proxy config maps to each published
+   * container port, read ONCE per tick (not once per system) -- resolving a
+   * named `upstream` block may require every vhost file to have been seen
+   * first, see `discoverHostnamesByPort` in `agent/src/vhosts.ts`.
+   *
+   * Returns `null` when the vhost directory could not be read this tick
+   * (missing path, permission denied, whatever) -- see
+   * `agent/src/vhosts.ts`'s `readVhostDir` docstring for why an empty
+   * result and an unreadable directory must never be reported as the same
+   * fact. `null` here is deliberately NOT the same as an empty `Map`: an
+   * empty map means "read the config, found no vhosts for any port",
+   * whereas `null` means "did not read the config at all", and only the
+   * former is a real fact about the host worth acting on. Both result in no
+   * on-box probing this tick, which is the safe behaviour either way, but
+   * only `null` is worth a caller logging as a diagnostic failure -- see
+   * `agent/src/main.ts`.
+   *
+   * Optional, and absent in every deployment until a monitored host has a
+   * vhost path configured to read -- see `agent/src/config.ts`.
+   */
+  hostnamesByPort?: () => Promise<Map<number, string[]> | null>
+  /**
+   * Probes one hostname FROM the monitored host itself, through loopback
+   * (see `agent/src/probe.ts`'s `probeHostnameOnBox`). Optional for the
+   * same reason as `probe` above -- with no hostnames discovered for a
+   * system, it is never called for that system.
+   */
+  probeOnBoxHostname?: (hostname: string) => Promise<{ outcome: ProbeOutcome; status: number | null }>
 }
 
 export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot> {
   const discovered = discoverSystems(await deps.listContainers())
+
+  // Read the host's reverse-proxy config ONCE for the whole tick, not once
+  // per system: discoverHostnamesByPort needs every vhost file to resolve a
+  // named upstream block that may be declared in a different file than the
+  // vhost referencing it. `null` means the read failed -- see
+  // `hostnamesByPort`'s docstring on CollectDeps -- and must not be treated
+  // as "read successfully, found nothing".
+  const byPort = deps.hostnamesByPort ? await deps.hostnamesByPort() : null
 
   const systems: SystemState[] = await Promise.all(
     discovered.map(async (d): Promise<SystemState> => {
@@ -76,10 +114,68 @@ export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot>
         }
       }
 
+      // Which hostnames does THIS system's published ports resolve to, and
+      // does each one answer through loopback on the monitored host itself?
+      // This is separate from the `probed`/`urlFor` block above: that is an
+      // EXTERNAL probe of an operator-configured public URL; this is an
+      // ON-BOX probe of hostnames DERIVED from the host's own reverse-proxy
+      // config, requiring no configuration at all.
+      //
+      // A system with no published ports, or whose published ports match no
+      // vhost, legitimately has no HTTP surface -- `hostnamesForSystem`
+      // then returns `[]`, `onBoxHealth` stays `null`, and `worstOf` leaves
+      // the row exactly as the containers (and any URL probe) already
+      // describe it. That is the same "null means not probed, never means
+      // probed-and-clean" discipline `worstOf` already enforces above; see
+      // its docstring in agent/src/probe.ts.
+      //
+      // Concurrent across every hostname of this one system, each
+      // individually time-bounded by `probeHostnameOnBox`'s own abort (see
+      // `probeOnBoxHostname`'s wiring in agent/src/main.ts) -- and this
+      // whole block runs inside the same per-system `Promise.all` callback
+      // as everything else here, so it is also concurrent with every OTHER
+      // system's on-box probing. Total collection time stays the slowest
+      // single probe, never the sum of them all.
+      let onBoxHealth: HealthState | null = null
+      if (byPort && deps.probeOnBoxHostname) {
+        try {
+          const hostnames = hostnamesForSystem(d.publishedPorts, byPort)
+          const results = await Promise.all(
+            hostnames.map((h) =>
+              deps.probeOnBoxHostname!(h).catch(
+                // A configured probe function that REJECTS (rather than
+                // resolving with a failure outcome, which
+                // probeHostnameOnBox always does on its own) must still be
+                // treated as evidence of a broken hostname, not as an
+                // absence of one -- the same rule the URL probe above
+                // applies to a throwing `deps.probe`.
+                (): { outcome: ProbeOutcome; status: number | null } => ({ outcome: 'not-answering', status: null }),
+              ),
+            ),
+          )
+          for (const r of results) {
+            const h = probeOutcomeToHealth(r.outcome)
+            if (h !== null) onBoxHealth = onBoxHealth === null ? h : worstOf(onBoxHealth, h)
+          }
+        } catch {
+          // The `.catch()` above only guards a REJECTED promise. A
+          // `probeOnBoxHostname` that misbehaves badly enough to throw
+          // SYNCHRONOUSLY (never returning a promise at all, despite its
+          // declared type) would otherwise escape `.map()`/`Promise.all`
+          // uncaught and reject THIS SYSTEM'S whole promise -- which,
+          // unhandled here, would propagate out of the outer `Promise.all`
+          // in `collectSnapshot` and fail the ENTIRE snapshot for every
+          // system, not just this one. A probe must never throw into the
+          // collection loop; treated as `down`, the same as a URL probe
+          // that could not be reached at all.
+          onBoxHealth = 'down'
+        }
+      }
+
       return {
         key: d.key,
         displayName: d.displayName,
-        health: worstOf(d.health, probed),
+        health: worstOf(worstOf(d.health, probed), onBoxHealth),
         containers: d.containers,
         // A short sha from a log is not a valid 40-char wire sha; only the
         // git-resolved full sha is reported.

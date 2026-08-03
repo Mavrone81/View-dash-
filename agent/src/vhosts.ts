@@ -1,4 +1,5 @@
 import { join } from 'node:path'
+import { readdir as fsReaddir, readFile as fsReadFile } from 'node:fs/promises'
 
 /**
  * Derives which hostnames serve which system, by reading the host's
@@ -287,6 +288,34 @@ export type VhostFs = {
 }
 
 /**
+ * The production `VhostFs`, wired directly to `node:fs/promises`. This is
+ * the exact object handed to `readVhostDir` on a real host -- see
+ * `agent/src/main.ts` -- and it is deliberately NOT
+ * `readdir(dir, { withFileTypes: true })` filtered on `dirent.isFile()`,
+ * which looks like the more careful, "only list real files" version.
+ *
+ * `isFile()` returns false for a directory ENTRY that is itself a symlink,
+ * even when the symlink's TARGET is an ordinary file -- and every enabled
+ * vhost on the monitored host is a symlink into an adjacent `available`
+ * directory (the standard nginx `sites-available` / `sites-enabled` split).
+ * That filter would make `readdir` report zero entries, `readVhostDir`
+ * would return `[]`, and that is indistinguishable from "this host
+ * genuinely has no vhosts" -- the exact silent-empty-scan failure this
+ * module exists to prevent, reintroduced one call deeper than the `grep -r`
+ * bug it was originally written to fix.
+ *
+ * The plain `readdir(d)` below returns bare names with no per-entry type to
+ * wrongly filter on, and `readFile` follows the symlink itself when handed
+ * that name -- which is exactly what makes it correct here. See
+ * `vhosts.test.ts`'s "the production VhostFs" suite, which runs this exact
+ * object (not a lookalike lambda) through a real symlink.
+ */
+export const nodeVhostFs: VhostFs = {
+  readdir: (d) => fsReaddir(d),
+  readFile: (p) => fsReadFile(p, 'utf8'),
+}
+
+/**
  * Reads every vhost file in a directory.
  *
  * `readFile` follows symlinks; this is load-bearing rather than incidental.
@@ -326,6 +355,48 @@ export async function readVhostDir(dir: string, fs: VhostFs): Promise<Array<{ te
     }
   }
   return out
+}
+
+/**
+ * Checks whether the vhost directory can be listed at all, WITHOUT reading
+ * any file inside it.
+ *
+ * `readVhostDir` cannot make this distinction on its own -- see its
+ * docstring immediately above -- so a `[]` from `readVhostDir` is
+ * ambiguous between "this host genuinely has zero vhosts" and "the
+ * configured path is wrong, or unreadable, and nothing was actually
+ * scanned". Anything about to treat an empty `readVhostDir` result as "no
+ * HTTP surface" MUST call this first: `false` means the empty result is a
+ * diagnostic failure, not a fact about the host, and must not be reported
+ * as though it were -- see `agent/src/main.ts`'s `hostnamesByPort`.
+ */
+export async function isVhostDirReachable(dir: string, fs: Pick<VhostFs, 'readdir'>): Promise<boolean> {
+  try {
+    await fs.readdir(dir)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Composes `isVhostDirReachable` + `readVhostDir` + `discoverHostnamesByPort`
+ * into the single call `agent/src/collect.ts`'s `CollectDeps.hostnamesByPort`
+ * needs -- this is the actual seam that joins vhost discovery to the
+ * collection loop; see `agent/src/main.ts`.
+ *
+ * Returns `null`, NOT an empty `Map`, when the directory itself could not be
+ * listed. Collapsing "unreadable" into "empty" here would let a
+ * misconfigured or temporarily-inaccessible vhost path render as "no system
+ * on this host has an HTTP surface" -- a false claim about every system on
+ * the board, not merely a gap in one collection tick. See
+ * `isVhostDirReachable` and `readVhostDir`'s docstrings for the underlying
+ * ambiguity this composes around.
+ */
+export async function discoverHostnamesFromDir(dir: string, fs: VhostFs): Promise<Map<number, string[]> | null> {
+  if (!(await isVhostDirReachable(dir, fs))) return null
+  const files = await readVhostDir(dir, fs)
+  return discoverHostnamesByPort(files)
 }
 
 export function discoverHostnamesByPort(files: Array<{ text: string }>): Map<number, string[]> {
