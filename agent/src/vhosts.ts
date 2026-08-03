@@ -51,26 +51,67 @@ function stripComments(text: string): string {
 }
 
 /**
- * Extracts every `location <selector> { ... }` block from a server block's
- * text. The body is found by counting braces rather than a `[^}]*` regex,
- * because a location body can itself contain nested `{ }` (an `if`, a
- * second location) that a non-greedy match would stop at prematurely.
+ * Given the index just past an opening `{`, returns the body up to its
+ * matching `}` (found by counting brace depth, not by a `[^}]*` regex) and
+ * the index just past that closing brace. Shared by `extractLocations` and
+ * `extractServerBlocks`, whose bodies can each contain their own nested
+ * `{ }` -- an `if` or a second `location` inside a location, a second
+ * `server` block inside a file -- that a non-greedy match would stop at
+ * prematurely.
  */
+function balancedBody(text: string, bodyStart: number): { body: string; end: number } {
+  let depth = 1
+  let i = bodyStart
+  while (i < text.length && depth > 0) {
+    if (text[i] === '{') depth++
+    else if (text[i] === '}') depth--
+    i++
+  }
+  return { body: text.slice(bodyStart, i - 1), end: i }
+}
+
+/** Extracts every `location <selector> { ... }` block from a server block's text. */
 function extractLocations(text: string): Array<{ selector: string; body: string }> {
   const out: Array<{ selector: string; body: string }> = []
   const re = /location\s+([^{]+?)\s*\{/g
   let m: RegExpExecArray | null
   while ((m = re.exec(text)) !== null) {
     const selector = (m[1] ?? '').trim()
-    let depth = 1
-    let i = re.lastIndex
-    while (i < text.length && depth > 0) {
-      if (text[i] === '{') depth++
-      else if (text[i] === '}') depth--
-      i++
-    }
-    out.push({ selector, body: text.slice(re.lastIndex, i - 1) })
-    re.lastIndex = i
+    const { body, end } = balancedBody(text, re.lastIndex)
+    out.push({ selector, body })
+    re.lastIndex = end
+  }
+  return out
+}
+
+/**
+ * Extracts the interior of every top-level `server { ... }` block from a
+ * config file's text.
+ *
+ * A file is not the unit of parsing -- a server block is. 26 of 28 files on
+ * the live host contain more than one `server {` block (most commonly a
+ * bare port-80 redirect paired with the real TLS block), and 3 of those
+ * files declare a root location in each of two different blocks. Scanning
+ * a whole file as though it were one block -- as this module used to --
+ * takes the first root location found anywhere in the file and attaches
+ * every hostname in the file to it, including hostnames declared in a
+ * different block for a different backend. That is the same defect class
+ * as taking the first `proxy_pass` instead of the root location's: a
+ * hostname bound to a backend that does not serve it, so the board reports
+ * a system as answering because a different system's app replied.
+ *
+ * `\bserver\s*\{` will not match `server_name` (no `{` follows) or a
+ * `server 127.0.0.1:PORT;` line inside an `upstream` block (a digit, not
+ * `{`, follows), so only genuine server blocks are found.
+ */
+function extractServerBlocks(text: string): string[] {
+  const out: string[] = []
+  const re = /\bserver\s*\{/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    const { body, end } = balancedBody(text, re.lastIndex)
+    out.push(body)
+    re.lastIndex = end
   }
   return out
 }
@@ -107,6 +148,20 @@ function resolveProxyPort(body: string, upstreams: ReadonlyMap<string, number>):
  * Only the first loopback `server` line in a block is used: a pool fronting
  * more than one instance on one host is not this module's problem to solve,
  * it just needs one reachable member to probe.
+ *
+ * If the same upstream name is declared more than once across the provided
+ * files, the LAST declaration processed wins (plain `Map.set` semantics) --
+ * a deliberate, if arbitrary, choice: real nginx treats a duplicate
+ * `upstream` name as a config error and refuses to reload at all, so this
+ * situation should not exist on a live, currently-loaded config. The rule
+ * exists only so behaviour on a stale or mid-edit file is deterministic
+ * rather than order-dependent-by-accident.
+ *
+ * `[^}]*` (not brace-balanced, unlike `extractLocations` /
+ * `extractServerBlocks` above) is safe here because nginx's `upstream { }`
+ * grammar cannot itself contain a nested block -- only directives like
+ * `server`, `keepalive`, `least_conn;` -- so there is no inner `}` for a
+ * non-greedy match to stop at prematurely.
  */
 export function parseUpstreams(files: Array<{ text: string }>): Map<string, number> {
   const upstreams = new Map<string, number>()
@@ -122,15 +177,8 @@ export function parseUpstreams(files: Array<{ text: string }>): Map<string, numb
   return upstreams
 }
 
-/**
- * `upstreams` resolves any `proxy_pass http://NAME;` found in the root
- * location (see below); it defaults to empty so a single vhost can still be
- * parsed on its own, as the tests below do, with named-upstream references
- * simply reporting null rather than an error.
- */
-export function parseVhost(text: string, upstreams: ReadonlyMap<string, number> = new Map()): VhostEntry {
-  const clean = stripComments(text)
-
+/** The shared parsing logic for one already-isolated server block's interior text. */
+function parseBlockEntry(clean: string, upstreams: ReadonlyMap<string, number>): VhostEntry {
   const hostnames: string[] = []
   for (const m of clean.matchAll(/server_name\s+([^;]+);/g)) {
     for (const name of (m[1] ?? '').trim().split(/\s+/)) {
@@ -156,6 +204,37 @@ export function parseVhost(text: string, upstreams: ReadonlyMap<string, number> 
   return { hostnames, upstreamPort, listensTls: tls }
 }
 
+/**
+ * Parses ONE server block's text (the interior, or the whole `server { ... }`
+ * wrapper -- either works, since none of the regexes above care about the
+ * outer braces).
+ *
+ * `upstreams` has no default: an omitted argument is invisible at the call
+ * site, and a caller who forgets it would see every named-upstream vhost
+ * silently resolve to `upstreamPort: null` -- the same shape as a genuinely
+ * dead vhost, with nothing to distinguish the two. Requiring the argument
+ * forces every call site to make that decision visibly, even when the
+ * answer is "no upstreams exist here, pass an empty map."
+ *
+ * For text that may contain MORE THAN ONE server block, use
+ * `parseServerBlocks` instead -- see its docstring for why the file is not
+ * a safe unit to hand to this function.
+ */
+export function parseVhost(text: string, upstreams: ReadonlyMap<string, number>): VhostEntry {
+  return parseBlockEntry(stripComments(text), upstreams)
+}
+
+/**
+ * Parses every server block in a config file's text independently, so that
+ * `server_name`, `listen` and the root location found in one block can
+ * never be associated with another block's -- see `extractServerBlocks` for
+ * why the file as a whole is not a safe parsing unit.
+ */
+export function parseServerBlocks(text: string, upstreams: ReadonlyMap<string, number>): VhostEntry[] {
+  const clean = stripComments(text)
+  return extractServerBlocks(clean).map((block) => parseBlockEntry(block, upstreams))
+}
+
 export function discoverHostnamesByPort(files: Array<{ text: string }>): Map<number, string[]> {
   // Two passes over the same file list: upstream blocks may be declared in
   // a different file than the vhost that references them by name, so every
@@ -164,13 +243,14 @@ export function discoverHostnamesByPort(files: Array<{ text: string }>): Map<num
   const upstreams = parseUpstreams(files)
   const byPort = new Map<number, string[]>()
   for (const f of files) {
-    const v = parseVhost(f.text, upstreams)
-    // A vhost with no resolvable upstream is real and worth reporting
-    // elsewhere, but it maps to no system, so it contributes nothing here
-    // rather than being guessed onto one.
-    if (v.upstreamPort === null || v.hostnames.length === 0) continue
-    const existing = byPort.get(v.upstreamPort) ?? []
-    byPort.set(v.upstreamPort, [...existing, ...v.hostnames])
+    for (const v of parseServerBlocks(f.text, upstreams)) {
+      // A vhost with no resolvable upstream is real and worth reporting
+      // elsewhere, but it maps to no system, so it contributes nothing here
+      // rather than being guessed onto one.
+      if (v.upstreamPort === null || v.hostnames.length === 0) continue
+      const existing = byPort.get(v.upstreamPort) ?? []
+      byPort.set(v.upstreamPort, [...existing, ...v.hostnames])
+    }
   }
   return byPort
 }

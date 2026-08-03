@@ -76,10 +76,12 @@ export type ProbeOutcome = z.infer<typeof ProbeOutcomeSchema>
  *
  * INPUT DOMAIN: a real HTTP status from a COMPLETED response, nothing else.
  * A probe that never got a response — DNS failure, refused connection, TLS
- * rejection, timeout — must go to `classifyProbeFailure` instead, and every
- * caller in this repository does that. The distinction matters because this
- * function cannot represent "no answer": it is a ladder of comparisons over
- * a number, so it will cheerfully classify a value that is not a status at
+ * rejection, timeout — must go to `classifyProbeFailure` instead; that is
+ * the discipline every caller in this repository is expected to follow, not
+ * yet a fact any of them demonstrates, since neither function has a
+ * production caller today. The distinction matters because this function
+ * cannot represent "no answer": it is a ladder of comparisons over a
+ * number, so it will cheerfully classify a value that is not a status at
  * all. 0 and 199 fall through to `answering`; 1000 lands on `not-answering`.
  * Neither is reachable today, and neither is meaningful — do not add
  * validation to make them so, add it at the call site that produced a
