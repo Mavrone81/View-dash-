@@ -36,6 +36,40 @@ The second row is the reason for the design. Neither probe alone can produce it,
 
 The on-box probe also survives the case the external one cannot diagnose: when public DNS or the route is broken, it still reports that the application itself is healthy. The external probe earns its keep permanently the moment any system moves to another host.
 
+### 3.1 What "on-box" has to mean, corrected during implementation
+
+The on-box probe requests **`http://127.0.0.1:<published container port>/` with an explicit `Host` header** naming the vhost. It does not resolve the hostname, does not use TLS, and does not pass through the reverse proxy.
+
+This corrects the original design, which said the probe would reach each hostname "through loopback" but was implemented as an ordinary `https://<hostname>/` request. That version resolved through public DNS and traversed exactly the path a real visitor takes. Two things followed, and the second is fatal to the design rather than merely wrong:
+
+- One egress rule, resolver hiccup or CDN error would turn **every row on the board red at once** while every application was fine.
+- **Both probes measured the same path, so they could never disagree** — and their disagreement is the only thing the two-probe design buys. The table above would have been decorative.
+
+Addressing the container port directly also removes a second fault: the scheme no longer has to be guessed. The earlier version hardcoded `https://`, so a vhost serving plain HTTP — a stack deployed before its certificate exists, precisely the "probed the day it deploys" case §4 promises — collected a certificate mismatch from whichever server block owns 443 and rendered red while working perfectly.
+
+The `Host` header is required, not cosmetic: an application behind a name-based vhost may redirect or refuse a request that arrives without the name it expects.
+
+**And it cannot be sent with `fetch`.** `Host` is a forbidden header name in the WHATWG fetch specification, and Node's global `fetch` (undici) silently discards it — no error, no warning. Measured on Node 22:
+
+```
+global fetch      -> server saw  host: 127.0.0.1:<port>      (a non-forbidden header passed fine)
+node:http.request -> server saw  host: alpha.example.invalid
+```
+
+So the on-box probe uses `node:http.request`. This is recorded in the spec rather than left as a code comment because the failure is invisible from the calling side: the request succeeds, the header is simply not there, and an application doing host-based routing answers as its default tenant. A green row would then say nothing about the hostname it claims to describe.
+
+The first implementation shipped tests that injected a fake `fetch` and asserted on the headers *argument*. They passed. They pinned what was handed to the transport, never what reached the wire — so **any test for this property must exercise the real transport against a real listener** and assert on the received request. That requirement is part of the design, not an implementation detail.
+
+**Only probe a port that something vouches for.** A hostname-mapped port is safe by construction: it appears in the map only because a vhost proxies to it, so the reverse proxy is itself the evidence that the port is loopback-bound and speaks HTTP. A published port with no vhost carries no such evidence — it may be a database, a cache, a mail relay, a UDP service, or bound to a non-loopback address. Probing one is still worthwhile, because it catches a stack deployed before its vhost exists, but it is **evidence that can only be positive**.
+
+Precisely: for an unmapped port, **only `answering` counts. Every other outcome is `not-probed`** — failures, and unsuccessful answers alike.
+
+An earlier draft said "an answer counts, and a failure is `not-probed`", which was self-contradictory and the implementation reasonably followed the looser clause. It left a 5xx from an unmapped port able to redden a row. That is the same false red this rule exists to remove, because a 500 from a port nothing vouched for tells us only that *something* there speaks HTTP — not that the thing is this system's user-facing surface. A published metrics exporter or internal API returning 500 is an ordinary state of affairs, not an outage of the application the row describes.
+
+We never had grounds to expect an HTTP answer from that port at all. A good answer is a happy surprise worth recording; anything else is a question we had no right to ask, and its answer is not ours to interpret.
+
+One consequence worth stating plainly, because it changes what the second row of the table means: the on-box axis no longer exercises the reverse proxy at all. That makes the diagnosis **sharper**, not weaker. "App port answers, external fails" now isolates the fault to everything between the application and the visitor — the proxy, its configuration, TLS, DNS, the firewall — which is what that row was always trying to say.
+
 ## 4 · Discovery, not a maintained list
 
 The agent derives each system's hostnames by parsing the host's reverse-proxy configuration:

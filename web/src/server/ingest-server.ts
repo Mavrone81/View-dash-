@@ -5,6 +5,7 @@ import { authenticateAgent } from './auth-agent.js'
 import { handleSnapshotMessage } from './agent-socket.js'
 import { prisma } from '../lib/db.js'
 import { loadIngestServerConfig, type IngestServerConfig } from './ingest-server-config.js'
+import { startExternalProbeScheduler } from '../lib/probe-scheduler.js'
 
 const BEARER_PREFIX = 'Bearer '
 
@@ -202,10 +203,56 @@ async function handleMessage(
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const cfg = loadIngestServerConfig()
+/**
+ * Starts the real ingest process: the WebSocket listener AND the external
+ * probe scheduler, together -- exactly what production wants (see the
+ * self-start guard below, this function's one real caller).
+ *
+ * Split out and exported (fix round 1, Task 9 review, H3) specifically so a
+ * test can call it directly and observe both halves starting. Before this
+ * split, everything past the `import.meta.url` guard was unreachable from
+ * any test -- that guard is only ever true when this file is run as a
+ * script, which a unit test cannot arrange -- so commenting out
+ * `startExternalProbeScheduler()` below left all 826 tests passing and
+ * `tsc -b` clean. Combined with H2, the external probe could have been
+ * silently disabled entirely (a deploy that drops the one line that starts
+ * it) with nothing in CI or `deploy/verify-board.sh` noticing until an
+ * operator went looking -- and the board would degrade to exactly the
+ * "not yet confirmed" state the runbook teaches people to treat as normal
+ * for the first five minutes after a deploy, forever, not for five minutes.
+ *
+ * `scheduler` defaults to the real `startExternalProbeScheduler` and exists
+ * as a parameter ONLY so a test can substitute a spy in its place and
+ * assert it was called, without a real 30-second interval and real internet
+ * traffic running during the test. Production's one call site (the guard
+ * below) never passes anything -- see `ingest-server.test.ts`'s test
+ * against this exact function for the pinning this closes.
+ */
+export function startIngestProcess(
+  cfg: IngestServerConfig = loadIngestServerConfig(),
+  scheduler: () => () => void = startExternalProbeScheduler,
+): WebSocketServer {
   const wss = startIngestServer(cfg)
   wss.once('listening', () => {
     console.log(`[ingest-server] listening on ${cfg.host}:${cfg.port}`)
   })
+
+  // The external prober (Task 6-8) had no production caller until this line:
+  // nothing else in this codebase decides WHEN to run it or WHAT to probe.
+  // This process is the natural home for that decision, not `web`'s
+  // Next.js request server: it is already the long-running, standalone
+  // Node process on the dashboard host (see this file's own top-of-file
+  // docstring), it already imports `prisma` directly, and
+  // `deploy/README.md`'s deploy runbook already restarts BOTH `web` and
+  // `ingest` together on every deploy of this repo -- there would be no
+  // reason for that if `ingest` had nothing new to pick up here. See
+  // `web/src/lib/probe-scheduler.ts` for the cadence and overlap-guard
+  // reasoning; this is its one production call site.
+  scheduler()
+  console.log('[ingest-server] external probe scheduler started')
+  return wss
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  startIngestProcess()
 }

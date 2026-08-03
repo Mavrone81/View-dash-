@@ -7,9 +7,15 @@ Wants=network-online.target
 Type=simple
 # Runs on the MONITORED host (not the dashboard droplet). Reads the local
 # container runtime (via the Docker socket), deploy logs, and repo
-# checkouts on this host; opens exactly one OUTBOUND connection to the
-# dashboard's `ingest` listener and never binds a port of its own -- see
-# agent/src/transport.ts and agent/src/main.ts's own comments on this.
+# checkouts on this host; opens ONE outbound connection to the dashboard's
+# `ingest` listener (held open across ticks) PLUS, every tick, a loopback
+# HTTP connection to each system's own published port (the on-box probe --
+# see agent/src/probe.ts's httpOnBoxRequest). Never binds a listening port
+# of its own -- see agent/src/transport.ts and agent/src/main.ts's own
+# comments on this. RestrictAddressFamilies below already permits AF_INET,
+# so the on-box probe needs no hardening change; this comment is corrected
+# only so an auditor reasoning about this unit's egress from the comment
+# alone reaches the right conclusion.
 # `bevora-agent` is the unit name this file must be installed as
 # (`/etc/systemd/system/bevora-agent.service`) -- deploy/verify.sh and
 # this file's own [Install] section both assume it.
@@ -105,8 +111,9 @@ LockPersonality=true
 # Do not "restore" this directive without re-running the agent under it.
 # MemoryDenyWriteExecute=true   # incompatible with any V8/JIT runtime
 # AF_UNIX for the Docker socket; AF_INET/AF_INET6 for the outbound
-# WebSocket connection to the dashboard. Nothing else this agent does
-# needs any other address family.
+# WebSocket connection to the dashboard AND the on-box probe's loopback
+# HTTP connections (see this file's header comment). Nothing else this
+# agent does needs any other address family.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM

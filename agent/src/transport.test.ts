@@ -35,6 +35,7 @@ function makeConfig(over: Partial<AgentConfig> = {}): AgentConfig {
     // anything, and an empty map is also the real-deployment default.
     systemUrls: {},
     probeTimeoutMs: 5_000,
+    vhostDir: '/etc/nginx/sites-enabled',
     ...over,
   }
 }

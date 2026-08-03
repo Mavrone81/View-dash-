@@ -1,4 +1,5 @@
 import { HealthStateSchema, type HealthState } from '@bevora-ops/shared'
+import { BEAT_INTERVAL_MS } from './beats.js'
 
 // Derived, not duplicated: the set of health values this file recognises is
 // the SAME set `shared` defines as the wire contract. If `shared` ever gains
@@ -7,6 +8,19 @@ import { HealthStateSchema, type HealthState } from '@bevora-ops/shared'
 export type DisplayState = HealthState | 'stale'
 
 const KNOWN = new Set<string>(HealthStateSchema.options)
+
+/**
+ * Three missed collection cycles, derived from the agent's own tick interval
+ * (`BEAT_INTERVAL_MS`, 30s) rather than a bare literal -- the same coupling
+ * discipline `EXTERNAL_RESULT_STALE_AFTER_MS` (fleet-query.ts) already
+ * follows for the external axis's cadence. `displayState` below uses this as
+ * its default; `fleet-query.ts`'s `buildHostnameAnswers` imports THIS SAME
+ * constant (as `ON_BOX_STALE_AFTER_MS`) to gate the on-box axis, so a stale
+ * observation is refused as a live opinion identically in the State column
+ * and in the Answers column -- one number, not two that happen to agree
+ * today.
+ */
+export const DEFAULT_STALE_AFTER_MS = BEAT_INTERVAL_MS * 3
 
 /**
  * Derive what the dashboard should display for one system, given its most
@@ -46,17 +60,17 @@ const KNOWN = new Set<string>(HealthStateSchema.options)
  * An unrecognised health value is also `unknown`, never passed through
  * as-is: only known health values are allowed to reach the display.
  *
- * `staleAfterMs` defaults to 90 seconds: three missed 30-second collection
- * cycles. One missed collection is noise (a slow tick, a brief blip);
- * three in a row is a real signal that the agent has stopped reporting.
- * The comparison is strict `>`, so an observation exactly at the threshold
- * age is still considered fresh, not stale.
+ * `staleAfterMs` defaults to `DEFAULT_STALE_AFTER_MS` (90 seconds: three
+ * missed 30-second collection cycles). One missed collection is noise (a
+ * slow tick, a brief blip); three in a row is a real signal that the agent
+ * has stopped reporting. The comparison is strict `>`, so an observation
+ * exactly at the threshold age is still considered fresh, not stale.
  */
 export function displayState(
   receivedAt: Date | null,
   health: string,
   now: Date,
-  staleAfterMs = 90_000,
+  staleAfterMs = DEFAULT_STALE_AFTER_MS,
 ): DisplayState {
   if (!receivedAt) return 'unknown'
   const ageMs = now.getTime() - receivedAt.getTime()

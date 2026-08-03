@@ -43,6 +43,23 @@ export type AgentConfig = {
    */
   systemUrls: Record<string, string>
   probeTimeoutMs: number
+  /**
+   * Where the monitored host's ENABLED reverse-proxy vhosts live -- the
+   * nginx `sites-enabled` convention, which on the live host is entirely
+   * symlinks into an adjacent `sites-available` directory (see
+   * `agent/src/vhosts.ts`'s `nodeVhostFs` for why that matters).
+   *
+   * This is the one piece of config the on-box probe needs, and it is
+   * deliberately just a PATH, not a list of hostnames or systems: everything
+   * downstream of it is derived, which is the whole point of reading the
+   * proxy config instead of maintaining a list (see vhosts.ts's module
+   * docstring). Defaulted rather than required, so an agent on a host that
+   * genuinely has no nginx (or uses a different layout) still starts --
+   * `discoverVhostsFromDir` reports an unreachable directory as `null`
+   * and on-box probing is simply skipped, exactly like an unconfigured
+   * `AGENT_SYSTEM_URLS` skips the external probe.
+   */
+  vhostDir: string
 }
 
 /**
@@ -91,5 +108,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AgentConfig {
     intervalMs: Number(env.AGENT_INTERVAL_MS ?? 30_000),
     systemUrls: parseSystemUrls(env.AGENT_SYSTEM_URLS),
     probeTimeoutMs: Number(env.AGENT_PROBE_TIMEOUT_MS ?? DEFAULT_PROBE_TIMEOUT_MS),
+    vhostDir: env.AGENT_VHOST_DIR ?? '/etc/nginx/sites-enabled',
   }
 }

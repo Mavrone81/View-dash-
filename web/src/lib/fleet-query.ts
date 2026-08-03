@@ -1,8 +1,73 @@
-import { PrismaClient } from '@prisma/client'
+import { PrismaClient, Prisma } from '@prisma/client'
+import type { HostnameConfig, OnBoxProbeResult, ProbeOutcome } from '@bevora-ops/shared'
 import { prisma } from './db.js'
-import { displayState } from './staleness.js'
+import { displayState, DEFAULT_STALE_AFTER_MS } from './staleness.js'
 import { buildBeatTrace, BEAT_WINDOW_MS, type Beat } from './beats.js'
-import type { FleetRow } from '../components/FleetTable.js'
+import { combine, primaryHostname, type Axis, type Verdict } from './answers.js'
+import type { FleetRow, HostnameAnswer } from '../components/FleetTable.js'
+
+/**
+ * Final whole-branch review, C1: the on-box axis's own staleness ceiling --
+ * re-exported, NOT redefined, from `staleness.ts`'s `DEFAULT_STALE_AFTER_MS`
+ * (three missed 30-second agent ticks), for the identical reason
+ * `EXTERNAL_PROBE_INTERVAL_MS` below is imported rather than re-picked by
+ * Task 9's scheduler: a second `90_000` defined here, even one that happens
+ * to hold the same value today, would decouple this ceiling from
+ * `displayState`'s the moment either one is edited alone.
+ *
+ * Before this constant existed, `buildHostnameAnswers` gated the EXTERNAL
+ * axis on `EXTERNAL_RESULT_STALE_AFTER_MS` but read `onBoxProbes` at
+ * whatever age the stored observation happened to be, with no ceiling at
+ * all -- so an agent silent for 24 hours still produced a live-looking
+ * on-box opinion, and worse, a `route-broken` verdict that named the wrong
+ * fault (DNS/routing/certificate) when the far likelier truth, given that
+ * agent silence and app-unreachability share the same machine, is that the
+ * host itself is down. `EXTERNAL_RESULT_STALE_AFTER_MS`'s own docstring
+ * already claimed this file worked "exactly as `displayState` refuses to
+ * vouch for a stale on-box observation" -- true of the STATE column, never
+ * of this one, until this constant closed the gap.
+ */
+export const ON_BOX_STALE_AFTER_MS = DEFAULT_STALE_AFTER_MS
+
+/**
+ * Five minutes -- the external probe's own cadence (spec §5.1). Recorded
+ * here, not imported from Task 9's not-yet-written scheduler, so this file
+ * carries no dependency on work that has not landed; Task 9 MUST import
+ * THIS constant rather than choosing the number a second, independent time.
+ *
+ * TASK 9 OBLIGATION, recorded rather than enforced (fix round 2, Task 8
+ * review): nothing in this codebase stops Task 9's scheduler from picking
+ * its own interval instead of importing this one. If it does,
+ * `EXTERNAL_RESULT_STALE_AFTER_MS` below silently stops meaning "three
+ * missed cycles" -- it would just be a number that happens to be 15
+ * minutes, decoupled from whatever the real cadence turned out to be. The
+ * reviewer endorsed 15 minutes as the right ceiling for a 5-minute cadence;
+ * that reasoning only holds if the two constants are ever actually the same
+ * one.
+ */
+export const EXTERNAL_PROBE_INTERVAL_MS = 300_000
+
+/**
+ * Past this age, a stored external result is not merely old -- it is stale
+ * enough that treating it as a CURRENT opinion would be exactly the lie
+ * spec §5.1 exists to prevent: "an old result presented as current is the
+ * same lie this slice exists to remove." `buildHostnameAnswers` below
+ * refuses to feed a result older than this into `combine()`'s external
+ * axis -- and (final whole-branch review, C1) does the SAME for the on-box
+ * axis via `ON_BOX_STALE_AFTER_MS` above, so both axes now refuse to vouch
+ * for a stale observation exactly as `displayState` (staleness.ts) already
+ * refused to for the State column; before that fix this docstring's claim
+ * held for one axis, not both. THREE cadences (15 minutes): one or two
+ * missed cycles is ordinary cadence jitter; crossing three means the axis's
+ * silence is itself the signal, not a fluke tick.
+ *
+ * The RAW age is still always reported on `HostnameAnswer.externalAgeMs`
+ * regardless of this ceiling -- an operator can and should see "checked 9
+ * days ago" even though the board stops trusting that reading as a live
+ * opinion. This mirrors `lastSeenAt`/`deployedSha` elsewhere on this board:
+ * a historical fact stays visible even once it has stopped being current.
+ */
+export const EXTERNAL_RESULT_STALE_AFTER_MS = EXTERNAL_PROBE_INTERVAL_MS * 3
 
 // Shape of one row returned by the DISTINCT ON query below. Typed
 // explicitly against the SystemObservation columns it selects, so the raw
@@ -17,6 +82,92 @@ type LatestObservationRow = {
   deployedAt: Date | null
   driftCommits: number | null
   receivedAt: Date
+  // Raw JSONB, `Prisma.JsonValue` (effectively `unknown` at this boundary) --
+  // parsed by `parseHostnames`/`parseOnBoxProbes` below, which are the only
+  // places that trust the shape. NULL (a genuine SQL NULL, per
+  // ingest.ts/Task 5's own discipline) means "no opinion this tick", never
+  // "confirmed empty" -- see FleetRow.hostnames's docstring.
+  hostnames: Prisma.JsonValue
+  onBoxProbes: Prisma.JsonValue
+}
+
+/**
+ * `SystemObservation.hostnames`/`onBoxProbes` arrive from Postgres as
+ * `Prisma.JsonValue` (a union that includes `null`, objects, arrays...).
+ * These two functions are the ONLY place that casts them to the typed
+ * shapes `shared/src/wire.ts` defines -- the same trust boundary
+ * `latestExternalResultsByHostname` below already crosses with its own
+ * `r.outcome as ProbeOutcome` cast, extended here to a whole array: every
+ * row that reaches this column was written by `ingestSnapshot`, which
+ * validated the ENTIRE incoming payload against `FleetSnapshotSchema`
+ * before writing anything (see ingest.ts), so nothing malformed can be
+ * sitting in this column. `null` passes straight through -- it is not a
+ * parse failure, it is Task 5's own "no opinion" sentinel.
+ */
+function parseHostnames(raw: Prisma.JsonValue): HostnameConfig[] | null {
+  if (raw === null) return null
+  return raw as unknown as HostnameConfig[]
+}
+
+function parseOnBoxProbes(raw: Prisma.JsonValue): OnBoxProbeResult[] | null {
+  if (raw === null) return null
+  return raw as unknown as OnBoxProbeResult[]
+}
+
+/**
+ * How "worse" each `Verdict` (Task 7) is, for folding several hostnames'
+ * individual verdicts into ONE row-level answer (`FleetRow.verdict`).
+ *
+ * `healthy` is the only good outcome. `unprobed`/`unconfirmed` outrank it
+ * DELIBERATELY, even though neither is a fault: a row with one healthy
+ * hostname and one never-probed hostname must not read as a flat
+ * "healthy" summary, because that would assert something about the second
+ * hostname nobody has checked -- the same "claim only what the evidence
+ * supports" rule every other absence on this board follows. `contradiction`
+ * outranks the two definite-fault states because confused evidence (spec
+ * §3's "flagged, never guessed") is at least as urgent as a named one.
+ */
+const VERDICT_SEVERITY: Record<Verdict, number> = {
+  healthy: 0,
+  unprobed: 1,
+  unconfirmed: 2,
+  'route-broken': 3,
+  'app-down': 4,
+  contradiction: 5,
+}
+
+/**
+ * The WORST (highest-severity) of several verdicts -- see `VERDICT_SEVERITY`
+ * above. This is the mechanism behind spec §8's "one failing hostname on a
+ * multi-hostname system must not be averaged away into a green row":
+ * `primaryHostname()` picks a hostname that ANSWERS to show as the
+ * clickable URL, so using its verdict alone as the row's summary would let
+ * exactly that averaging happen. `worstVerdict` looks at every NAMED
+ * hostname this system has and reports the worst one, regardless of which
+ * hostname `primaryHostname()` chose to display. An empty input is
+ * `unprobed` -- there was nothing to check either axis against.
+ *
+ * Fix round 4 (Task 8 review), C1, stated here because it is this
+ * function's own contract, not just its caller's: an UNNAMED on-box probe
+ * (a published port with no vhost) NEVER contributes to this fold, in
+ * either direction. `worstVerdict` is a MAX, and a max-fold has no way to
+ * express "positive evidence that should not decide the outcome on its
+ * own" except by lowering the floor -- and lowering it below every absence
+ * state is exactly how one answering, unnamed port turned into an entire
+ * system's `healthy` verdict, for a system with no named hostnames at all.
+ * See `systemRow`'s own comment at the call site for the full history.
+ */
+export function worstVerdict(verdicts: Verdict[]): Verdict {
+  if (verdicts.length === 0) return 'unprobed'
+  return verdicts.reduce((worst, v) => (VERDICT_SEVERITY[v] > VERDICT_SEVERITY[worst] ? v : worst))
+}
+
+/** Builds the `Axis` `combine()` (Task 7) expects, or `null` when there is
+ * nothing to build one from -- kept as one place so every caller below
+ * expresses "no opinion" identically. */
+function toAxis(outcome: ProbeOutcome | undefined, status: number | null | undefined): Axis | null {
+  if (outcome === undefined) return null
+  return { outcome, status: status ?? null }
 }
 
 /** One row of the bounded beat-window fetch below. */
@@ -103,16 +254,79 @@ export const NO_SYSTEMS_LABEL = '(no systems reported yet)'
  *     token would previously have seen a board that looked completely
  *     normal.
  */
-export async function latestPerSystem(now: Date, client: PrismaClient = prisma): Promise<FleetRow[]> {
+/**
+ * The last recorded run of the external prober, whatever its outcome --
+ * see `ExternalProbeRun` in schema.prisma. `null` means no sweep has ever
+ * run (a fresh deploy, before Task 9's scheduler has fired once).
+ */
+export type LatestExternalProbeRun = { ranAt: Date; reachedAnything: boolean }
+
+/**
+ * Fix round 1 (Task 8 review), C2b: the fleet-wide banner used to be
+ * INFERRED from `isFleetWideExternalFailure` over
+ * `latestExternalResultsByHostname`'s per-hostname rows -- which have no
+ * time bound (Task 7a's rule keeps the previous good result as "latest"
+ * during an outage). Two applications failing three weeks apart could both
+ * read as "failing now", and the banner would announce a fleet-wide fault
+ * "this cycle" that never happened; meanwhile a REAL dashboard-network
+ * outage, which writes NOTHING to `ExternalProbeResult` (by the same rule),
+ * would produce no visible signal at all.
+ *
+ * `ExternalProbeRun` is written on every sweep, including one that reached
+ * nothing, specifically so this function has a single row to read instead
+ * of an inference over unrelated history.
+ */
+export async function latestExternalProbeRun(client: PrismaClient = prisma): Promise<LatestExternalProbeRun | null> {
+  const row = await client.externalProbeRun.findFirst({ orderBy: { ranAt: 'desc' } })
+  return row ? { ranAt: row.ranAt, reachedAnything: row.reachedAnything } : null
+}
+
+/**
+ * `latestPerSystem`'s result: the board's rows, plus the last external
+ * sweep's own status, computed ONCE for the whole fetch rather than per
+ * row -- it describes the dashboard's OWN probing, not any one system's
+ * state, so it does not belong on `FleetRow` itself.
+ */
+export type FleetBoard = {
+  rows: FleetRow[]
+  /**
+   * `null` when no external sweep has ever run. Otherwise, whether that
+   * sweep reached anything and how long ago (relative to `now`) it ran.
+   * Every row's own `verdict` already reflects the fallback this triggers
+   * when `reachedAnything` is false (the external axis is treated as
+   * absent, see `latestPerSystem`'s body) -- this field exists to drive the
+   * banner's text, not to change any row's colour a second time.
+   */
+  lastExternalSweep: { reachedAnything: boolean; ageMs: number } | null
+}
+
+export async function latestPerSystem(now: Date, client: PrismaClient = prisma): Promise<FleetBoard> {
+  // Independent of whether any host/system exists at all -- the sweep is a
+  // fact about the DASHBOARD's own probing, not about the fleet it probes.
+  const lastRun = await latestExternalProbeRun(client)
+  const lastExternalSweep = lastRun
+    ? { reachedAnything: lastRun.reachedAnything, ageMs: now.getTime() - lastRun.ranAt.getTime() }
+    : null
+  // Spec §9's fallback: while the last sweep reached nothing, every
+  // hostname's verdict is built as if the external axis were simply absent
+  // (`combine(onBox, null)`), which can only ever resolve to `unprobed` or
+  // `unconfirmed`, never a fault verdict -- so the guard's promise ("shows
+  // the on-box results ... does not turn every row red") holds by
+  // construction, not by a second, separate check.
+  const fleetWideFailure = lastRun !== null && !lastRun.reachedAnything
+
   // Hosts first, and ordered here, so the board's ordering is host-major
   // and stable regardless of what systems exist under each.
   const hosts = await client.host.findMany({ orderBy: { name: 'asc' } })
-  if (hosts.length === 0) return []
+  if (hosts.length === 0) return { rows: [], lastExternalSweep }
 
   const systems = await client.system.findMany({ orderBy: { key: 'asc' } })
   if (systems.length === 0) {
     // Every enrolled host, all of them awaiting a first report.
-    return hosts.map((h) => neverReportedRow(h.id, h.name, h.lastSeenAt))
+    return {
+      rows: hosts.map((h) => neverReportedRow(h.id, h.name, h.lastSeenAt)),
+      lastExternalSweep,
+    }
   }
 
   // Fetch exactly one observation row PER SYSTEM, in the database, via
@@ -137,7 +351,8 @@ export async function latestPerSystem(now: Date, client: PrismaClient = prisma):
   const observations = await client.$queryRaw<LatestObservationRow[]>`
     SELECT DISTINCT ON ("systemId")
       "systemId", "health", "containersTotal", "containersRunning",
-      "deployedSha", "deployedSubject", "deployedAt", "driftCommits", "receivedAt"
+      "deployedSha", "deployedSubject", "deployedAt", "driftCommits", "receivedAt",
+      "hostnames", "onBoxProbes"
     FROM "SystemObservation"
     WHERE "systemId" = ANY(${systemIds})
     ORDER BY "systemId", "receivedAt" DESC
@@ -148,6 +363,18 @@ export async function latestPerSystem(now: Date, client: PrismaClient = prisma):
   // query above: that query is bounded by system count, this one by a time
   // window, and neither can serve the other's purpose.
   const beatsBySystemId = await fetchRecentBeats(systemIds, now, client)
+
+  // The union of every hostname CURRENTLY configured across the whole
+  // fleet's latest observations -- fetched ONCE, batched, the same reason
+  // `fetchRecentBeats` above is batched rather than queried per system.
+  // Bounding `latestExternalResultsByHostname` (Task 7a) by exactly this
+  // set is what lets a retired hostname stop appearing on its own, with no
+  // retention pass -- see that function's own docstring.
+  const allHostnames = new Set<string>()
+  for (const o of observations) {
+    for (const h of parseHostnames(o.hostnames) ?? []) allHostnames.add(h.hostname)
+  }
+  const externalByHostname = await latestExternalResultsByHostname([...allHostnames], client)
 
   const byHostId = new Map<string, typeof systems>()
   for (const s of systems) {
@@ -168,10 +395,21 @@ export async function latestPerSystem(now: Date, client: PrismaClient = prisma):
       continue
     }
     for (const s of hostSystems) {
-      rows.push(systemRow(s, host.name, host.lastSeenAt, bySystemId.get(s.id) ?? null, beatsBySystemId.get(s.id) ?? [], now))
+      rows.push(
+        systemRow(
+          s,
+          host.name,
+          host.lastSeenAt,
+          bySystemId.get(s.id) ?? null,
+          beatsBySystemId.get(s.id) ?? [],
+          now,
+          externalByHostname,
+          fleetWideFailure,
+        ),
+      )
     }
   }
-  return rows
+  return { rows, lastExternalSweep }
 }
 
 /** A host that is enrolled but has never reported a single system. */
@@ -201,7 +439,154 @@ function neverReportedRow(hostId: string, hostName: string, lastSeenAt: Date | n
     // 40-slot array of `absent`, not an empty one). `FleetTable` renders an
     // em dash for the empty case, same as any other "nothing to show" field.
     beats: [],
+    // No system exists here at all, so there is nothing to have hostnames
+    // (`null`, not `[]` -- there is no observation to have confirmed an
+    // empty list from), no probes, no verdict beyond `unprobed`.
+    hostnames: null,
+    onBoxProbes: null,
+    primaryHostname: null,
+    verdict: 'unprobed',
+    leadHostnameAnswer: null,
+    tlsConfigured: null,
+    certDaysRemaining: null,
+    hostnameAnswers: [],
+    unnamedOnBoxProbes: [],
   }
+}
+
+/**
+ * Builds every named hostname's `HostnameAnswer`, this system's unnamed
+ * on-box probe results, its row-level `verdict` (spec §8, via
+ * `worstVerdict`), and the primary hostname's own flattened cert/TLS facts.
+ *
+ * `fleetWideFailure` -- when true, the EXTERNAL axis is treated as absent
+ * for every hostname, regardless of what `externalByHostname` actually
+ * holds. That is spec §9's fallback in code: a fleet-wide external failure
+ * must fall back to on-box evidence, not report the (almost certainly
+ * locally-caused) external failures as this system's own fault.
+ *
+ * Fix round 1 (Task 8 review), C3: a stored external result older than
+ * `EXTERNAL_RESULT_STALE_AFTER_MS` is likewise treated as NO CURRENT
+ * OPINION for REACHABILITY -- `externalOutcome` reads `null`, and
+ * `combine()` never sees its axis -- exactly the same "absent" treatment
+ * `fleetWideFailure` already gets. Without this, a result from nine days
+ * ago (a hostname the sweep has quietly stopped reaching) would still
+ * count as a live "healthy" opinion forever, which is precisely the lie
+ * spec §5.1 exists to remove. `externalAgeMs` is the one field that is
+ * NEVER nulled by staleness -- an operator must still be able to see
+ * "checked 9 days ago" even though the board itself stops trusting the
+ * content of that reading.
+ *
+ * Fix round 4 (Task 8 review), C2: `certExpiresAt`/`certDaysRemaining` are
+ * DELIBERATELY NOT part of that gate -- rounds 1-3 nulled them together
+ * with `externalOutcome`, which meant every certificate figure on the
+ * board vanished (fell to grey "not checked"/"no longer current") for the
+ * entire duration of a fleet-wide failure or any three missed cycles, the
+ * one window the column is least able to re-check anything. The asymmetry
+ * is deliberate and load-bearing: REACHABILITY can flip in either
+ * direction between two checks (an app that was down can come back, and
+ * vice versa), so a stale reachability reading genuinely cannot be trusted
+ * either way -- but a certificate's EXPIRY DATE can only ever move LATER
+ * (renewal) or stay the same; it never moves earlier. A stale reading of
+ * expiry can therefore only ever OVER-alarm (the cert may since have been
+ * renewed to a later date), never under-alarm (an expiry the board saw was
+ * 3 days out cannot have secretly become 30 days out on its own). Since
+ * over-alarming is the safe direction and under-alarming is the one this
+ * whole slice exists to prevent, suppressing the stale figure was the one
+ * direction that was actually unsafe. `certLabel` (FleetTable.tsx) states
+ * the reading's provenance explicitly whenever it is not current, so an
+ * old figure is never presented as a fresh one -- it is presented as
+ * exactly what it is: real, and possibly out of date.
+ *
+ * Fix round 5 (Task 8 review): round 4 named `certExpiresAt` specifically
+ * instead of stating the general rule, and missed the OTHER field sharing
+ * its property -- `externalOutcome === 'tls-failed'` (spec §7's three
+ * hostnames configured for TLS whose handshake fails) is EQUALLY
+ * monotone: a completed, failed handshake cannot silently become a
+ * passing one without an operator installing a valid certificate, so a
+ * stale `tls-failed` reading can only ever over-alarm, never under-alarm,
+ * for the identical reason expiry can. `certHandshakeFailed` below carries
+ * that one fact through ungated, the same way `certExpiresAt` is. Every
+ * OTHER value `externalOutcome` can take (`answering`, `not-answering`,
+ * `proxy-no-upstream`, `answering-oddly`) genuinely CAN flip in either
+ * direction between two checks and stays correctly gated -- `tls-failed`
+ * and `certExpiresAt`/`certDaysRemaining` are the ONLY two facts reached
+ * through this function that have the "cannot silently improve" property;
+ * this was a deliberate sweep for a third one, not an assumption.
+ */
+function buildHostnameAnswers(
+  hostnames: HostnameConfig[],
+  // Final whole-branch review, C1: the caller (`systemRow`) is responsible
+  // for gating this to `null` once the observation it came from is too old
+  // to trust as a live opinion (`ON_BOX_STALE_AFTER_MS`, mirroring
+  // `displayState`'s own staleness gate) -- see `systemRow`'s own comment at
+  // its call site. This function does not re-derive that gate itself:
+  // `systemRow` gates the SAME `onBoxProbes` value before it reaches BOTH
+  // this function and the unnamed-port list a few lines below in
+  // `systemRow`, so there is exactly one place that decides "is the on-box
+  // snapshot still current", not two that could disagree.
+  onBoxProbes: OnBoxProbeResult[] | null,
+  externalByHostname: Map<string, LatestExternalResult>,
+  fleetWideFailure: boolean,
+  now: Date,
+): HostnameAnswer[] {
+  return hostnames.map((h) => {
+    const onBoxEntry = onBoxProbes?.find((p) => p.hostname === h.hostname) ?? null
+    const onBoxAxis = onBoxEntry ? toAxis(onBoxEntry.outcome, onBoxEntry.status) : null
+
+    // Fix round 2 (Task 8 review), I1: `externalAgeMs` is read from the RAW
+    // map lookup, UNCONDITIONALLY -- age is an observed fact about when the
+    // last probe ran, independent of whether this tick's fleet-wide guard
+    // or staleness ceiling currently trusts its CONTENT. The previous
+    // version computed age from `external` AFTER it had already been forced
+    // to `undefined` by `fleetWideFailure`, so a result stored 4 minutes
+    // ago -- carrying a certificate 3 days from expiry -- rendered as
+    // "never checked externally" during a fleet-wide fallback, directly
+    // contradicting C3's own rule that age is the one field never nulled.
+    const rawExternal = externalByHostname.get(h.hostname)
+    const externalAgeMs = rawExternal ? now.getTime() - rawExternal.observedAt.getTime() : null
+
+    // The REACHABILITY content (axis) is what the fleet-wide guard and the
+    // staleness ceiling actually gate -- never the age above, and (fix
+    // round 4, C2) never the certificate figures below either.
+    const external = fleetWideFailure ? undefined : rawExternal
+    const externalIsCurrent = external !== undefined && externalAgeMs !== null && externalAgeMs <= EXTERNAL_RESULT_STALE_AFTER_MS
+
+    const externalAxis = externalIsCurrent ? toAxis(external.outcome, external.status) : null
+
+    // Fix round 4 (Task 8 review), C2: read from `rawExternal`, NOT
+    // `external` -- ungated by `fleetWideFailure` or the staleness ceiling,
+    // for the reasoning in this function's own docstring above (expiry only
+    // ever moves later, so a stale reading can only over-alarm).
+    const certExpiresAt = rawExternal?.certExpiresAt ?? null
+    const certDaysRemaining = certExpiresAt ? Math.floor((certExpiresAt.getTime() - now.getTime()) / 86_400_000) : null
+
+    // Fix round 5 (Task 8 review): the OTHER monotone fact this gate was
+    // still hiding. `externalOutcome` (below) correctly nulls under
+    // staleness/fleet-wide failure for every OTHER outcome -- reachability
+    // can flip in either direction between checks, so a stale `answering`,
+    // `not-answering`, or `proxy-no-upstream` reading genuinely cannot be
+    // trusted either way. But `'tls-failed'` shares `certExpiresAt`'s own
+    // property: a completed handshake that failed verification cannot
+    // silently become a PASSING one without an operator installing a valid
+    // certificate, so a stale `tls-failed` reading can only ever
+    // OVER-alarm (the operator may since have fixed it), never
+    // under-alarm. Read from `rawExternal`, same as `certExpiresAt`, so it
+    // survives exactly the same suppression.
+    const certHandshakeFailed = rawExternal?.outcome === 'tls-failed'
+
+    return {
+      hostname: h.hostname,
+      verdict: combine(onBoxAxis, externalAxis),
+      onBoxOutcome: onBoxAxis?.outcome ?? null,
+      externalOutcome: externalAxis?.outcome ?? null,
+      externalAgeMs,
+      listensTls: h.listensTls,
+      certExpiresAt,
+      certDaysRemaining,
+      certHandshakeFailed,
+    }
+  })
 }
 
 function systemRow(
@@ -211,7 +596,132 @@ function systemRow(
   o: LatestObservationRow | null,
   beats: Beat[],
   now: Date,
+  externalByHostname: Map<string, LatestExternalResult>,
+  fleetWideFailure: boolean,
 ): FleetRow {
+  const hostnames = o ? parseHostnames(o.hostnames) : null
+  const rawOnBoxProbes = o ? parseOnBoxProbes(o.onBoxProbes) : null
+
+  // Final whole-branch review, C1: treat the WHOLE on-box snapshot as absent
+  // once the observation it came from is too old to trust as a live
+  // opinion -- the on-box axis's own mirror of `displayState`'s staleness
+  // gate on the State column, via the SAME constant
+  // (`ON_BOX_STALE_AFTER_MS`, re-exported from `staleness.ts` so the two
+  // never drift apart). Before this fix, `onBoxProbes` was read at whatever
+  // age the stored observation happened to be, with no ceiling at all: an
+  // agent silent for 24 hours still produced a live-looking on-box
+  // `answering`, which combined with a FRESH external failure into
+  // `route-broken` ("app up, route broken") -- naming exactly the wrong
+  // fault, since agent silence and app-unreachability share a machine and
+  // the far likelier truth is that the HOST is down.
+  //
+  // Gated HERE, once, rather than inside `buildHostnameAnswers` alone,
+  // because `onBoxProbes` feeds TWO consumers below: the per-hostname axis
+  // that function folds into `verdict`, and the unnamed-port list
+  // (`unnamed`) a few lines down. An "answered on-box" claim about a port
+  // with no vhost is exactly as capable of misleading the operator once it
+  // is 24 hours stale as a named hostname's claim is, so both must see the
+  // SAME gated value rather than one being fixed and the other quietly
+  // exempt.
+  //
+  // A future `receivedAt` (a clock fault somewhere upstream) is ALSO
+  // treated as not-current, mirroring `displayState`'s own handling of a
+  // future receive time: a clock that could not honestly have produced this
+  // reading yet is not grounds to trust it as live.
+  //
+  // Fix round 2, Important 7 -- REVERSED a round-1 decision. Round 1 kept
+  // `FleetRow.onBoxProbes` itself (the return statement below) as
+  // `rawOnBoxProbes`, UNGATED, reasoning that its documented contract ("the
+  // raw, complete list") shouldn't change. Nothing reads that field directly
+  // today -- only `hostnameAnswers`/`unnamedOnBoxProbes`, both built from the
+  // GATED `currentOnBoxProbes` below, are ever rendered -- but that made it
+  // a landmine: a future renderer reading `FleetRow.onBoxProbes` directly
+  // would silently reintroduce this whole fix's Critical, with nothing in
+  // the type system or a test to catch it. `FleetRow.onBoxProbes` now
+  // carries `currentOnBoxProbes` too, so the SHAPE itself cannot express a
+  // stale on-box snapshot at all -- there is no ungated variant left for
+  // any future caller to reach for by mistake. See FleetTable.tsx's updated
+  // docstring on this field.
+  const onBoxAgeMs = o ? now.getTime() - o.receivedAt.getTime() : null
+  const onBoxIsCurrent = onBoxAgeMs !== null && onBoxAgeMs >= 0 && onBoxAgeMs <= ON_BOX_STALE_AFTER_MS
+  const currentOnBoxProbes = onBoxIsCurrent ? rawOnBoxProbes : null
+
+  const hostnameAnswers = buildHostnameAnswers(hostnames ?? [], currentOnBoxProbes, externalByHostname, fleetWideFailure, now)
+
+  // `hostname: null` entries are a published port with no vhost mapping --
+  // Task 5's positive "a port with no name answered" fact, not tied to any
+  // named hostname so it cannot enter `hostnameAnswers` above.
+  //
+  // Fix round 2 (Task 8 review), C2 -- corrected claim: an earlier version
+  // of this comment asserted that feeding EVERY unnamed entry through
+  // `combine(axis, null)` "cannot distort the result either way". That was
+  // false, and the render disproved it: `combine(answeringAxis, null)` is
+  // `unconfirmed` (an opinion on one axis, none on the other) and
+  // `combine(notProbedAxis, null)` -- since `not-probed` has NO opinion --
+  // is `unprobed`. Both outrank `healthy` in `VERDICT_SEVERITY`, so folding
+  // either into `worstVerdict` alongside a genuinely healthy NAMED hostname
+  // DOWNGRADED the row -- a silent unmapped database/cache/exporter port
+  // (common on a multi-stack host) could drag a fully healthy system down
+  // to `unprobed` or `unconfirmed`.
+  //
+  // Fix round 2's OWN chosen fix was ALSO wrong, and round 4's review found
+  // it: it made an `answering` unmapped entry contribute the string
+  // `'healthy'` to the array `worstVerdict` folds over. That comment argued
+  // correctly that `'healthy'` (severity 0, the floor) "can never make
+  // `worstVerdict` read worse" -- true, and it is exactly the wrong half of
+  // the argument, because `worstVerdict` is a MAX over its input, and a
+  // system with NO NAMED HOSTNAMES AT ALL has nothing else in that array.
+  // `worstVerdict(['healthy'])` is `'healthy'` -- the synthesized entry
+  // becomes the ENTIRE row's verdict, on the strength of one port spec
+  // §3.1 says "may be a database, a cache, a mail relay, a UDP service",
+  // for a system the row's own URL column calls "no HTTP surface" and whose
+  // external axis has never run. Spec §2: "a row is green only when the
+  // application answers." A max-fold cannot express "positive but
+  // non-dispositive evidence" by lowering its floor -- lowering it BELOW
+  // every absence state (`unprobed`/`unconfirmed`, severity 1/2) is exactly
+  // what manufactures a false green out of nothing.
+  //
+  // The fix: an unmapped port's result contributes NOTHING to `verdict`,
+  // ever, regardless of outcome. It is not thrown away -- `unnamedOnBoxProbes`
+  // below still carries it, and `AnswersCell` (FleetTable.tsx) prints "a
+  // port with no name answered on-box (N)" independently of `verdict` --
+  // but a fact that can only be positive must never be allowed to BECOME
+  // the verdict on its own; it may only ever fail to move one.
+  const unnamed = (currentOnBoxProbes ?? []).filter((p) => p.hostname === null)
+
+  const verdict = worstVerdict(hostnameAnswers.map((h) => h.verdict))
+
+  // Fix round 1 (Task 8 review), I2: the Answers cell's parenthetical
+  // detail (spec §5's "proxy up, app not responding" / "TLS handshake
+  // failed") must come from the hostname that actually PRODUCED the row's
+  // worst verdict, never from `primaryAnswer` below -- `primaryHostname()`
+  // prefers a hostname that ANSWERS, so the two can disagree, and reading
+  // the detail off the wrong one produces a sentence that contradicts
+  // itself ("contradiction -- unreachable on-box, answering from outside
+  // (proxy up, app not responding)" when the PRIMARY hostname, not the one
+  // in contradiction, happened to see a 502). `null` when no NAMED hostname
+  // reaches the row's worst severity -- i.e. the worst verdict came from an
+  // unnamed on-box probe instead, which has no hostname to attribute a
+  // detail to.
+  const leadHostnameAnswer = hostnameAnswers.find((h) => h.verdict === verdict) ?? null
+
+  // The clickable URL prefers a hostname that ANSWERS (see
+  // `primaryHostname`'s own docstring) -- built from whichever axis has an
+  // opinion, external preferred, since that is the path a real visitor
+  // takes. A hostname with neither axis's opinion is simply absent from
+  // this map, which `primaryHostname` treats identically to an explicit
+  // non-answering entry.
+  const outcomeForPrimary = new Map<string, ProbeOutcome>()
+  for (const h of hostnameAnswers) {
+    const outcome = h.externalOutcome ?? h.onBoxOutcome
+    if (outcome) outcomeForPrimary.set(h.hostname, outcome)
+  }
+  const primary = primaryHostname(
+    hostnameAnswers.map((h) => h.hostname),
+    outcomeForPrimary,
+  )
+  const primaryAnswer = hostnameAnswers.find((h) => h.hostname === primary) ?? null
+
   return {
     // Host-scoped, because `key` alone is not unique across hosts.
     id: `${s.hostId}:${s.key}`,
@@ -244,5 +754,82 @@ function systemRow(
     // becomes a full trace of `absent`, not an empty array. An empty array
     // here is reserved for the "no system exists" placeholder row.
     beats,
+    hostnames,
+    onBoxProbes: currentOnBoxProbes,
+    primaryHostname: primary,
+    verdict,
+    leadHostnameAnswer,
+    tlsConfigured: primaryAnswer?.listensTls ?? null,
+    certDaysRemaining: primaryAnswer?.certDaysRemaining ?? null,
+    hostnameAnswers,
+    unnamedOnBoxProbes: unnamed.filter((p) => p.outcome === 'answering'),
   }
+}
+
+/**
+ * One hostname's most recent external probe result -- the second axis
+ * Task 7's `combine` consumes, and the row Task 8's board join reads.
+ * `outcome` is typed as the shared `ProbeOutcome` (not left as the raw
+ * `string` the column stores) because every value ever written here comes
+ * from `probeExternally` (Task 6), whose result is already constrained to
+ * that type -- see `external-probe-runner.ts`.
+ */
+export type LatestExternalResult = {
+  hostname: string
+  outcome: ProbeOutcome
+  status: number | null
+  certExpiresAt: Date | null
+  observedAt: Date
+}
+
+/** Raw shape `$queryRaw` returns, before the `outcome` cast above. */
+type LatestExternalResultRow = {
+  hostname: string
+  outcome: string
+  status: number | null
+  certExpiresAt: Date | null
+  observedAt: Date
+}
+
+/**
+ * The latest `ExternalProbeResult` row for each of the given hostnames,
+ * via the same `DISTINCT ON` shape `latestPerSystem` above uses for
+ * `SystemObservation` -- and for the identical reason: `ExternalProbeResult`
+ * is a history (a fresh row is INSERTED every probe run, never updated in
+ * place, so a result can persist and age across restarts -- see its own
+ * docstring in schema.prisma), so "the latest result" must be a query, not
+ * a row identity, and it must be one Postgres can serve via the
+ * `[hostname, observedAt]` index rather than by scanning every historical
+ * row for every hostname and slicing afterwards.
+ *
+ * DELIBERATELY bounded by the caller's own `hostnames` list, the same way
+ * `latestPerSystem` bounds its beat fetch by the CURRENT `systemIds`
+ * rather than every system id that ever existed. This is what answers the
+ * question of what happens when a hostname stops being served: its rows
+ * are never deleted (no retention is built by this task -- see
+ * `external-probe-runner.ts`'s report), so left unbounded, its last result
+ * WOULD read as newest forever, on a hostname nothing serves any more. By
+ * requiring the caller to pass the CURRENTLY discovered hostname set
+ * (e.g. from the latest `SystemObservation.hostnames`), a retired
+ * hostname simply stops appearing in the argument and therefore stops
+ * appearing in the result -- the stale row is still on disk, but nothing
+ * ever asks for it again. That is a caller-side filter, not a database
+ * one: this function does not know which hostnames are current, it only
+ * knows how to fetch the latest result for whichever ones it is asked
+ * about.
+ */
+export async function latestExternalResultsByHostname(
+  hostnames: string[],
+  client: PrismaClient = prisma,
+): Promise<Map<string, LatestExternalResult>> {
+  if (hostnames.length === 0) return new Map()
+
+  const rows = await client.$queryRaw<LatestExternalResultRow[]>`
+    SELECT DISTINCT ON ("hostname")
+      "hostname", "outcome", "status", "certExpiresAt", "observedAt"
+    FROM "ExternalProbeResult"
+    WHERE "hostname" = ANY(${hostnames})
+    ORDER BY "hostname", "observedAt" DESC
+  `
+  return new Map(rows.map((r) => [r.hostname, { ...r, outcome: r.outcome as ProbeOutcome }]))
 }

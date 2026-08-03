@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import { discoverSystems, toSummary } from './docker.js'
 
-const c = (project: string | null, state: string, health: string | null = null) =>
-  ({ names: ['/x'], project, state, health })
+const c = (project: string | null, state: string, health: string | null = null, publishedPorts: number[] = []) =>
+  ({ names: ['/x'], project, state, health, publishedPorts })
 
 describe('discoverSystems', () => {
   it('groups containers by compose project', () => {
@@ -48,6 +48,17 @@ describe('discoverSystems', () => {
   it('returns systems sorted by key regardless of input order', () => {
     const out = discoverSystems([c('zeta', 'running'), c('alpha', 'running'), c('mid', 'running')])
     expect(out.map((s) => s.key)).toEqual(['alpha', 'mid', 'zeta'])
+  })
+
+  it('unions published ports across every container in the same system, deduplicated', () => {
+    // A compose project's web and worker containers can each publish their
+    // own port; a hostname mapped to either must reach this one system.
+    const out = discoverSystems([c('a', 'running', null, [8081]), c('a', 'running', null, [8081, 9001])])
+    expect(out[0]!.publishedPorts).toEqual([8081, 9001])
+  })
+
+  it('reports no published ports for a system whose containers publish none', () => {
+    expect(discoverSystems([c('a', 'running')])[0]!.publishedPorts).toEqual([])
   })
 })
 
@@ -102,5 +113,91 @@ describe('toSummary', () => {
     const out = toSummary({ Names: ['/beta-web-1'], State: 'exited', Status: 'Exited (0) 3 minutes ago' })
     expect(out.names).toEqual(['/beta-web-1'])
     expect(out.state).toBe('exited')
+  })
+
+  it('reports no published ports when Ports is absent', () => {
+    expect(toSummary(raw('Up 2 hours')).publishedPorts).toEqual([])
+  })
+
+  it('keeps only entries that carry a PublicPort, dropping an internal-only port', () => {
+    // A port with no PublicPort is not reachable from outside the daemon at
+    // all -- attaching a hostname to it would be worse than reporting none,
+    // because nothing a probe does could ever reach it.
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [
+        { PrivatePort: 80, PublicPort: 8088, Type: 'tcp' },
+        { PrivatePort: 9000, Type: 'tcp' }, // internal only -- no PublicPort
+      ],
+    })
+    expect(out.publishedPorts).toEqual([8088])
+  })
+
+  it('deduplicates a PublicPort reported twice, once per IPv4 and IPv6 host binding', () => {
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [
+        { IP: '0.0.0.0', PrivatePort: 80, PublicPort: 8088, Type: 'tcp' },
+        { IP: '::', PrivatePort: 80, PublicPort: 8088, Type: 'tcp' },
+      ],
+    })
+    expect(out.publishedPorts).toEqual([8088])
+  })
+
+  // Fix round 2, C2: an unmapped published port is now probed on-box with
+  // no evidence from nginx that it is loopback-bound TCP HTTP -- these two
+  // filters are what makes that safe. Measured against real listeners: a
+  // line-protocol service on a UDP-shaped port threw HPE_INVALID_CONSTANT,
+  // and a silent TCP one burned the full probe timeout every tick before
+  // ECONNREFUSED/AbortError -- both would render a perfectly healthy
+  // database/cache/mail-relay/UDP stack permanently down.
+  it('drops a udp port entirely -- an HTTP probe cannot even open a TCP connection to one', () => {
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [{ IP: '0.0.0.0', PrivatePort: 53, PublicPort: 8053, Type: 'udp' }],
+    })
+    expect(out.publishedPorts).toEqual([])
+  })
+
+  it('drops a port bound to a specific non-loopback address -- 127.0.0.1 on THIS host cannot reach it', () => {
+    // Docker's userland proxy / iptables rule for a port bound to one
+    // specific address only forwards traffic that arrives at THAT address;
+    // dialing 127.0.0.1 for a port published at, say, a droplet's own
+    // public IP gets a plain connection refusal regardless of the
+    // container's health.
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [{ IP: '203.0.113.5', PrivatePort: 80, PublicPort: 8080, Type: 'tcp' }],
+    })
+    expect(out.publishedPorts).toEqual([])
+  })
+
+  it('keeps a port explicitly bound to 127.0.0.1', () => {
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [{ IP: '127.0.0.1', PrivatePort: 80, PublicPort: 8080, Type: 'tcp' }],
+    })
+    expect(out.publishedPorts).toEqual([8080])
+  })
+
+  // Its own case, on its own port: the only other place '::' appeared
+  // (the IPv4/IPv6 dedup test above) always paired it with a '0.0.0.0' row
+  // for the SAME port, so removing '::' from LOOPBACK_REACHABLE_IPS entirely
+  // would still leave that other test green (0.0.0.0 alone already keeps
+  // the port). This is the case that actually needs '::' to be reachable.
+  it('keeps a port bound only to :: (all interfaces, IPv6), with no accompanying 0.0.0.0 row', () => {
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [{ IP: '::', PrivatePort: 80, PublicPort: 8080, Type: 'tcp' }],
+    })
+    expect(out.publishedPorts).toEqual([8080])
+  })
+
+  it('keeps a tcp port with no IP reported at all, the same as 0.0.0.0', () => {
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [{ PrivatePort: 80, PublicPort: 8080, Type: 'tcp' }],
+    })
+    expect(out.publishedPorts).toEqual([8080])
   })
 })

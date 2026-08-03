@@ -1,7 +1,18 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { PrismaClient, type Prisma } from '@prisma/client'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { prisma } from './db.js'
-import { latestPerSystem, NO_SYSTEMS_LABEL } from './fleet-query.js'
+import {
+  latestPerSystem,
+  latestExternalResultsByHostname,
+  latestExternalProbeRun,
+  worstVerdict,
+  NO_SYSTEMS_LABEL,
+  EXTERNAL_RESULT_STALE_AFTER_MS,
+  ON_BOX_STALE_AFTER_MS,
+} from './fleet-query.js'
+import { DEFAULT_STALE_AFTER_MS } from './staleness.js'
 import { BEAT_COUNT, BEAT_INTERVAL_MS } from './beats.js'
 
 beforeEach(async () => {
@@ -9,6 +20,29 @@ beforeEach(async () => {
   await prisma.system.deleteMany()
   await prisma.agentEnrolment.deleteMany()
   await prisma.host.deleteMany()
+  await prisma.externalProbeResult.deleteMany()
+  await prisma.externalProbeRun.deleteMany()
+})
+
+// Final whole-branch review, fix round 2, Important 6 -- GOVERNANCE, not
+// behavioural, same reasoning as `probe-scheduler.test.ts`'s sibling test
+// and `staleness.test.ts`'s new one for `DEFAULT_STALE_AFTER_MS` itself:
+// value equality alone would still pass if this file redefined its own
+// `90_000`. The source check confirms `ON_BOX_STALE_AFTER_MS` is an IMPORT
+// of `staleness.ts`'s constant, not an independent literal that merely
+// agrees with it today.
+describe('ON_BOX_STALE_AFTER_MS is imported from staleness.ts, not redefined', () => {
+  it('is numerically identical to staleness.ts\'s DEFAULT_STALE_AFTER_MS', () => {
+    expect(ON_BOX_STALE_AFTER_MS).toBe(DEFAULT_STALE_AFTER_MS)
+  })
+
+  it('is an import from staleness.ts in the source, and defines no numeric literal of its own', () => {
+    const path = fileURLToPath(new URL('./fleet-query.ts', import.meta.url))
+    const source = readFileSync(path, 'utf8')
+    expect(source).toMatch(/DEFAULT_STALE_AFTER_MS \} from '\.\/staleness\.js'/)
+    expect(source).toMatch(/export const ON_BOX_STALE_AFTER_MS = DEFAULT_STALE_AFTER_MS/)
+    expect(source).not.toMatch(/ON_BOX_STALE_AFTER_MS\s*=\s*90[_,]?000\b/)
+  })
 })
 
 describe('latestPerSystem', () => {
@@ -47,7 +81,7 @@ describe('latestPerSystem', () => {
       },
     })
 
-    const rows = await latestPerSystem(new Date('2026-08-01T10:05:30Z'))
+    const { rows } = await latestPerSystem(new Date('2026-08-01T10:05:30Z'))
 
     expect(rows).toHaveLength(1)
     // Non-null: exactly one row was just asserted above.
@@ -75,7 +109,7 @@ describe('latestPerSystem', () => {
       },
     })
 
-    const rows = await latestPerSystem(now)
+    const { rows } = await latestPerSystem(now)
 
     expect(rows).toHaveLength(1)
     // Non-null: exactly one row was just asserted above.
@@ -101,7 +135,7 @@ describe('latestPerSystem', () => {
       },
     })
 
-    const rows = await latestPerSystem(now)
+    const { rows } = await latestPerSystem(now)
 
     expect(rows).toHaveLength(1)
     // Non-null: exactly one row was just asserted above.
@@ -115,7 +149,7 @@ describe('latestPerSystem', () => {
       data: { hostId: host.id, key: 'sys-empty', displayName: 'sys-empty' },
     })
 
-    const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+    const { rows } = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
 
     expect(rows).toHaveLength(1)
     // Non-null: exactly one row was just asserted above.
@@ -147,7 +181,7 @@ describe('latestPerSystem', () => {
       },
     })
 
-    const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+    const { rows } = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
 
     expect(rows).toHaveLength(1)
     // Non-null: exactly one row was just asserted above.
@@ -157,7 +191,7 @@ describe('latestPerSystem', () => {
   })
 
   it('returns an empty list, not an error, when no systems are enrolled', async () => {
-    const rows = await latestPerSystem(new Date())
+    const { rows } = await latestPerSystem(new Date())
     expect(rows).toEqual([])
   })
 
@@ -217,7 +251,7 @@ describe('latestPerSystem', () => {
       })
       expect(totalStored).toBe(systemCount * observationsPerSystem)
 
-      const rows = await latestPerSystem(base, logging)
+      const { rows } = await latestPerSystem(base, logging)
 
       expect(rows).toHaveLength(systemCount)
 
@@ -262,7 +296,7 @@ describe('latestPerSystem', () => {
         await prisma.system.create({ data: { hostId: h.id, key: 'web', displayName: 'web' } })
       }
 
-      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+      const { rows } = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
 
       expect(rows).toHaveLength(2)
       expect(rows.map((r) => r.hostName).sort()).toEqual(['host-alpha', 'host-bravo'])
@@ -280,7 +314,7 @@ describe('latestPerSystem', () => {
       // fleet.
       await prisma.host.create({ data: { name: 'host-silent' } })
 
-      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+      const { rows } = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
 
       expect(rows).toHaveLength(1)
       expect(rows[0]!.hostName).toBe('host-silent')
@@ -308,7 +342,7 @@ describe('latestPerSystem', () => {
         },
       })
 
-      const rows = await latestPerSystem(now)
+      const { rows } = await latestPerSystem(now)
 
       expect(rows.map((r) => r.hostName).sort()).toEqual(['host-live', 'host-silent'])
       expect(rows.find((r) => r.hostName === 'host-silent')!.state).toBe('unknown')
@@ -322,7 +356,7 @@ describe('latestPerSystem', () => {
       const lastSeen = new Date('2026-08-01T10:07:00Z')
       await prisma.host.create({ data: { name: 'host-quiet', lastSeenAt: lastSeen } })
 
-      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+      const { rows } = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
 
       expect(rows[0]!.lastSeenAt).toEqual(lastSeen)
     })
@@ -337,7 +371,7 @@ describe('latestPerSystem', () => {
       const host = await prisma.host.create({ data: { name: 'host-tracked', lastSeenAt: lastSeen } })
       await prisma.system.create({ data: { hostId: host.id, key: 'web', displayName: 'web' } })
 
-      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+      const { rows } = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
 
       expect(rows).toHaveLength(1)
       expect(rows[0]!.key).toBe('web')
@@ -351,7 +385,7 @@ describe('latestPerSystem', () => {
       await prisma.system.create({ data: { hostId: hostB.id, key: 'aaa', displayName: 'aaa' } })
       await prisma.system.create({ data: { hostId: hostA.id, key: 'zzz', displayName: 'zzz' } })
 
-      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+      const { rows } = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
 
       // Host-major: alpha's `zzz` precedes bravo's `aaa`. A system-key sort
       // would put them the other way round and interleave the machines.
@@ -380,7 +414,7 @@ describe('latestPerSystem', () => {
         })
       }
 
-      const rows = await latestPerSystem(now)
+      const { rows } = await latestPerSystem(now)
 
       expect(rows).toHaveLength(1)
       const beats = rows[0]!.beats
@@ -404,7 +438,7 @@ describe('latestPerSystem', () => {
         })
       }
 
-      const rows = await latestPerSystem(now)
+      const { rows } = await latestPerSystem(now)
 
       expect(rows).toHaveLength(1)
       const beats = rows[0]!.beats
@@ -422,7 +456,7 @@ describe('latestPerSystem', () => {
         data: { systemId: system.id, receivedAt: new Date(now.getTime() - 30_000), health: 'down', containersTotal: 1, containersRunning: 0 },
       })
 
-      const rows = await latestPerSystem(now)
+      const { rows } = await latestPerSystem(now)
 
       expect(rows[0]!.beats.filter((b) => b.state === 'alarm')).toHaveLength(1)
       expect(rows[0]!.beats.filter((b) => b.state === 'good')).toHaveLength(0)
@@ -431,7 +465,7 @@ describe('latestPerSystem', () => {
     it('gives an enrolled-but-never-reported host row an empty beat list, not a fabricated full trace', async () => {
       await prisma.host.create({ data: { name: 'host-notrace' } })
 
-      const rows = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
+      const { rows } = await latestPerSystem(new Date('2026-08-01T12:00:00Z'))
 
       expect(rows).toHaveLength(1)
       expect(rows[0]!.beats).toEqual([])
@@ -451,7 +485,7 @@ describe('latestPerSystem', () => {
         data: { systemId: system.id, receivedAt: new Date(now.getTime() - 30 * 60_000), health: 'healthy', containersTotal: 1, containersRunning: 1 },
       })
 
-      const rows = await latestPerSystem(now)
+      const { rows } = await latestPerSystem(now)
 
       expect(rows).toHaveLength(1)
       // The row's own STATE still comes from the single-latest-row query, so
@@ -506,7 +540,7 @@ describe('latestPerSystem', () => {
         const totalStored = await prisma.systemObservation.count({ where: { systemId: system.id } })
         expect(totalStored).toBe(oldRowCount + recentRowCount)
 
-        const rows = await latestPerSystem(now, logging)
+        const { rows } = await latestPerSystem(now, logging)
         expect(rows).toHaveLength(1)
 
         // Directly measure the row volume the beat fetch pulls: a query
@@ -535,5 +569,1108 @@ describe('latestPerSystem', () => {
         await logging.$disconnect()
       }
     })
+  })
+
+  describe('latestExternalResultsByHostname', () => {
+    const HOST_X = 'fq-external-x.example.invalid'
+    const HOST_Y = 'fq-external-y.example.invalid'
+    const HOST_RETIRED = 'fq-external-retired.example.invalid'
+
+    it('returns the most recently OBSERVED row per hostname, not the most recently inserted one', async () => {
+      // Two rows for the same hostname, inserted in one order but observed
+      // in the other -- if this read picked "last inserted" rather than
+      // "greatest observedAt", it would report the stale result as latest.
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_X, outcome: 'not-answering', status: null, observedAt: new Date('2026-08-03T09:00:00Z') },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_X, outcome: 'answering', status: 200, observedAt: new Date('2026-08-03T08:00:00Z') },
+      })
+
+      const result = await latestExternalResultsByHostname([HOST_X])
+
+      expect(result.size).toBe(1)
+      expect(result.get(HOST_X)?.outcome).toBe('not-answering')
+      expect(result.get(HOST_X)?.observedAt.toISOString()).toBe('2026-08-03T09:00:00.000Z')
+    })
+
+    it('keeps two hostnames independent -- a failing one is never merged into a passing one', async () => {
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_X, outcome: 'answering', status: 200 },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_Y, outcome: 'not-answering', status: null },
+      })
+
+      const result = await latestExternalResultsByHostname([HOST_X, HOST_Y])
+
+      expect(result.size).toBe(2)
+      expect(result.get(HOST_X)?.outcome).toBe('answering')
+      expect(result.get(HOST_Y)?.outcome).toBe('not-answering')
+    })
+
+    it('never invents an entry for a hostname with no stored result -- absence must stay absent, not become a definite verdict', async () => {
+      const result = await latestExternalResultsByHostname(['fq-external-never-probed.example.invalid'])
+      expect(result.size).toBe(0)
+      expect(result.get('fq-external-never-probed.example.invalid')).toBeUndefined()
+    })
+
+    it('excludes a hostname that stopped being served when the caller does not ask about it, even though its row is never deleted', async () => {
+      // A hostname whose last real probe was long ago, and is not in the
+      // CURRENT hostname set the caller passes -- e.g. a vhost that was
+      // removed from the reverse-proxy config. The row is not deleted (no
+      // retention is built by this task), but a caller that bounds its
+      // query by the current hostname set never sees it again.
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_RETIRED, outcome: 'answering', status: 200, observedAt: new Date('2026-01-01T00:00:00Z') },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_X, outcome: 'answering', status: 200 },
+      })
+
+      // The caller only names the currently-served hostname.
+      const result = await latestExternalResultsByHostname([HOST_X])
+
+      expect(result.has(HOST_RETIRED)).toBe(false)
+      expect(result.has(HOST_X)).toBe(true)
+
+      // Proof the retired row genuinely still exists on disk (nothing was
+      // deleted) -- it is excluded by the query's WHERE clause, not by
+      // retention.
+      const stillOnDisk = await prisma.externalProbeResult.findFirst({ where: { hostname: HOST_RETIRED } })
+      expect(stillOnDisk).not.toBeNull()
+    })
+
+    it('returns an empty map for an empty hostname list without querying the database', async () => {
+      const result = await latestExternalResultsByHostname([])
+      expect(result.size).toBe(0)
+    })
+  })
+})
+
+describe('worstVerdict', () => {
+  it('is healthy only when nothing else is present', () => {
+    expect(worstVerdict(['healthy'])).toBe('healthy')
+  })
+
+  it('an unprobed hostname outranks a healthy one -- a row must not read fully healthy while something was never checked', () => {
+    expect(worstVerdict(['healthy', 'unprobed'])).toBe('unprobed')
+  })
+
+  it('a definite fault outranks an unconfirmed one', () => {
+    expect(worstVerdict(['unconfirmed', 'route-broken'])).toBe('route-broken')
+  })
+
+  it('app-down outranks route-broken', () => {
+    expect(worstVerdict(['route-broken', 'app-down'])).toBe('app-down')
+  })
+
+  it('contradiction outranks every other value -- confused evidence is flagged above a named fault', () => {
+    expect(worstVerdict(['app-down', 'contradiction'])).toBe('contradiction')
+  })
+
+  it('is unprobed for an empty input -- there was nothing to check either axis against', () => {
+    expect(worstVerdict([])).toBe('unprobed')
+  })
+})
+
+// Spec §8: "Answers" (the two-axis verdict), "Cert" (days remaining from the
+// handshake), and the fleet-wide external-failure fallback -- all computed
+// by latestPerSystem from SystemObservation.hostnames/onBoxProbes (Task 5)
+// joined against latestExternalResultsByHostname (Task 7a) via combine()
+// (Task 7). Integration tests against the real database, like the rest of
+// this file, because the join itself -- not just combine()'s own truth
+// table, already unit-tested in answers.test.ts -- is what Task 8 adds.
+describe('the Answers/Cert join (Task 8)', () => {
+  const HOSTNAME_A = 'fq-answers-a.example.invalid'
+  const HOSTNAME_B = 'fq-answers-b.example.invalid'
+
+  async function makeSystem(key: string, hostName: string) {
+    const host = await prisma.host.create({ data: { name: hostName } })
+    const system = await prisma.system.create({ data: { hostId: host.id, key, displayName: key } })
+    return { host, system }
+  }
+
+  it('is healthy when both axes answer for the one hostname a system has', async () => {
+    const { system } = await makeSystem('sys-both-good', 'host-both-good')
+    const now = new Date('2026-08-03T12:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+        onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+      },
+    })
+    await prisma.externalProbeResult.create({
+      data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+    })
+
+    const { rows } = await latestPerSystem(now)
+
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.verdict).toBe('healthy')
+    expect(rows[0]!.hostnameAnswers).toHaveLength(1)
+    expect(rows[0]!.hostnameAnswers[0]!.verdict).toBe('healthy')
+    expect(rows[0]!.primaryHostname).toBe(HOSTNAME_A)
+  })
+
+  it('is route-broken when on-box answers but the external axis does not', async () => {
+    const { system } = await makeSystem('sys-route-broken', 'host-route-broken')
+    const now = new Date('2026-08-03T12:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+        onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+      },
+    })
+    await prisma.externalProbeResult.create({
+      data: { hostname: HOSTNAME_A, outcome: 'not-answering', status: null, observedAt: now },
+    })
+    // A second, unrelated, entirely healthy system/hostname -- so this
+    // scenario is a PARTIAL failure (one hostname down, the rest of the
+    // board fine), not the fleet-wide case the next describe block covers.
+    // Without this, HOSTNAME_A would be the board's only hostname, and
+    // `isFleetWideExternalFailure` would (correctly) read "every hostname
+    // failed" as fleet-wide, forcing the fallback this test is NOT about.
+    const { system: healthySystem } = await makeSystem('sys-route-broken-sibling', 'host-route-broken-sibling')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: healthySystem.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [{ hostname: HOSTNAME_B, listensTls: true }],
+        onBoxProbes: [{ hostname: HOSTNAME_B, outcome: 'answering', status: 200 }],
+      },
+    })
+    await prisma.externalProbeResult.create({
+      data: { hostname: HOSTNAME_B, outcome: 'answering', status: 200, observedAt: now },
+    })
+
+    const { rows } = await latestPerSystem(now)
+
+    expect(rows.find((r) => r.key === 'sys-route-broken')!.verdict).toBe('route-broken')
+  })
+
+  it('is unconfirmed when only the on-box axis has ever run', async () => {
+    const { system } = await makeSystem('sys-unconfirmed', 'host-unconfirmed')
+    const now = new Date('2026-08-03T12:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+        onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+      },
+    })
+    // No ExternalProbeResult row at all for HOSTNAME_A.
+
+    const { rows } = await latestPerSystem(now)
+
+    expect(rows[0]!.verdict).toBe('unconfirmed')
+  })
+
+  it('is unprobed when neither axis has ever run for a named hostname', async () => {
+    const { system } = await makeSystem('sys-unprobed', 'host-unprobed')
+    const now = new Date('2026-08-03T12:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+        // onBoxProbes omitted entirely -> SQL NULL, no opinion this tick.
+      },
+    })
+
+    const { rows } = await latestPerSystem(now)
+
+    expect(rows[0]!.onBoxProbes).toBeNull()
+    expect(rows[0]!.verdict).toBe('unprobed')
+  })
+
+  // THE DENIAL TEST for spec §8's "one failing hostname on a multi-hostname
+  // system must not be averaged away into a green row". Two hostnames on
+  // ONE system: A is fully healthy, B is fully down. `primaryHostname()`
+  // will pick A (it answers), so a row-level verdict that simply copied the
+  // primary's own verdict would read `healthy` -- exactly the averaging
+  // spec §8 forbids. Mutation-verified: see task-8-report.md.
+  it('does not average a failing hostname into a healthy row', async () => {
+    const { system } = await makeSystem('sys-mixed', 'host-mixed')
+    const now = new Date('2026-08-03T12:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [
+          { hostname: HOSTNAME_A, listensTls: true },
+          { hostname: HOSTNAME_B, listensTls: true },
+        ],
+        onBoxProbes: [
+          { hostname: HOSTNAME_A, outcome: 'answering', status: 200 },
+          { hostname: HOSTNAME_B, outcome: 'not-answering', status: null },
+        ],
+      },
+    })
+    await prisma.externalProbeResult.create({
+      data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+    })
+    await prisma.externalProbeResult.create({
+      data: { hostname: HOSTNAME_B, outcome: 'not-answering', status: null, observedAt: now },
+    })
+
+    const { rows } = await latestPerSystem(now)
+
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.primaryHostname).toBe(HOSTNAME_A) // the healthy one, chosen for the clickable URL
+    expect(rows[0]!.verdict).not.toBe('healthy')
+    expect(rows[0]!.verdict).toBe('app-down') // the worst of A's healthy and B's app-down
+    // I2: the Answers cell's detail must come from the hostname that
+    // PRODUCED the verdict (B), never from the primary (A) -- reading A's
+    // evidence here would describe a contradiction that does not exist.
+    expect(rows[0]!.leadHostnameAnswer?.hostname).toBe(HOSTNAME_B)
+  })
+
+  // Fix round 1 (Task 8 review), C2b -- the fleet-wide flag is now a
+  // directly recorded fact (`ExternalProbeRun`, written by the runner on
+  // EVERY sweep including a failed one), not an inference over
+  // `latestExternalResultsByHostname`'s per-hostname rows. These tests
+  // exercise the QUERY side of that fix; `external-probe-runner.test.ts`
+  // exercises the WRITE side.
+  describe('the fleet-wide fallback, driven by ExternalProbeRun (C2b)', () => {
+    // THE DENIAL TEST for spec §9's fleet-wide guard, at the point where it
+    // actually renders: a local probe fault must fall back to on-box
+    // evidence, not report the (almost certainly locally-caused) external
+    // failure as THIS system's own fault.
+    it('falls back to on-box-only evidence, and does not report route-broken, when the last recorded sweep reached nothing', async () => {
+      const { system } = await makeSystem('sys-fleet-fail', 'host-fleet-fail')
+      const now = new Date('2026-08-03T12:00:00Z')
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      // A FRESH, non-stale stored result that -- if it were NOT suppressed
+      // by the fleet-wide fallback -- would combine with the healthy
+      // on-box axis into a definite `route-broken`. Seeded deliberately so
+      // this test actually DISCRIMINATES the fallback: without it, nothing
+      // is stored for HOSTNAME_A at all, and the axis would already read
+      // null/`unconfirmed` regardless of whether the fallback ran, so the
+      // assertion below would pass even with the fallback deleted.
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'not-answering', status: null, observedAt: now },
+      })
+      await prisma.externalProbeRun.create({
+        data: { ranAt: now, reachedAnything: false },
+      })
+
+      const board = await latestPerSystem(now)
+
+      expect(board.lastExternalSweep).not.toBeNull()
+      expect(board.lastExternalSweep!.reachedAnything).toBe(false)
+      expect(board.rows[0]!.verdict).not.toBe('route-broken')
+      expect(board.rows[0]!.verdict).not.toBe('app-down')
+      expect(board.rows[0]!.verdict).toBe('unconfirmed')
+    })
+
+    it('does not fall back when the last recorded sweep reached something, even for a genuine PARTIAL failure', async () => {
+      const { system } = await makeSystem('sys-partial', 'host-partial')
+      const now = new Date('2026-08-03T12:00:00Z')
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [
+            { hostname: HOSTNAME_A, listensTls: true },
+            { hostname: HOSTNAME_B, listensTls: true },
+          ],
+          onBoxProbes: [
+            { hostname: HOSTNAME_A, outcome: 'answering', status: 200 },
+            { hostname: HOSTNAME_B, outcome: 'answering', status: 200 },
+          ],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_B, outcome: 'not-answering', status: null, observedAt: now },
+      })
+      await prisma.externalProbeRun.create({ data: { ranAt: now, reachedAnything: true } })
+
+      const board = await latestPerSystem(now)
+
+      expect(board.lastExternalSweep!.reachedAnything).toBe(true)
+      expect(board.rows[0]!.verdict).toBe('route-broken') // B's real fault must still surface
+    })
+
+    // THE scenario C2b's review specifically named: a REAL, ongoing
+    // dashboard-network outage must be visible even though Task 7a's own
+    // rule leaves the STORED per-hostname rows looking perfectly healthy
+    // (they are the last GOOD results from before the outage started, and
+    // a fleet-wide failure writes nothing on top of them). The OLD,
+    // inferred version of this flag read `externalByHostname`'s values --
+    // all "answering" here -- and would have missed this outage entirely.
+    it('shows the fleet-wide fallback even when every STORED per-hostname result still looks healthy (the outage wrote nothing on top of them)', async () => {
+      const { system } = await makeSystem('sys-quiet-outage', 'host-quiet-outage')
+      const now = new Date('2026-08-03T12:00:00Z')
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      // The last GOOD result, stored before the outage began -- exactly
+      // what Task 7a's write-nothing-on-fleet-wide-failure rule leaves
+      // behind.
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+      // The CURRENT sweep recorded that it reached nothing -- this is the
+      // one fact this test hinges on.
+      await prisma.externalProbeRun.create({ data: { ranAt: now, reachedAnything: false } })
+
+      const board = await latestPerSystem(now)
+
+      expect(board.lastExternalSweep!.reachedAnything).toBe(false)
+    })
+
+    // THE scenario C2b's review named on the OTHER side: two applications
+    // failing three weeks apart must not both read as "failing NOW" and
+    // trigger a fleet-wide banner that never happened. Here, HOSTNAME_A's
+    // stored result is old and failing (its own genuine, isolated
+    // route-broken finding), but the MOST RECENT sweep (recorded
+    // separately) reached plenty -- so no fallback applies, and A's real
+    // fault stays visible.
+    it('does not let an old, isolated failing hostname retroactively read as a fleet-wide fault', async () => {
+      const { system } = await makeSystem('sys-old-failure', 'host-old-failure')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const threeWeeksAgo = new Date(now.getTime() - 21 * 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'not-answering', status: null, observedAt: threeWeeksAgo },
+      })
+      // The most recent sweep succeeded (reached other hostnames fine) --
+      // recorded independently of HOSTNAME_A's own stale, failing result.
+      await prisma.externalProbeRun.create({ data: { ranAt: now, reachedAnything: true } })
+
+      const board = await latestPerSystem(now)
+
+      expect(board.lastExternalSweep!.reachedAnything).toBe(true)
+      // A's own three-week-old result is ALSO past the staleness ceiling
+      // (C3), so it reads unconfirmed, not a false route-broken from stale
+      // data -- but critically, it is NOT suppressed by a fleet-wide
+      // fallback that never applied.
+      expect(board.rows[0]!.verdict).toBe('unconfirmed')
+    })
+
+    // THE DENIAL TEST for fix round 2's I1: a fleet-wide failure must not
+    // erase the AGE of a genuinely recent, good result -- only its content.
+    // A result stored 4 minutes ago, carrying a certificate 3 days from
+    // expiry, must still report that real age even while the verdict/cert
+    // content is correctly suppressed by the fallback. Before this fix,
+    // `external` was forced to `undefined` before `externalAgeMs` was ever
+    // computed, so this rendered as "never checked externally" and the
+    // 3-day certificate simply vanished during the one window an operator
+    // most needs to see it.
+    it('reports the real age of a recent result even while a fleet-wide failure suppresses its content', async () => {
+      const { system } = await makeSystem('sys-fleet-fail-age', 'host-fleet-fail-age')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const fourMinutesAgo = new Date(now.getTime() - 4 * 60_000)
+      const expires = new Date(now.getTime() + 3 * 86_400_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: {
+          hostname: HOSTNAME_A,
+          outcome: 'answering',
+          status: 200,
+          certExpiresAt: expires,
+          observedAt: fourMinutesAgo,
+        },
+      })
+      await prisma.externalProbeRun.create({ data: { ranAt: now, reachedAnything: false } })
+
+      const { rows } = await latestPerSystem(now)
+
+      const answer = rows[0]!.hostnameAnswers[0]!
+      // REACHABILITY content is correctly suppressed by the fallback.
+      expect(answer.externalOutcome).toBeNull()
+      // Fix round 4 (Task 8 review), C2 -- THIS TEST used to pin the
+      // opposite of this assertion (`certDaysRemaining` expected `null`
+      // here), which was itself the defect the round 4 review found: every
+      // certificate figure on the board fell to grey for the whole duration
+      // of a fleet-wide failure. An expiry date can only ever move LATER
+      // (renewal), never earlier, so a stale/suppressed reading of it can
+      // only ever over-alarm, never under-alarm -- the safe direction, so
+      // it is no longer gated on `fleetWideFailure` at all. Fixing the test
+      // that pinned the old (wrong) behaviour, recorded here rather than
+      // changed quietly.
+      expect(answer.certDaysRemaining).toBe(3)
+      // Age is NOT suppressed -- it is a fact about the stored evidence,
+      // independent of whether this tick trusts its content.
+      expect(answer.externalAgeMs).not.toBeNull()
+      expect(answer.externalAgeMs).toBeCloseTo(4 * 60_000, -3)
+    })
+  })
+
+  describe('latestExternalProbeRun', () => {
+    it('returns null when no sweep has ever run', async () => {
+      expect(await latestExternalProbeRun()).toBeNull()
+    })
+
+    it('returns the MOST RECENT run, not the first one written', async () => {
+      await prisma.externalProbeRun.create({
+        data: { ranAt: new Date('2026-08-01T00:00:00Z'), reachedAnything: true },
+      })
+      await prisma.externalProbeRun.create({
+        data: { ranAt: new Date('2026-08-03T00:00:00Z'), reachedAnything: false },
+      })
+
+      const latest = await latestExternalProbeRun()
+
+      expect(latest?.reachedAnything).toBe(false)
+      expect(latest?.ranAt.toISOString()).toBe('2026-08-03T00:00:00.000Z')
+    })
+  })
+
+  // Fix round 1 (Task 8 review), C3: spec §5.1's "an old result presented
+  // as current is the same lie this slice exists to remove," applied to
+  // the VERDICT itself, not just the age label already shown alongside it.
+  describe('the external result staleness ceiling (C3)', () => {
+    it('treats a result older than the staleness ceiling as NO current opinion -- never a green healthy row from stale data', async () => {
+      const { system } = await makeSystem('sys-stale-healthy', 'host-stale-healthy')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const nineDaysAgo = new Date(now.getTime() - 9 * 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      // A NINE-DAY-OLD "healthy" result -- ancient relative to the 5-minute
+      // cadence, but still the "latest" row on disk for this hostname.
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: nineDaysAgo },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.verdict).not.toBe('healthy')
+      expect(rows[0]!.verdict).toBe('unconfirmed')
+      expect(rows[0]!.hostnameAnswers[0]!.externalOutcome).toBeNull()
+      // The RAW age is still reported -- an operator can still see how long
+      // ago it was actually checked, even though it no longer counts.
+      expect(rows[0]!.hostnameAnswers[0]!.externalAgeMs).toBeGreaterThan(EXTERNAL_RESULT_STALE_AFTER_MS)
+    })
+
+    it('still treats a result just inside the ceiling as a current opinion', async () => {
+      const { system } = await makeSystem('sys-fresh-enough', 'host-fresh-enough')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const justInside = new Date(now.getTime() - (EXTERNAL_RESULT_STALE_AFTER_MS - 1_000))
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: justInside },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.verdict).toBe('healthy')
+    })
+
+    // THE DENIAL TEST for fix round 4's C2, under the STALENESS ceiling
+    // specifically (the fleet-wide-failure case is covered separately,
+    // above in "the fleet-wide fallback" describe block). The reviewer's
+    // exact reproduction: a nine-day-old reading of a certificate expiring
+    // in 3 days. Reachability correctly stops counting as a current
+    // opinion past the ceiling -- but the certificate figure itself must
+    // NOT vanish, because a stale reading of EXPIRY can only ever
+    // over-alarm (renewal moves it later, never earlier), which is the
+    // safe direction, unlike a stale reading of reachability (which can be
+    // wrong either way).
+    it('does not let the staleness ceiling erase a certificate figure -- a stale reading can only over-alarm, never under-alarm', async () => {
+      const { system } = await makeSystem('sys-stale-cert', 'host-stale-cert')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const nineDaysAgo = new Date(now.getTime() - 9 * 24 * 60 * 60_000)
+      const expiresIn3Days = new Date(now.getTime() + 3 * 86_400_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: {
+          hostname: HOSTNAME_A,
+          outcome: 'answering',
+          status: 200,
+          certExpiresAt: expiresIn3Days,
+          observedAt: nineDaysAgo,
+        },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      const answer = rows[0]!.hostnameAnswers[0]!
+      // Reachability correctly no longer counts as current.
+      expect(answer.externalOutcome).toBeNull()
+      // The certificate figure survives, ungated by the same ceiling.
+      expect(answer.certDaysRemaining).toBe(3)
+      expect(answer.externalAgeMs).toBeGreaterThan(EXTERNAL_RESULT_STALE_AFTER_MS)
+    })
+
+    // THE DENIAL TEST for fix round 5: the review's exact reproduction --
+    // a `tls-failed` reading (spec §7's three hostnames configured for TLS
+    // with no certificate) must not fade to `unknown` past the staleness
+    // ceiling. `certExpiresAt`'s own monotone argument applies verbatim: a
+    // completed, failed handshake cannot silently become a passing one
+    // without an operator acting, so a stale reading of it can only ever
+    // over-alarm, never under-alarm.
+    it('does not let the staleness ceiling erase a `tls-failed` reading -- it can only over-alarm, same as a stale expiry', async () => {
+      const { system } = await makeSystem('sys-stale-tls-failed', 'host-stale-tls-failed')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const nineDaysAgo = new Date(now.getTime() - 9 * 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'tls-failed', status: null, certExpiresAt: null, observedAt: nineDaysAgo },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      const answer = rows[0]!.hostnameAnswers[0]!
+      // Reachability no longer counts as current -- correct, unchanged.
+      expect(answer.externalOutcome).toBeNull()
+      // The handshake-failure fact survives, ungated by the same ceiling.
+      expect(answer.certHandshakeFailed).toBe(true)
+      expect(answer.externalAgeMs).toBeGreaterThan(EXTERNAL_RESULT_STALE_AFTER_MS)
+    })
+  })
+
+  // THE DENIAL TESTS for the final whole-branch review's C1: before this
+  // fix, `onBoxProbes` was read at whatever age the observation happened to
+  // be, with NO ceiling -- unlike the external axis just above, which
+  // already refused to trust a result past `EXTERNAL_RESULT_STALE_AFTER_MS`.
+  // These three scenarios are the review's own report table, reproduced
+  // exactly: an agent silent for 24 hours (far past `ON_BOX_STALE_AFTER_MS`)
+  // must never let a day-old on-box reading render as a live opinion, in
+  // EITHER direction -- an `answering` reading must not produce a green
+  // `healthy` row (and must not misname a fresh external failure as
+  // `route-broken`, which blames the route/DNS/certificate when the far
+  // likelier truth is that the HOST itself is down), and a `not-answering`
+  // reading must not produce a `contradiction` verdict.
+  describe('the on-box staleness ceiling (final whole-branch review, C1)', () => {
+    it('does not let a day-old on-box "answering" reading combine with a fresh external "answering" into a green healthy row', async () => {
+      const { system } = await makeSystem('sys-stale-onbox-healthy', 'host-stale-onbox-healthy')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: oneDayAgo, // the WHOLE observation -- hostnames, onBoxProbes -- is this old
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.hostnameAnswers[0]!.onBoxOutcome).toBeNull()
+      expect(rows[0]!.verdict).not.toBe('healthy')
+      expect(rows[0]!.verdict).toBe('unconfirmed')
+    })
+
+    it('does not let a day-old on-box "answering" reading combine with a fresh external failure into "route-broken" -- the agent\'s own silence means the host, not the route, is the likelier fault', async () => {
+      const { system } = await makeSystem('sys-stale-onbox-route', 'host-stale-onbox-route')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: oneDayAgo,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'not-answering', status: null, observedAt: now },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.hostnameAnswers[0]!.onBoxOutcome).toBeNull()
+      expect(rows[0]!.verdict).not.toBe('route-broken')
+      expect(rows[0]!.verdict).toBe('unconfirmed')
+    })
+
+    it('does not let a day-old on-box "not-answering" reading combine with a fresh external "answering" into a contradiction that is really just stale evidence', async () => {
+      const { system } = await makeSystem('sys-stale-onbox-contradiction', 'host-stale-onbox-contradiction')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: oneDayAgo,
+          health: 'down',
+          containersTotal: 1,
+          containersRunning: 0,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'not-answering', status: null }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.hostnameAnswers[0]!.onBoxOutcome).toBeNull()
+      expect(rows[0]!.verdict).not.toBe('contradiction')
+      expect(rows[0]!.verdict).toBe('unconfirmed')
+    })
+
+    it('still treats an on-box reading just inside the ceiling as a current opinion', async () => {
+      const { system } = await makeSystem('sys-onbox-fresh-enough', 'host-onbox-fresh-enough')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const justInside = new Date(now.getTime() - (ON_BOX_STALE_AFTER_MS - 1_000))
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: justInside,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.hostnameAnswers[0]!.onBoxOutcome).toBe('answering')
+      expect(rows[0]!.verdict).toBe('healthy')
+    })
+
+    // THE DENIAL TEST for fix round 2, Important 6 -- a `receivedAt` from
+    // the FUTURE (a clock fault somewhere upstream: a bad migration, a
+    // skewed database host clock) must not read as maximally fresh.
+    // Removing the `onBoxAgeMs >= 0` guard would let a future `receivedAt`
+    // produce a NEGATIVE age, which is always `<= ON_BOX_STALE_AFTER_MS`,
+    // so the on-box axis would read as a CURRENT opinion FOREVER -- the
+    // exact "forever fresh" failure `staleness.ts`'s own future-clock
+    // handling exists to prevent for the State column (see its docstring),
+    // reopened one column over in the Answers column.
+    it('does not treat a future receivedAt as a current on-box opinion', async () => {
+      const { system } = await makeSystem('sys-future-onbox', 'host-future-onbox')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const future = new Date(now.getTime() + 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: future,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.hostnameAnswers[0]!.onBoxOutcome).toBeNull()
+      expect(rows[0]!.verdict).not.toBe('healthy')
+    })
+
+    // M2 companion, at the same layer this fix lives at: a stale
+    // observation's ANSWERING unnamed (no-vhost) port must not still render
+    // as "a port with no name answered on-box" -- the same positive claim
+    // the named-hostname fix above exists to gate, applied to the OTHER
+    // consumer of `onBoxProbes` (`systemRow`'s `unnamed` list).
+    it('does not report a day-old unnamed on-box "answering" probe as a current positive fact', async () => {
+      const { system } = await makeSystem('sys-stale-unnamed', 'host-stale-unnamed')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: oneDayAgo,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [],
+          onBoxProbes: [{ hostname: null, outcome: 'answering', status: 200 }],
+        },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.unnamedOnBoxProbes).toEqual([])
+    })
+
+    // THE DENIAL TEST for fix round 2, Important 7 -- `FleetRow.onBoxProbes`
+    // ITSELF must be gated, not merely the two things derived from it
+    // (`hostnameAnswers`/`unnamedOnBoxProbes`). Round 1 left this ONE field
+    // carrying the raw, ungated `SystemObservation.onBoxProbes` value,
+    // reasoning that nothing rendered it directly today -- which made it a
+    // landmine for any future renderer reaching for it and silently
+    // reintroducing this whole fix's Critical. There is now no ungated
+    // variant anywhere on `FleetRow` to reach for by mistake.
+    it('gates FleetRow.onBoxProbes itself, not only the derived hostnameAnswers/unnamedOnBoxProbes fields', async () => {
+      const { system } = await makeSystem('sys-stale-raw-field', 'host-stale-raw-field')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: oneDayAgo,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.onBoxProbes).toBeNull()
+    })
+  })
+
+  // Query-layer sibling to the staleness-ceiling test above: the SAME
+  // `tls-failed` fact must ALSO survive a fleet-wide failure, not just the
+  // passage of time -- both are gates on `externalOutcome` that
+  // `certHandshakeFailed` is deliberately exempt from.
+  describe('a `tls-failed` reading under a fleet-wide failure (fix round 5)', () => {
+    it('keeps certHandshakeFailed true even while the fleet-wide guard nulls externalOutcome', async () => {
+      const { system } = await makeSystem('sys-fleet-wide-tls-failed', 'host-fleet-wide-tls-failed')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const fourMinutesAgo = new Date(now.getTime() - 4 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: {
+          hostname: HOSTNAME_A,
+          outcome: 'tls-failed',
+          status: null,
+          certExpiresAt: null,
+          observedAt: fourMinutesAgo,
+        },
+      })
+      await prisma.externalProbeRun.create({ data: { ranAt: now, reachedAnything: false } })
+
+      const { rows } = await latestPerSystem(now)
+
+      const answer = rows[0]!.hostnameAnswers[0]!
+      expect(answer.externalOutcome).toBeNull() // suppressed by the fleet-wide guard, correctly
+      expect(answer.certHandshakeFailed).toBe(true) // NOT suppressed
+      expect(answer.externalAgeMs).not.toBeNull()
+    })
+  })
+
+  it('computes days-remaining from the external probe\'s own handshake, and flags a configured-but-missing certificate', async () => {
+    const { system } = await makeSystem('sys-cert', 'host-cert')
+    const now = new Date('2026-08-03T00:00:00Z')
+    const expires = new Date(now.getTime() + 3 * 86_400_000) // 3 days out
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+        onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+      },
+    })
+    await prisma.externalProbeResult.create({
+      data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, certExpiresAt: expires, observedAt: now },
+    })
+
+    const { rows } = await latestPerSystem(now)
+
+    expect(rows[0]!.certDaysRemaining).toBe(3)
+    expect(rows[0]!.tlsConfigured).toBe(true)
+  })
+
+  it('reports no certificate (not null-as-fine) when TLS is configured but no handshake has ever succeeded', async () => {
+    const { system } = await makeSystem('sys-no-cert', 'host-no-cert')
+    const now = new Date('2026-08-03T00:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+        onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+      },
+    })
+    await prisma.externalProbeResult.create({
+      // TLS handshake itself failed -- no cert observed.
+      data: { hostname: HOSTNAME_A, outcome: 'tls-failed', status: null, certExpiresAt: null, observedAt: now },
+    })
+
+    const { rows } = await latestPerSystem(now)
+
+    expect(rows[0]!.tlsConfigured).toBe(true)
+    expect(rows[0]!.certDaysRemaining).toBeNull()
+  })
+
+  // Task 5's obligation, handed to this task: `hostnames: null` (no
+  // opinion this tick) and `hostnames: []` (confirmed no HTTP surface) must
+  // stay distinguishable all the way out to the row, not just at the
+  // database boundary.
+  it('preserves null (no opinion) vs [] (confirmed no HTTP surface) all the way to the row', async () => {
+    const { system: neverSaid } = await makeSystem('sys-null-hostnames', 'host-null-hostnames')
+    const { system: confirmedEmpty } = await makeSystem('sys-empty-hostnames', 'host-empty-hostnames')
+    const now = new Date('2026-08-03T00:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: neverSaid.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        // `hostnames` omitted entirely -> real SQL NULL.
+      },
+    })
+    await prisma.systemObservation.create({
+      data: {
+        systemId: confirmedEmpty.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [],
+      },
+    })
+
+    const { rows } = await latestPerSystem(now)
+    const nullRow = rows.find((r) => r.key === 'sys-null-hostnames')!
+    const emptyRow = rows.find((r) => r.key === 'sys-empty-hostnames')!
+
+    expect(nullRow.hostnames).toBeNull()
+    expect(emptyRow.hostnames).toEqual([])
+    expect(nullRow.primaryHostname).toBeNull()
+    expect(emptyRow.primaryHostname).toBeNull()
+    expect(nullRow.verdict).toBe('unprobed')
+    expect(emptyRow.verdict).toBe('unprobed')
+  })
+
+  // Fix round 4 (Task 8 review), C1 -- THE bug, PINNED BY THIS TEST as
+  // correct at the end of round 2 (`verdict` asserted `'healthy'` here).
+  // The round 4 review found the render: a system with NO NAMED HOSTNAMES
+  // AT ALL, whose URL column reads "no HTTP surface" and whose external
+  // axis has never run, rendered a fully GREEN row on the strength of one
+  // port spec §3.1 itself says "may be a database, a cache, a mail relay, a
+  // UDP service". Spec §2: "a row is green only when the application
+  // answers." Round 2's fix (contribute `'healthy'` to the worst-of fold)
+  // stopped an unmapped port from DRAGGING A ROW DOWN, which was that
+  // round's real finding -- but a max-fold cannot express "positive but
+  // non-dispositive" evidence by lowering its floor; lowering it BELOW
+  // every absence state is what manufactures a green verdict out of
+  // nothing. The correct fix contributes NOTHING at all: `verdict` reads
+  // `unprobed` (nothing named was ever checked), while the fact itself
+  // stays fully visible via `unnamedOnBoxProbes` (and, independently,
+  // `AnswersCell`'s "a port with no name answered on-box (N)" text, which
+  // does not depend on `verdict`). Fixing the test that pinned the old,
+  // wrong behaviour, recorded here rather than changed quietly.
+  it('does NOT read healthy on an unmapped port\'s answer alone -- a system with no named hostnames stays unprobed', async () => {
+    const { system } = await makeSystem('sys-unnamed-port', 'host-unnamed-port')
+    const now = new Date('2026-08-03T00:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [],
+        onBoxProbes: [{ hostname: null, outcome: 'answering', status: 200 }],
+      },
+    })
+
+    const { rows } = await latestPerSystem(now)
+
+    // The fact itself is NOT hidden -- it is simply not allowed to BECOME
+    // the row's own verdict.
+    expect(rows[0]!.unnamedOnBoxProbes).toHaveLength(1)
+    expect(rows[0]!.unnamedOnBoxProbes[0]!.outcome).toBe('answering')
+    expect(rows[0]!.verdict).not.toBe('healthy')
+    expect(rows[0]!.verdict).toBe('unprobed')
+  })
+
+  // THE DENIAL TEST for fix round 2's C2: the reviewer's exact
+  // reproduction -- one NAMED hostname healthy on both axes, plus one
+  // published port with no vhost that recorded `not-probed`. The system is
+  // fully working; the unmapped port merely has nothing to say. Before this
+  // fix, `combine(notProbedAxis, null)` folded to `unprobed` (severity 1,
+  // strictly worse than `healthy`'s 0) and dragged the whole row down to
+  // "not probed" -- a silent unmapped database/cache/exporter port, common
+  // on a multi-stack host, downgrading an otherwise fully healthy system.
+  it('does not let a not-probed unmapped port downgrade an otherwise fully healthy row', async () => {
+    const { system } = await makeSystem('sys-named-plus-unnamed', 'host-named-plus-unnamed')
+    const now = new Date('2026-08-03T12:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+        onBoxProbes: [
+          { hostname: HOSTNAME_A, outcome: 'answering', status: 200 },
+          { hostname: null, outcome: 'not-probed', status: null },
+        ],
+      },
+    })
+    await prisma.externalProbeResult.create({
+      data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+    })
+
+    const { rows } = await latestPerSystem(now)
+
+    expect(rows[0]!.verdict).toBe('healthy')
+  })
+
+  // Same reproduction, but the unmapped port ANSWERED instead of recording
+  // `not-probed`. Before this fix, `combine(answeringAxis, null)` folded to
+  // `unconfirmed` (severity 2) and downgraded the row just as badly, for
+  // the OPPOSITE reason (an opinion with nothing to combine it against,
+  // rather than no opinion at all) -- both wrong, for the same underlying
+  // cause: feeding an unmapped port's result through the two-axis `combine`
+  // at all, when it has no second axis to compare against.
+  it('does not let an ANSWERING unmapped port downgrade an otherwise fully healthy row either', async () => {
+    const { system } = await makeSystem('sys-named-plus-answering-unnamed', 'host-named-plus-answering-unnamed')
+    const now = new Date('2026-08-03T12:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+        onBoxProbes: [
+          { hostname: HOSTNAME_A, outcome: 'answering', status: 200 },
+          { hostname: null, outcome: 'answering', status: 200 },
+        ],
+      },
+    })
+    await prisma.externalProbeResult.create({
+      data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+    })
+
+    const { rows } = await latestPerSystem(now)
+
+    expect(rows[0]!.verdict).toBe('healthy')
   })
 })

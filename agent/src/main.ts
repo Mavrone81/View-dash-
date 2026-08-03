@@ -1,40 +1,33 @@
 import Docker from 'dockerode'
-import { readFile } from 'node:fs/promises'
 import { loadConfig } from './config.js'
 import { collectSnapshot } from './collect.js'
-import { toSummary } from './docker.js'
 import { AgentTransport } from './transport.js'
 import { createTickRunner } from './loop.js'
-import { probeUrl } from './probe.js'
-import { resolveDeployLogPath, resolveRepoDir } from './paths.js'
+import { buildCollectDeps } from './agent-deps.js'
+
+// This file is deliberately thin, and deliberately untested: everything it
+// does beyond wiring the three real singletons together (config, Docker,
+// the transport) lives in agent-deps.ts, which HAS no top-level side
+// effects and IS tested -- see agent-deps.test.ts. Importing THIS file, by
+// contrast, immediately calls loadConfig() (throws without a real
+// environment), opens a Docker client, and starts the tick interval below.
+// A test file must never import main.ts for that reason; anything worth
+// pinning belongs in agent-deps.ts instead.
 
 const cfg = loadConfig()
 const docker = new Docker()
-// The agent's only network connection: it DIALS OUT to the dashboard and
-// holds that connection open across ticks. Nothing in this file, or in
-// AgentTransport, ever binds a listening socket on this host.
+// This agent DIALS OUT only -- to the dashboard here (held open across
+// ticks), and, every tick, to `127.0.0.1:<published port>` for each
+// system's on-box probe (see agent/src/agent-deps.ts/probe.ts). Nothing in
+// this file, AgentTransport, or the on-box probe ever binds a LISTENING
+// socket on this host. (This comment used to say the dashboard connection
+// was the agent's ONLY network connection -- true before this task added
+// on-box probing, false now; corrected rather than left to mislead an
+// auditor reasoning about this host's egress.)
 const transport = new AgentTransport(cfg)
 
 async function tick(): Promise<void> {
-  const snapshot = await collectSnapshot({
-    listContainers: async () => (await docker.listContainers({ all: true })).map(toSummary),
-    // `key` originates from a Docker compose-project label on the monitored
-    // host, not from this agent's own config -- resolveDeployLogPath and
-    // resolveRepoDir below both guard against it being used to escape the
-    // configured glob/root (see agent/src/paths.ts). Per-system failures
-    // here (bad path, unreadable file) are contained by collectSnapshot's
-    // own try/catch around each of these calls, so one bad key degrades
-    // only that system's row.
-    readDeployLog: async (key) => readFile(resolveDeployLogPath(cfg.deployLogGlob, key), 'utf8').catch(() => null),
-    repoDirFor: (key) => resolveRepoDir(cfg.repoRoot, key),
-    now: () => new Date(),
-    // Spec §4.1's HTTP probe. `systemUrls` is empty unless an operator sets
-    // AGENT_SYSTEM_URLS, and a system with no entry is simply not probed --
-    // never downgraded for it. See agent/src/config.ts for why that map is
-    // empty in every deployment today.
-    urlFor: (key) => cfg.systemUrls[key] ?? null,
-    probe: (url) => probeUrl(url, fetch, cfg.probeTimeoutMs),
-  })
+  const snapshot = await collectSnapshot(buildCollectDeps(cfg, docker))
   // A failed send never throws (see AgentTransport.send): losing the
   // dashboard must never stop this loop from continuing to collect and
   // retry on the next tick.

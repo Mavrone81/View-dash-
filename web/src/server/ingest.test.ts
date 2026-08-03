@@ -13,6 +13,23 @@ const sys = (key: string, over: Record<string, unknown> = {}) => ({
   driftCommits: 0, ...over,
 })
 
+// Fix round 1's 🟡: this `beforeEach` wipes these tables WHOLESALE
+// (`deleteMany()` with no `where`, not scoped to `'host-a'`/`'host-b'`),
+// then re-creates the same two host names every other test in this file
+// (and Task 5's new hostnames/onBoxProbes describe block) reuses. That is
+// SAFE only because `vitest.config.ts` sets `fileParallelism: false`,
+// serializing every test FILE in the suite: no other spec file's
+// `Host`/`System`/`SystemObservation` rows can exist concurrently with
+// this file's run, so a wholesale wipe here can never delete another
+// file's in-flight fixture out from under it. If that config line were
+// ever flipped back to the default (parallel files), this file's own
+// tests would very likely still pass in isolation -- the interference
+// would show up as sporadic, unrelated-looking failures in WHICHEVER
+// OTHER file's Host-table test happened to be running at the same moment,
+// which is exactly the shape that reads as flake rather than as this
+// file suddenly running unsafely. See vitest.config.ts's own comment on
+// `fileParallelism: false` for the general rule; this is the concrete
+// instance of it Task 5 leaned on rather than inventing a new host name.
 beforeEach(async () => {
   await prisma.systemObservation.deleteMany()
   await prisma.system.deleteMany()
@@ -127,6 +144,102 @@ describe('ingestSnapshot', () => {
       const receivedAtMs = observation.receivedAt.getTime()
       expect(receivedAtMs).toBeGreaterThanOrEqual(before - 5000)
       expect(receivedAtMs).toBeLessThanOrEqual(after + 5000)
+    })
+  })
+
+  // Task 5: carrying per-hostname on-box probe detail from the agent onto
+  // the stored row, without letting `not-probed`/"we don't know" collapse
+  // into a claim the agent never made.
+  describe('hostnames / onBoxProbes (Task 5)', () => {
+    it('stores the hostnames and per-hostname probe results the agent reported', async () => {
+      await ingestSnapshot(
+        hostId,
+        snap([
+          sys('alpha', {
+            health: 'degraded',
+            hostnames: [{ hostname: 'alpha.example.invalid', listensTls: true }],
+            onBoxProbes: [{ hostname: 'alpha.example.invalid', outcome: 'proxy-no-upstream', status: 502 }],
+          }),
+        ]),
+      )
+      const obs = await prisma.systemObservation.findFirstOrThrow({ orderBy: { receivedAt: 'desc' } })
+      expect(obs.hostnames).toEqual([{ hostname: 'alpha.example.invalid', listensTls: true }])
+      expect(obs.onBoxProbes).toEqual([{ hostname: 'alpha.example.invalid', outcome: 'proxy-no-upstream', status: 502 }])
+    })
+
+    it('stores a null-hostname probe result (an unmapped port) unchanged, not folded into some other shape', async () => {
+      await ingestSnapshot(
+        hostId,
+        snap([sys('alpha', { hostnames: [], onBoxProbes: [{ hostname: null, outcome: 'not-probed', status: null }] })]),
+      )
+      const obs = await prisma.systemObservation.findFirstOrThrow({ orderBy: { receivedAt: 'desc' } })
+      expect(obs.onBoxProbes).toEqual([{ hostname: null, outcome: 'not-probed', status: null }])
+    })
+
+    it('stores listensTls: null unchanged -- "not determined this tick" must not become true, false, or vanish', async () => {
+      await ingestSnapshot(
+        hostId,
+        snap([sys('alpha', { hostnames: [{ hostname: 'alpha.example.invalid', listensTls: null }] })]),
+      )
+      const obs = await prisma.systemObservation.findFirstOrThrow({ orderBy: { receivedAt: 'desc' } })
+      expect(obs.hostnames).toEqual([{ hostname: 'alpha.example.invalid', listensTls: null }])
+    })
+
+    // The discriminating case this task's brief calls out by name: an
+    // OLDER agent's snapshot must not merely be ACCEPTED (the brief's own
+    // test only checks that much) -- what gets STORED must read as "no
+    // opinion", never as "this system has no HTTP surface". A stored `[]`
+    // and a stored `null` are visually similar but mean opposite things to
+    // a board that has to decide whether to render a warning.
+    it('stores NULL (never []) for hostnames/onBoxProbes when an OLDER agent sends neither field', async () => {
+      await ingestSnapshot(hostId, snap([sys('beta')])) // sys() never sets hostnames/onBoxProbes
+      const obs = await prisma.systemObservation.findFirstOrThrow({ orderBy: { receivedAt: 'desc' } })
+      // The Prisma-client-level check: both `Prisma.DbNull` (a real SQL
+      // NULL) and `Prisma.JsonNull` (the JSON scalar `null`, stored INSIDE
+      // the JSONB value) read back as JS `null` through the client -- this
+      // assertion alone cannot tell them apart, and did not, before fix
+      // round 1's review caught it live.
+      expect(obs.hostnames).toBeNull()
+      expect(obs.onBoxProbes).toBeNull()
+    })
+
+    // Fix round 1's Important: the assertion above cannot distinguish a real
+    // SQL NULL from the JSON scalar `null` stored inside the JSONB value --
+    // Prisma's client collapses both to JS `null` on read. Only a raw query
+    // against the column itself can tell them apart: `IS NULL` is true for a
+    // genuine SQL NULL and FALSE for a JSON `null` scalar (verified live:
+    // `Prisma.JsonNull` gave `hostnames IS NULL` = false, `hostnames::text` =
+    // the three characters `null`). This is the one assertion that would
+    // have failed under the original `Prisma.JsonNull` write and does not
+    // under the corrected `Prisma.DbNull` -- see ingest.ts's docstring on
+    // that column for why the distinction matters beyond this test: a NEW
+    // Task 8 query of the shape `WHERE hostnames IS NOT NULL` (or Prisma's
+    // `{ not: Prisma.DbNull }`) would silently exclude every no-opinion row
+    // this code writes if it were JSON `null` instead of real SQL NULL.
+    it('stores a REAL SQL NULL, not the JSON scalar null, for an older agent\'s hostnames/onBoxProbes -- IS NULL must read true at the raw column', async () => {
+      await ingestSnapshot(hostId, snap([sys('beta')]))
+      const obs = await prisma.systemObservation.findFirstOrThrow({ orderBy: { receivedAt: 'desc' } })
+      const rows = await prisma.$queryRaw<Array<{ hostnames_is_null: boolean; on_box_probes_is_null: boolean }>>`
+        SELECT "hostnames" IS NULL AS hostnames_is_null, "onBoxProbes" IS NULL AS on_box_probes_is_null
+        FROM "SystemObservation" WHERE "id" = ${obs.id}
+      `
+      expect(rows[0]?.hostnames_is_null).toBe(true)
+      expect(rows[0]?.on_box_probes_is_null).toBe(true)
+    })
+
+    it('stores an empty array (never NULL) when a NEWER agent confirms zero hostnames/probes for a system', async () => {
+      await ingestSnapshot(hostId, snap([sys('alpha', { hostnames: [], onBoxProbes: [] })]))
+      const obs = await prisma.systemObservation.findFirstOrThrow({ orderBy: { receivedAt: 'desc' } })
+      expect(obs.hostnames).toEqual([])
+      expect(obs.onBoxProbes).toEqual([])
+    })
+
+    it('accepts a snapshot from an OLDER agent that sends neither field, without throwing', async () => {
+      // A rolling deploy means the agent and dashboard are briefly different
+      // versions. An older agent must not be rejected.
+      await expect(
+        ingestSnapshot(hostId, snap([sys('beta')])),
+      ).resolves.toEqual({ accepted: 1 })
     })
   })
 })

@@ -1,0 +1,44 @@
+-- Task 5 (slice 2a): carry per-hostname on-box probe detail from the agent
+-- onto the board's storage layer.
+--
+-- Both columns are additive and nullable, with no @default, on purpose --
+-- this must tolerate a rolling deploy in BOTH directions:
+--   * Migrations run as a separate operator step BEFORE the new code
+--     starts, so for a window the OLD code runs against the NEW schema.
+--     Nullable, default-less columns the old code never writes are simply
+--     ignored by it.
+--   * If a deploy is rolled back, NEW-schema rows (with these columns
+--     populated) are read by OLD code, which does not select them at all
+--     -- nothing to migrate back.
+--   * An OLDER agent (or any row written before this migration ran) sends
+--     neither `hostnames` nor `onBoxProbes` on the wire at all. NULL is
+--     exactly what a nullable column with no default already gives a row
+--     that never mentions these columns -- no backfill needed, and no
+--     backfill would be honest here anyway: nobody ever recorded a real
+--     value for those older observations.
+--
+-- NULL carries a specific, load-bearing meaning distinct from `[]` --
+-- "this observation has no opinion about this system's hostnames" versus
+-- "a NEWER agent actually read the vhost config this tick and confirmed
+-- there is nothing there." Collapsing the two (e.g. by defaulting this
+-- column to `'[]'`) would render every pre-migration row, and every tick
+-- where a newer agent's own vhost read failed, as "confirmed no HTTP
+-- surface" -- a false claim this slice exists to stop making. See
+-- shared/src/wire.ts's SystemStateSchema.hostnames/onBoxProbes docstrings
+-- and web/src/server/ingest.ts for the code that preserves this distinction
+-- end to end.
+--
+-- A REAL SQL NULL, specifically -- NOT the JSON scalar `null` stored inside
+-- a JSONB value. `hostnames::text = 'null'` (a JSON scalar, satisfying
+-- neither of the two facts above) and `hostnames IS NULL` (a genuine
+-- absence, "no opinion") are different states this column can hold, and
+-- Prisma's client returns JS `null` for BOTH, which hides the difference
+-- from every ordinary read. ingest.ts writes `Prisma.DbNull` (a true SQL
+-- NULL) specifically because `Prisma.JsonNull` (the JSON scalar) would put
+-- this exact conflation back, one layer below the wire-level fix above --
+-- fix round 1's review caught this live against the test database
+-- (`hostnames IS NULL` reading FALSE under `Prisma.JsonNull`) after the
+-- unit tests, which only see the client's already-collapsed JS `null`,
+-- passed either way.
+ALTER TABLE "SystemObservation" ADD COLUMN     "hostnames" JSONB,
+ADD COLUMN     "onBoxProbes" JSONB;
