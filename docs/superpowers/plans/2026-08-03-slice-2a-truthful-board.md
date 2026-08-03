@@ -1004,6 +1004,46 @@ git commit -m "feat(web): a two-axis verdict that names where the fault is"
 
 ---
 
+### Task 7a: Store external probe results, and actually run the prober
+
+> **This task was missing from the plan and was added during execution.** Task 6 built `probeExternally`; Task 7 built the verdict that consumes two axes; Task 8's brief says its query "joins the latest external result per hostname"; Task 9 decides *when* to probe. **No task created anywhere to store a result, and no task ever called the prober.**
+>
+> On deploy the external axis would have been permanently absent, every verdict would have read `unconfirmed` forever, the Cert column would never have populated, and the two-axis design — the whole justification for this slice — would have been inert.
+>
+> It would also have failed *quietly*. Task 7's `not-probed` fix means a missing axis yields `unconfirmed` rather than a false `app-down`; without that fix this gap would have produced wrong red rows. The change that made it safe is the change that made it invisible.
+
+**Files:**
+- Modify: `web/prisma/schema.prisma` + new migration
+- Create: `web/src/lib/external-probe-runner.ts` and its test
+- Modify: `web/src/lib/fleet-query.ts` so the board can read the stored results
+
+**Interfaces:**
+- Consumes: `probeExternally`, `ExternalResult` (Task 6); `shouldRunExternalProbe` (Task 9, if already landed — otherwise leave the cadence seam clean and let Task 9 wire it).
+- Produces: a stored external result per hostname, readable as the second axis, carrying its own observation time so the board can show its age.
+
+**Requirements:**
+
+- **Store per hostname, not per system.** A system can have several hostnames and they can disagree — that is the point of spec §8's expansion. Storing one result per system would average away the failing hostname, which spec §8 forbids explicitly.
+- **Record when the result was observed.** Spec §5.1 requires the board to show the age of the last external result, so a stale one is never mistaken for a fresh one. A result with no timestamp cannot satisfy that.
+- **Persist across restarts and age rather than reset.** Task 7's reviewer relied on this when it judged the `unconfirmed` window to be a cold-start cost rather than a recurring gap. If results vanished on restart, that judgement would be wrong.
+- **Store `certExpiresAt` only when observed.** Never infer, never carry forward a previous handshake's value into a failed one — spec §6.
+- **A run that cannot reach anything must not overwrite good results with failures.** Spec §9's fleet-wide guard exists because one local network fault must not redden the board; the same reasoning applies to storage. Decide and state whether a fleet-wide failure writes at all.
+- The migration is additive and nullable, and must tolerate a rolling deploy in both directions — old code against the new schema, and new-schema data read by old code after a rollback.
+
+- [ ] **Step 1: Write the failing test**
+
+Tests must assert on the **stored row**, not on the object passed in — a test asserting on an argument rather than on what reached the other side has already produced one Critical in this slice. Cover at minimum: a result is stored and read back per hostname; two hostnames on one system are stored independently and a failing one is not averaged away; `certExpiresAt` is null when the handshake failed; a stored result carries an observation time; and a fleet-wide failure behaves as the task decides, tested either way.
+
+- [ ] **Step 2: Run it and watch it fail**
+
+- [ ] **Step 3: Implement**
+
+- [ ] **Step 4: Run it and watch it pass**, then the full suite from the repo root.
+
+- [ ] **Step 5: Commit**
+
+---
+
 ### Task 8: The board says it — URL, Answers, Cert
 
 **Files:**
