@@ -1,3 +1,5 @@
+import { join } from 'node:path'
+
 /**
  * Derives which hostnames serve which system, by reading the host's
  * reverse-proxy configuration rather than a maintained list.
@@ -233,6 +235,54 @@ export function parseVhost(text: string, upstreams: ReadonlyMap<string, number>)
 export function parseServerBlocks(text: string, upstreams: ReadonlyMap<string, number>): VhostEntry[] {
   const clean = stripComments(text)
   return extractServerBlocks(clean).map((block) => parseBlockEntry(block, upstreams))
+}
+
+/** The two filesystem calls this module needs, so a test needs no mocking of node:fs. */
+export type VhostFs = {
+  readdir(d: string): Promise<string[]>
+  readFile(p: string): Promise<string>
+}
+
+/**
+ * Reads every vhost file in a directory.
+ *
+ * `readFile` follows symlinks; this is load-bearing rather than incidental.
+ * The enabled-vhost directory is entirely symlinks into an adjacent
+ * directory, and a scan that does not follow them returns nothing while
+ * looking exactly like a scan of a host with no vhosts. That happened
+ * twice during the survey for this slice, using `grep -r`, which skips
+ * symlinks where `grep -R` follows them. Do not "optimise" this by
+ * filtering entries on file type or resolving links yourself -- the
+ * plain, unfiltered `readFile` call below is the fix, not an accident.
+ *
+ * Never throws: a missing directory or an unreadable file yields fewer
+ * entries, not a failed collection cycle. A probe is a diagnostic; if it
+ * cannot see, it must report less, never crash the collection loop.
+ *
+ * This function cannot distinguish "the directory does not exist" from
+ * "the directory exists and is empty" -- both return `[]`. That is a real
+ * gap: a host with genuinely zero vhosts and a misconfigured probe path
+ * look identical here. Whatever calls this must not treat an empty result
+ * as "this system serves nothing" without also checking that the
+ * directory itself is reachable -- otherwise this reintroduces, one layer
+ * up, exactly the silent-empty-scan failure this module exists to prevent.
+ */
+export async function readVhostDir(dir: string, fs: VhostFs): Promise<Array<{ text: string }>> {
+  let names: string[]
+  try {
+    names = await fs.readdir(dir)
+  } catch {
+    return []
+  }
+  const out: Array<{ text: string }> = []
+  for (const n of names) {
+    try {
+      out.push({ text: await fs.readFile(join(dir, n)) })
+    } catch {
+      // One unreadable file must not blind the scan to the rest.
+    }
+  }
+  return out
 }
 
 export function discoverHostnamesByPort(files: Array<{ text: string }>): Map<number, string[]> {

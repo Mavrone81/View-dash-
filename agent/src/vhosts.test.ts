@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { parseVhost, parseServerBlocks, discoverHostnamesByPort, parseUpstreams } from './vhosts.js'
+import { parseVhost, parseServerBlocks, discoverHostnamesByPort, parseUpstreams, readVhostDir } from './vhosts.js'
+import { mkdtemp, mkdir, writeFile, symlink, readdir, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const NONE = new Map<string, number>()
 
@@ -196,5 +199,50 @@ describe('parseUpstreams', () => {
       { text: 'upstream backend { server 127.0.0.1:8901; }' },
     ])
     expect(upstreams.get('backend')).toBe(8901)
+  })
+})
+
+describe('reading the vhost directory', () => {
+  it('follows symlinks, because the enabled directory is nothing but symlinks', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'vhosts-'))
+    try {
+      const available = join(root, 'available')
+      const enabled = join(root, 'enabled')
+      await mkdir(available)
+      await mkdir(enabled)
+      await writeFile(join(available, 'a.conf'), 'server { server_name a.example.invalid; }')
+      await symlink(join(available, 'a.conf'), join(enabled, 'a.conf'))
+
+      const files = await readVhostDir(enabled, {
+        readdir: (d) => readdir(d),
+        readFile: (p) => readFile(p, 'utf8'),
+      })
+
+      expect(files).toHaveLength(1)
+      expect(files[0]!.text).toContain('a.example.invalid')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('skips a file it cannot read rather than failing the whole scan', async () => {
+    const files = await readVhostDir('/enabled', {
+      readdir: async () => ['ok.conf', 'gone.conf'],
+      readFile: async (p) => {
+        if (p.endsWith('gone.conf')) throw new Error('ENOENT')
+        return 'server { server_name ok.example.invalid; }'
+      },
+    })
+    expect(files).toHaveLength(1)
+  })
+
+  it('returns empty when the directory does not exist, without throwing', async () => {
+    const files = await readVhostDir('/nope', {
+      readdir: async () => {
+        throw new Error('ENOENT')
+      },
+      readFile: async () => '',
+    })
+    expect(files).toEqual([])
   })
 })
