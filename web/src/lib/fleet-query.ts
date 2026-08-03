@@ -1,10 +1,33 @@
 import { PrismaClient, Prisma } from '@prisma/client'
 import type { HostnameConfig, OnBoxProbeResult, ProbeOutcome } from '@bevora-ops/shared'
 import { prisma } from './db.js'
-import { displayState } from './staleness.js'
+import { displayState, DEFAULT_STALE_AFTER_MS } from './staleness.js'
 import { buildBeatTrace, BEAT_WINDOW_MS, type Beat } from './beats.js'
 import { combine, primaryHostname, type Axis, type Verdict } from './answers.js'
 import type { FleetRow, HostnameAnswer } from '../components/FleetTable.js'
+
+/**
+ * Final whole-branch review, C1: the on-box axis's own staleness ceiling --
+ * re-exported, NOT redefined, from `staleness.ts`'s `DEFAULT_STALE_AFTER_MS`
+ * (three missed 30-second agent ticks), for the identical reason
+ * `EXTERNAL_PROBE_INTERVAL_MS` below is imported rather than re-picked by
+ * Task 9's scheduler: a second `90_000` defined here, even one that happens
+ * to hold the same value today, would decouple this ceiling from
+ * `displayState`'s the moment either one is edited alone.
+ *
+ * Before this constant existed, `buildHostnameAnswers` gated the EXTERNAL
+ * axis on `EXTERNAL_RESULT_STALE_AFTER_MS` but read `onBoxProbes` at
+ * whatever age the stored observation happened to be, with no ceiling at
+ * all -- so an agent silent for 24 hours still produced a live-looking
+ * on-box opinion, and worse, a `route-broken` verdict that named the wrong
+ * fault (DNS/routing/certificate) when the far likelier truth, given that
+ * agent silence and app-unreachability share the same machine, is that the
+ * host itself is down. `EXTERNAL_RESULT_STALE_AFTER_MS`'s own docstring
+ * already claimed this file worked "exactly as `displayState` refuses to
+ * vouch for a stale on-box observation" -- true of the STATE column, never
+ * of this one, until this constant closed the gap.
+ */
+export const ON_BOX_STALE_AFTER_MS = DEFAULT_STALE_AFTER_MS
 
 /**
  * Five minutes -- the external probe's own cadence (spec §5.1). Recorded
@@ -30,11 +53,13 @@ export const EXTERNAL_PROBE_INTERVAL_MS = 300_000
  * spec §5.1 exists to prevent: "an old result presented as current is the
  * same lie this slice exists to remove." `buildHostnameAnswers` below
  * refuses to feed a result older than this into `combine()`'s external
- * axis, exactly as `displayState` (staleness.ts) refuses to vouch for a
- * stale on-box observation rather than passing its raw health straight
- * through. THREE cadences (15 minutes): one or two missed cycles is
- * ordinary cadence jitter; crossing three means the axis's silence is
- * itself the signal, not a fluke tick.
+ * axis -- and (final whole-branch review, C1) does the SAME for the on-box
+ * axis via `ON_BOX_STALE_AFTER_MS` above, so both axes now refuse to vouch
+ * for a stale observation exactly as `displayState` (staleness.ts) already
+ * refused to for the State column; before that fix this docstring's claim
+ * held for one axis, not both. THREE cadences (15 minutes): one or two
+ * missed cycles is ordinary cadence jitter; crossing three means the axis's
+ * silence is itself the signal, not a fluke tick.
  *
  * The RAW age is still always reported on `HostnameAnswer.externalAgeMs`
  * regardless of this ceiling -- an operator can and should see "checked 9
@@ -491,6 +516,15 @@ function neverReportedRow(hostId: string, hostName: string, lastSeenAt: Date | n
  */
 function buildHostnameAnswers(
   hostnames: HostnameConfig[],
+  // Final whole-branch review, C1: the caller (`systemRow`) is responsible
+  // for gating this to `null` once the observation it came from is too old
+  // to trust as a live opinion (`ON_BOX_STALE_AFTER_MS`, mirroring
+  // `displayState`'s own staleness gate) -- see `systemRow`'s own comment at
+  // its call site. This function does not re-derive that gate itself:
+  // `systemRow` gates the SAME `onBoxProbes` value before it reaches BOTH
+  // this function and the unnamed-port list a few lines below in
+  // `systemRow`, so there is exactly one place that decides "is the on-box
+  // snapshot still current", not two that could disagree.
   onBoxProbes: OnBoxProbeResult[] | null,
   externalByHostname: Map<string, LatestExternalResult>,
   fleetWideFailure: boolean,
@@ -566,9 +600,46 @@ function systemRow(
   fleetWideFailure: boolean,
 ): FleetRow {
   const hostnames = o ? parseHostnames(o.hostnames) : null
-  const onBoxProbes = o ? parseOnBoxProbes(o.onBoxProbes) : null
+  const rawOnBoxProbes = o ? parseOnBoxProbes(o.onBoxProbes) : null
 
-  const hostnameAnswers = buildHostnameAnswers(hostnames ?? [], onBoxProbes, externalByHostname, fleetWideFailure, now)
+  // Final whole-branch review, C1: treat the WHOLE on-box snapshot as absent
+  // once the observation it came from is too old to trust as a live
+  // opinion -- the on-box axis's own mirror of `displayState`'s staleness
+  // gate on the State column, via the SAME constant
+  // (`ON_BOX_STALE_AFTER_MS`, re-exported from `staleness.ts` so the two
+  // never drift apart). Before this fix, `onBoxProbes` was read at whatever
+  // age the stored observation happened to be, with no ceiling at all: an
+  // agent silent for 24 hours still produced a live-looking on-box
+  // `answering`, which combined with a FRESH external failure into
+  // `route-broken` ("app up, route broken") -- naming exactly the wrong
+  // fault, since agent silence and app-unreachability share a machine and
+  // the far likelier truth is that the HOST is down.
+  //
+  // Gated HERE, once, rather than inside `buildHostnameAnswers` alone,
+  // because `onBoxProbes` feeds TWO consumers below: the per-hostname axis
+  // that function folds into `verdict`, and the unnamed-port list
+  // (`unnamed`) a few lines down. An "answered on-box" claim about a port
+  // with no vhost is exactly as capable of misleading the operator once it
+  // is 24 hours stale as a named hostname's claim is, so both must see the
+  // SAME gated value rather than one being fixed and the other quietly
+  // exempt.
+  //
+  // A future `receivedAt` (a clock fault somewhere upstream) is ALSO
+  // treated as not-current, mirroring `displayState`'s own handling of a
+  // future receive time: a clock that could not honestly have produced this
+  // reading yet is not grounds to trust it as live.
+  //
+  // `FleetRow.onBoxProbes` itself (the return statement below) still gets
+  // `rawOnBoxProbes`, UNGATED -- its own docstring in FleetTable.tsx
+  // documents it as "the raw, complete list" for this tick, and that
+  // contract does not change here. `currentOnBoxProbes` is a SEPARATE,
+  // gated view used only to decide `verdict` and the unnamed-port list --
+  // the two places a stale reading could be misread as a live opinion.
+  const onBoxAgeMs = o ? now.getTime() - o.receivedAt.getTime() : null
+  const onBoxIsCurrent = onBoxAgeMs !== null && onBoxAgeMs >= 0 && onBoxAgeMs <= ON_BOX_STALE_AFTER_MS
+  const currentOnBoxProbes = onBoxIsCurrent ? rawOnBoxProbes : null
+
+  const hostnameAnswers = buildHostnameAnswers(hostnames ?? [], currentOnBoxProbes, externalByHostname, fleetWideFailure, now)
 
   // `hostname: null` entries are a published port with no vhost mapping --
   // Task 5's positive "a port with no name answered" fact, not tied to any
@@ -609,7 +680,7 @@ function systemRow(
   // port with no name answered on-box (N)" independently of `verdict` --
   // but a fact that can only be positive must never be allowed to BECOME
   // the verdict on its own; it may only ever fail to move one.
-  const unnamed = (onBoxProbes ?? []).filter((p) => p.hostname === null)
+  const unnamed = (currentOnBoxProbes ?? []).filter((p) => p.hostname === null)
 
   const verdict = worstVerdict(hostnameAnswers.map((h) => h.verdict))
 
@@ -677,7 +748,7 @@ function systemRow(
     // here is reserved for the "no system exists" placeholder row.
     beats,
     hostnames,
-    onBoxProbes,
+    onBoxProbes: rawOnBoxProbes,
     primaryHostname: primary,
     verdict,
     leadHostnameAnswer,

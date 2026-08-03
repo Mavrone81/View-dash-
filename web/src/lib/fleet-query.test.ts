@@ -8,6 +8,7 @@ import {
   worstVerdict,
   NO_SYSTEMS_LABEL,
   EXTERNAL_RESULT_STALE_AFTER_MS,
+  ON_BOX_STALE_AFTER_MS,
 } from './fleet-query.js'
 import { BEAT_COUNT, BEAT_INTERVAL_MS } from './beats.js'
 
@@ -1199,6 +1200,149 @@ describe('the Answers/Cert join (Task 8)', () => {
       // The handshake-failure fact survives, ungated by the same ceiling.
       expect(answer.certHandshakeFailed).toBe(true)
       expect(answer.externalAgeMs).toBeGreaterThan(EXTERNAL_RESULT_STALE_AFTER_MS)
+    })
+  })
+
+  // THE DENIAL TESTS for the final whole-branch review's C1: before this
+  // fix, `onBoxProbes` was read at whatever age the observation happened to
+  // be, with NO ceiling -- unlike the external axis just above, which
+  // already refused to trust a result past `EXTERNAL_RESULT_STALE_AFTER_MS`.
+  // These three scenarios are the review's own report table, reproduced
+  // exactly: an agent silent for 24 hours (far past `ON_BOX_STALE_AFTER_MS`)
+  // must never let a day-old on-box reading render as a live opinion, in
+  // EITHER direction -- an `answering` reading must not produce a green
+  // `healthy` row (and must not misname a fresh external failure as
+  // `route-broken`, which blames the route/DNS/certificate when the far
+  // likelier truth is that the HOST itself is down), and a `not-answering`
+  // reading must not produce a `contradiction` verdict.
+  describe('the on-box staleness ceiling (final whole-branch review, C1)', () => {
+    it('does not let a day-old on-box "answering" reading combine with a fresh external "answering" into a green healthy row', async () => {
+      const { system } = await makeSystem('sys-stale-onbox-healthy', 'host-stale-onbox-healthy')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: oneDayAgo, // the WHOLE observation -- hostnames, onBoxProbes -- is this old
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.hostnameAnswers[0]!.onBoxOutcome).toBeNull()
+      expect(rows[0]!.verdict).not.toBe('healthy')
+      expect(rows[0]!.verdict).toBe('unconfirmed')
+    })
+
+    it('does not let a day-old on-box "answering" reading combine with a fresh external failure into "route-broken" -- the agent\'s own silence means the host, not the route, is the likelier fault', async () => {
+      const { system } = await makeSystem('sys-stale-onbox-route', 'host-stale-onbox-route')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: oneDayAgo,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'not-answering', status: null, observedAt: now },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.hostnameAnswers[0]!.onBoxOutcome).toBeNull()
+      expect(rows[0]!.verdict).not.toBe('route-broken')
+      expect(rows[0]!.verdict).toBe('unconfirmed')
+    })
+
+    it('does not let a day-old on-box "not-answering" reading combine with a fresh external "answering" into a contradiction that is really just stale evidence', async () => {
+      const { system } = await makeSystem('sys-stale-onbox-contradiction', 'host-stale-onbox-contradiction')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: oneDayAgo,
+          health: 'down',
+          containersTotal: 1,
+          containersRunning: 0,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'not-answering', status: null }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.hostnameAnswers[0]!.onBoxOutcome).toBeNull()
+      expect(rows[0]!.verdict).not.toBe('contradiction')
+      expect(rows[0]!.verdict).toBe('unconfirmed')
+    })
+
+    it('still treats an on-box reading just inside the ceiling as a current opinion', async () => {
+      const { system } = await makeSystem('sys-onbox-fresh-enough', 'host-onbox-fresh-enough')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const justInside = new Date(now.getTime() - (ON_BOX_STALE_AFTER_MS - 1_000))
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: justInside,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.hostnameAnswers[0]!.onBoxOutcome).toBe('answering')
+      expect(rows[0]!.verdict).toBe('healthy')
+    })
+
+    // M2 companion, at the same layer this fix lives at: a stale
+    // observation's ANSWERING unnamed (no-vhost) port must not still render
+    // as "a port with no name answered on-box" -- the same positive claim
+    // the named-hostname fix above exists to gate, applied to the OTHER
+    // consumer of `onBoxProbes` (`systemRow`'s `unnamed` list).
+    it('does not report a day-old unnamed on-box "answering" probe as a current positive fact', async () => {
+      const { system } = await makeSystem('sys-stale-unnamed', 'host-stale-unnamed')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: oneDayAgo,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [],
+          onBoxProbes: [{ hostname: null, outcome: 'answering', status: 200 }],
+        },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.unnamedOnBoxProbes).toEqual([])
     })
   })
 

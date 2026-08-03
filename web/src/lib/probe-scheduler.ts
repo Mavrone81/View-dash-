@@ -88,7 +88,7 @@ export async function runExternalProbeCycle(
   try {
     const lastRun = await latestExternalProbeRun(client)
     if (!shouldRunExternalProbe(lastRun?.ranAt ?? null, now)) return
-    const targets = await currentExternalProbeTargets(client)
+    const targets = await currentExternalProbeTargets(client, now)
     await runExternalProbes(targets, deps, client)
   } catch (err) {
     // Contained, the same way `agent/src/loop.ts`'s `createTickRunner`

@@ -1,6 +1,7 @@
 import { PrismaClient, Prisma } from '@prisma/client'
 import type { HostnameConfig } from '@bevora-ops/shared'
 import { prisma } from './db.js'
+import { ON_BOX_STALE_AFTER_MS } from './fleet-query.js'
 
 /**
  * What the external prober is told to probe THIS sweep: every hostname
@@ -84,11 +85,31 @@ function parseHostnames(raw: Prisma.JsonValue): HostnameConfig[] | null {
  * hostname (e.g. a shared load balancer vhost) should still produce exactly
  * one probe target, not one real request per system that happens to name
  * it.
+ *
+ * Final whole-branch review, M2: bounded to a system whose latest
+ * observation is no older than `ON_BOX_STALE_AFTER_MS` -- the SAME ceiling
+ * `fleet-query.ts`'s `buildHostnameAnswers` now gates the on-box axis with
+ * (final whole-branch review, C1), imported rather than re-picked for the
+ * identical coupling reason `probe-scheduler.ts` already imports
+ * `EXTERNAL_PROBE_INTERVAL_MS` from that same file. Before this bound, a
+ * decommissioned or permanently offline host's LAST reported hostnames
+ * stayed the "latest" row forever (`SystemObservation` rows are never
+ * deleted), so this function kept handing them to the external prober
+ * indefinitely -- real internet requests against applications nobody
+ * monitors any more, three of which belong to another business. A system
+ * that stops reporting simply ages out of this list on its own, with no
+ * separate retention pass, the same way a retired HOSTNAME already aged out
+ * via the "latest observation per system" rule above.
  */
-export async function currentExternalProbeTargets(client: PrismaClient = prisma): Promise<ExternalProbeTarget[]> {
+export async function currentExternalProbeTargets(
+  client: PrismaClient = prisma,
+  now: Date = new Date(),
+): Promise<ExternalProbeTarget[]> {
+  const cutoff = new Date(now.getTime() - ON_BOX_STALE_AFTER_MS)
   const rows = await client.$queryRaw<LatestHostnamesRow[]>`
     SELECT DISTINCT ON ("systemId") "systemId", "hostnames"
     FROM "SystemObservation"
+    WHERE "receivedAt" >= ${cutoff}
     ORDER BY "systemId", "receivedAt" DESC
   `
 

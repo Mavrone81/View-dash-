@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { Prisma } from '@prisma/client'
 import { prisma } from './db.js'
 import { currentExternalProbeTargets } from './external-probe-targets.js'
+import { ON_BOX_STALE_AFTER_MS } from './fleet-query.js'
 
 // This file touches Host/System/SystemObservation, the same shared tables
 // fleet-query.test.ts wipes -- run serially (vitest.config.ts's
@@ -50,6 +51,7 @@ describe('currentExternalProbeTargets', () => {
   // non-null observation for the same system resurface a stale target.
   it('does not resurrect a hostname from an OLDER observation when the latest one has hostnames: null', async () => {
     const system = await makeSystem('host-2', 'sys-2')
+    const now = new Date('2026-08-01T10:05:30Z') // shortly after the latest observation below
     await prisma.systemObservation.create({
       data: {
         systemId: system.id,
@@ -77,7 +79,11 @@ describe('currentExternalProbeTargets', () => {
       },
     })
 
-    const targets = await currentExternalProbeTargets()
+    // Explicit `now`, kept within M2's age bound of BOTH rows above, so this
+    // test's own discriminating claim (reading only the latest row) is not
+    // conflated with M2's separate age bound -- see the "does not include a
+    // hostname..." test below for what happens when `now` is left to drift.
+    const targets = await currentExternalProbeTargets(prisma, now)
 
     expect(targets.find((t) => t.hostname === 'stale.example.invalid')).toBeUndefined()
   })
@@ -108,6 +114,7 @@ describe('currentExternalProbeTargets', () => {
 
   it('does not include a hostname a system used to report but no longer does -- bounded by the CURRENT latest observation only', async () => {
     const system = await makeSystem('host-4', 'sys-4')
+    const now = new Date('2026-08-01T09:05:30Z') // shortly after the latest observation below
     await prisma.systemObservation.create({
       data: {
         systemId: system.id,
@@ -129,7 +136,11 @@ describe('currentExternalProbeTargets', () => {
       },
     })
 
-    const targets = await currentExternalProbeTargets()
+    // Explicit `now`, not the real clock (final whole-branch review, M2
+    // added an age bound to this query) -- see this file's other fixed-date
+    // tests just below for the same adjustment, and their own comment for
+    // why.
+    const targets = await currentExternalProbeTargets(prisma, now)
 
     expect(targets.map((t) => t.hostname)).toEqual(['current.example.invalid'])
   })
@@ -181,5 +192,54 @@ describe('currentExternalProbeTargets', () => {
   it('returns an empty list when there are no systems at all', async () => {
     const targets = await currentExternalProbeTargets()
     expect(targets).toEqual([])
+  })
+
+  // THE DENIAL TEST for the final whole-branch review's M2 -- a
+  // decommissioned or permanently offline host's LAST observation stays the
+  // "latest" row on disk forever (SystemObservation rows are never
+  // deleted), so with no age bound this function would keep handing its
+  // hostnames to the external prober long after anyone stopped monitoring
+  // it: real internet requests against applications nobody watches any
+  // more, three of which belong to another business.
+  describe('the observation-age bound (final whole-branch review, M2)', () => {
+    it('excludes a system whose latest observation is older than ON_BOX_STALE_AFTER_MS -- a decommissioned host stops being probed on its own', async () => {
+      const system = await makeSystem('host-decommissioned', 'sys-decommissioned')
+      const now = new Date('2026-08-01T12:00:00Z')
+      const longAfter = new Date(now.getTime() - (ON_BOX_STALE_AFTER_MS + 1_000))
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: longAfter,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: 'decommissioned.example.invalid', listensTls: true }],
+        },
+      })
+
+      const targets = await currentExternalProbeTargets(prisma, now)
+
+      expect(targets).toEqual([])
+    })
+
+    it('still includes a system whose latest observation is just inside the bound', async () => {
+      const system = await makeSystem('host-still-alive', 'sys-still-alive')
+      const now = new Date('2026-08-01T12:00:00Z')
+      const justInside = new Date(now.getTime() - (ON_BOX_STALE_AFTER_MS - 1_000))
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: justInside,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: 'still-alive.example.invalid', listensTls: true }],
+        },
+      })
+
+      const targets = await currentExternalProbeTargets(prisma, now)
+
+      expect(targets.map((t) => t.hostname)).toEqual(['still-alive.example.invalid'])
+    })
   })
 })
