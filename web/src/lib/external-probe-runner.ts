@@ -71,8 +71,28 @@ export async function runExternalProbes(
   client: PrismaClient = prisma,
 ): Promise<ExternalProbeRunResult> {
   const results = await Promise.all(hostnames.map((hostname) => probeExternally(hostname, deps)))
+  const fleetWide = isFleetWideExternalFailure(results)
 
-  if (isFleetWideExternalFailure(results)) {
+  // Task 8 fix round 1 (C2b): a run-level record, written EVERY time this
+  // ran with at least one hostname to probe -- including (especially) a
+  // fleet-wide failure, which is exactly when `ExternalProbeResult` below
+  // writes NOTHING. Without this, the board's fleet-wide banner had no
+  // honest signal to read: `isFleetWideExternalFailure` over
+  // `latestExternalResultsByHostname`'s per-hostname rows has no time
+  // bound, so it could fire (or fail to fire) based on results from
+  // cycles unrelated to "this sweep". `ExternalProbeRun` answers "when did
+  // the last sweep run, and did it reach anything" directly, independent
+  // of whatever the per-hostname history happens to contain.
+  //
+  // Skipped for an EMPTY hostname list: there was nothing to attempt, which
+  // is a different fact from "attempted and reached nothing" -- recording
+  // a run here would let a board with no hostnames yet (nothing configured,
+  // not a fault) read as a sweep that failed.
+  if (hostnames.length > 0) {
+    await client.externalProbeRun.create({ data: { reachedAnything: !fleetWide } })
+  }
+
+  if (fleetWide) {
     return { results, stored: false }
   }
 

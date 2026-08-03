@@ -26,6 +26,7 @@ const row = (over = {}) => ({
   onBoxProbes: null,
   primaryHostname: null,
   verdict: 'unprobed' as const,
+  leadHostnameAnswer: null,
   tlsConfigured: null,
   certDaysRemaining: null,
   hostnameAnswers: [],
@@ -330,6 +331,41 @@ describe('FleetTable', () => {
       expect(link.getAttribute('href')).toBe('https://alpha.example.invalid/')
     })
 
+    // Fix round 1 (Task 8 review), I3, scoped exactly as asked: only the
+    // link SCHEME, not the prober itself (that half is Task 9's job, since
+    // it owns the hostname list the runner receives).
+    it('links a deliberately plain-HTTP vhost with http://, not a permanently-wrong https://', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [{ hostname: 'alpha.example.invalid', listensTls: false }],
+              primaryHostname: 'alpha.example.invalid',
+              hostnameAnswers: [healthyHostnameAnswer({ listensTls: false })],
+            }),
+          ]}
+        />,
+      )
+      const link = screen.getByRole('link', { name: 'alpha.example.invalid' })
+      expect(link.getAttribute('href')).toBe('http://alpha.example.invalid/')
+    })
+
+    it('still defaults to https:// when listensTls is undetermined this tick (null)', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [{ hostname: 'alpha.example.invalid', listensTls: null }],
+              primaryHostname: 'alpha.example.invalid',
+              hostnameAnswers: [healthyHostnameAnswer({ listensTls: null })],
+            }),
+          ]}
+        />,
+      )
+      const link = screen.getByRole('link', { name: 'alpha.example.invalid' })
+      expect(link.getAttribute('href')).toBe('https://alpha.example.invalid/')
+    })
+
     it('reveals every other hostname on expansion, not just the primary', () => {
       const { container } = render(
         <FleetTable
@@ -388,6 +424,12 @@ describe('FleetTable', () => {
       render(<FleetTable rows={[row({ verdict: 'unconfirmed' })]} />)
       const cell = screen.getByTestId('answers-cell')
       expect(cell.getAttribute('data-verdict')).toBe('unconfirmed')
+      // POSITIVE presence check, not just the two negatives below --
+      // `VERDICT_COPY.unconfirmed = ''` left every one of those 47 tests
+      // green in fix round 1, because nothing anywhere pinned the actual
+      // text this state renders. `.answer-word` is scoped so this cannot
+      // accidentally match copy belonging to a different verdict.
+      expect(cell.querySelector('.answer-word')?.textContent).toBe('not yet confirmed')
       expect(within(cell).queryByText(/^healthy$/i)).toBeNull()
       expect(within(cell).queryByText(/down|broken|contradiction/i)).toBeNull()
     })
@@ -403,18 +445,15 @@ describe('FleetTable', () => {
     })
 
     it('names the proxy specifically when the failing axis is a 502/504', () => {
+      const answer = healthyHostnameAnswer({ verdict: 'route-broken', externalOutcome: 'proxy-no-upstream' })
       render(
         <FleetTable
           rows={[
             row({
               verdict: 'route-broken',
               primaryHostname: 'alpha.example.invalid',
-              hostnameAnswers: [
-                healthyHostnameAnswer({
-                  verdict: 'route-broken',
-                  externalOutcome: 'proxy-no-upstream',
-                }),
-              ],
+              hostnameAnswers: [answer],
+              leadHostnameAnswer: answer,
             }),
           ]}
         />,
@@ -423,13 +462,15 @@ describe('FleetTable', () => {
     })
 
     it('names a TLS handshake failure as its own thing, not folded silently into "app down"', () => {
+      const answer = healthyHostnameAnswer({ verdict: 'route-broken', externalOutcome: 'tls-failed' })
       render(
         <FleetTable
           rows={[
             row({
               verdict: 'route-broken',
               primaryHostname: 'alpha.example.invalid',
-              hostnameAnswers: [healthyHostnameAnswer({ verdict: 'route-broken', externalOutcome: 'tls-failed' })],
+              hostnameAnswers: [answer],
+              leadHostnameAnswer: answer,
             }),
           ]}
         />,
@@ -438,12 +479,15 @@ describe('FleetTable', () => {
     })
 
     it('shows the age of the last external result, so a stale one cannot pass as fresh (spec §5.1)', () => {
+      const answer = healthyHostnameAnswer({ externalAgeMs: 7 * 60_000 })
       render(
         <FleetTable
           rows={[
             row({
+              verdict: 'healthy',
               primaryHostname: 'alpha.example.invalid',
-              hostnameAnswers: [healthyHostnameAnswer({ externalAgeMs: 7 * 60_000 })],
+              hostnameAnswers: [answer],
+              leadHostnameAnswer: answer,
             }),
           ]}
         />,
@@ -475,6 +519,12 @@ describe('FleetTable', () => {
     // the component renders that correctly-computed verdict rather than
     // fabricating its own "healthy" from, say, the primary hostname alone.
     it('does not average a failing hostname into a green row', () => {
+      const failing = healthyHostnameAnswer({
+        hostname: 'beta.example.invalid',
+        verdict: 'app-down',
+        onBoxOutcome: 'not-answering',
+        externalOutcome: 'not-answering',
+      })
       render(
         <FleetTable
           rows={[
@@ -484,16 +534,9 @@ describe('FleetTable', () => {
                 { hostname: 'beta.example.invalid', listensTls: true },
               ],
               primaryHostname: 'alpha.example.invalid', // the healthy one, chosen for the link
-              hostnameAnswers: [
-                healthyHostnameAnswer(),
-                healthyHostnameAnswer({
-                  hostname: 'beta.example.invalid',
-                  verdict: 'app-down',
-                  onBoxOutcome: 'not-answering',
-                  externalOutcome: 'not-answering',
-                }),
-              ],
+              hostnameAnswers: [healthyHostnameAnswer(), failing],
               verdict: 'app-down', // the row's own worst-of, as fleet-query.ts computes it
+              leadHostnameAnswer: failing, // the hostname that actually produced that verdict
             })]}
         />,
       )
@@ -510,16 +553,68 @@ describe('FleetTable', () => {
       // simply dropped because the summary reads badly already.
       expect(within(cell).getByText(/beta\.example\.invalid/)).toBeTruthy()
     })
+
+    // THE DENIAL TEST for fix round 1's I2: the summary's parenthetical
+    // detail and age must come from `leadHostnameAnswer` (the hostname that
+    // actually produced the row's verdict), NEVER from the primary
+    // hostname -- which can legitimately be a DIFFERENT, healthy one. Using
+    // the primary's evidence here would produce a sentence contradicting
+    // itself (the verdict names one fault, the parenthetical describes a
+    // different, unrelated hostname's evidence).
+    it('takes the Answers summary detail from the hostname that produced the verdict, never from a different, healthy primary', () => {
+      const primaryAnswer = healthyHostnameAnswer() // alpha: healthy, no detail, no proxy/TLS failure
+      const lead = healthyHostnameAnswer({
+        hostname: 'beta.example.invalid',
+        verdict: 'route-broken',
+        externalOutcome: 'proxy-no-upstream',
+        externalAgeMs: 3 * 60_000,
+      })
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [
+                { hostname: 'alpha.example.invalid', listensTls: true },
+                { hostname: 'beta.example.invalid', listensTls: true },
+              ],
+              primaryHostname: 'alpha.example.invalid', // the healthy one -- deliberately NOT the lead
+              hostnameAnswers: [primaryAnswer, lead],
+              verdict: 'route-broken',
+              leadHostnameAnswer: lead,
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('answers-cell')
+      // Scoped to `.answer-detail`/`.answer-age` SPECIFICALLY -- the
+      // per-hostname expansion below independently renders beta's own
+      // detail and age a second time regardless of which hostname the
+      // SUMMARY actually used, so an unscoped query over the whole cell
+      // would pass even if the summary read the wrong hostname's evidence.
+      const summaryDetail = cell.querySelector('.answer-detail')
+      const summaryAge = cell.querySelector('.answer-age')
+      expect(summaryDetail?.textContent).toMatch(/proxy up, app not responding/i)
+      expect(summaryAge?.textContent).toMatch(/3m ago/)
+    })
   })
 
   // Spec §6/§8: "Cert -- days remaining, amber under 21, red under 7. 'No
   // certificate' where TLS is configured without one."
   describe('the Cert column (spec §6/§8)', () => {
+    // Every fixture below needs a non-null, non-empty `hostnames` --
+    // `CertCell` (fix round 1, I1) checks that FIRST, before ever looking
+    // at `primaryHostname`/`hostnameAnswers`, so leaving it at row()'s
+    // default `null` would make every one of these tests exercise the
+    // "hostname data not available" branch instead of the severity logic
+    // they mean to test.
+    const oneHostname = [{ hostname: 'alpha.example.invalid', listensTls: true }]
+
     it('shows a certificate under 7 days as red, not amber', () => {
       render(
         <FleetTable
           rows={[
             row({
+              hostnames: oneHostname,
               primaryHostname: 'alpha.example.invalid',
               tlsConfigured: true,
               certDaysRemaining: 3,
@@ -536,6 +631,7 @@ describe('FleetTable', () => {
         <FleetTable
           rows={[
             row({
+              hostnames: oneHostname,
               primaryHostname: 'alpha.example.invalid',
               tlsConfigured: true,
               certDaysRemaining: 15,
@@ -552,6 +648,7 @@ describe('FleetTable', () => {
         <FleetTable
           rows={[
             row({
+              hostnames: oneHostname,
               primaryHostname: 'alpha.example.invalid',
               tlsConfigured: true,
               certDaysRemaining: 21,
@@ -563,15 +660,18 @@ describe('FleetTable', () => {
       expect(screen.getByTestId('cert-cell').getAttribute('data-severity')).toBe('ok')
     })
 
-    it('says "no certificate" where TLS is configured without one', () => {
+    it('says "no certificate" where TLS is configured and the handshake itself reached and failed', () => {
       render(
         <FleetTable
           rows={[
             row({
+              hostnames: oneHostname,
               primaryHostname: 'alpha.example.invalid',
               tlsConfigured: true,
               certDaysRemaining: null,
-              hostnameAnswers: [healthyHostnameAnswer({ certDaysRemaining: null, certExpiresAt: null })],
+              hostnameAnswers: [
+                healthyHostnameAnswer({ certDaysRemaining: null, certExpiresAt: null, externalOutcome: 'tls-failed' }),
+              ],
             }),
           ]}
         />,
@@ -581,11 +681,65 @@ describe('FleetTable', () => {
       expect(cell.getAttribute('data-severity')).toBe('red')
     })
 
+    // Fix round 1 (Task 8 review), C1: an ABSENCE of a days-remaining
+    // figure must not, on its own, read as red. Only when the evidence
+    // says the handshake was reached and failed (`tls-failed`, tested
+    // above) is that a supported claim -- a hostname the external axis has
+    // simply never reached yet (Task 9 not deployed, or the check failed
+    // before ever reaching TLS) must read as "not observed", not "missing".
+    it('does NOT say "no certificate" when the external axis has simply never reached this hostname -- that is "not checked", not "missing"', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: oneHostname,
+              primaryHostname: 'alpha.example.invalid',
+              tlsConfigured: true,
+              certDaysRemaining: null,
+              hostnameAnswers: [
+                healthyHostnameAnswer({ certDaysRemaining: null, certExpiresAt: null, externalOutcome: null }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('cert-cell')
+      expect(within(cell).queryByText(/^no certificate$/i)).toBeNull()
+      expect(within(cell).getByText(/not checked yet/i)).toBeTruthy()
+      expect(cell.getAttribute('data-severity')).toBe('unknown')
+    })
+
+    // Same absence, but this time the probe DID run and failed BEFORE
+    // reaching TLS at all (DNS, timeout, refused connection --
+    // `not-answering`) -- still not evidence of a missing certificate.
+    it('does NOT say "no certificate" when the probe failed before ever reaching the TLS layer', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: oneHostname,
+              primaryHostname: 'alpha.example.invalid',
+              tlsConfigured: true,
+              certDaysRemaining: null,
+              hostnameAnswers: [
+                healthyHostnameAnswer({ certDaysRemaining: null, certExpiresAt: null, externalOutcome: 'not-answering' }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('cert-cell')
+      expect(within(cell).queryByText(/^no certificate$/i)).toBeNull()
+      expect(within(cell).getByText(/not observed this check/i)).toBeTruthy()
+      expect(cell.getAttribute('data-severity')).toBe('unknown')
+    })
+
     it('does not conflate "TLS not configured" with "no certificate" -- they are different facts', () => {
       render(
         <FleetTable
           rows={[
             row({
+              hostnames: oneHostname,
               primaryHostname: 'alpha.example.invalid',
               tlsConfigured: false,
               certDaysRemaining: null,
@@ -608,6 +762,7 @@ describe('FleetTable', () => {
         <FleetTable
           rows={[
             row({
+              hostnames: oneHostname,
               primaryHostname: 'alpha.example.invalid',
               tlsConfigured: null,
               certDaysRemaining: null,
@@ -627,25 +782,73 @@ describe('FleetTable', () => {
       render(<FleetTable rows={[row({ hostnames: [], primaryHostname: null, hostnameAnswers: [] })]} />)
       expect(within(screen.getByTestId('cert-cell')).getByText(/no http surface/i)).toBeTruthy()
     })
+
+    // THE DENIAL TEST for fix round 1's I1: an enrolled host that has never
+    // checked in (`hostnames: null`, no opinion this tick) must NOT read as
+    // "no HTTP surface" in the Cert column -- that is the CONFIRMED-empty
+    // sentence, a different and stronger claim than "we simply do not know
+    // yet". The previous CertCell fell through to `certLabel(null)` for
+    // BOTH cases, destroying the distinction Task 5 spent two fix rounds
+    // preserving in the URL column.
+    it('does NOT say "no HTTP surface" in the Cert column when hostnames is null (never checked), unlike confirmed-empty', () => {
+      render(<FleetTable rows={[row({ hostnames: null, primaryHostname: null, hostnameAnswers: [] })]} />)
+      const cell = screen.getByTestId('cert-cell')
+      expect(within(cell).queryByText(/no http surface/i)).toBeNull()
+      expect(cell.textContent?.toLowerCase()).toContain('not available')
+    })
   })
 
   // Spec §9: "A fleet-wide external failure is a probe fault, not twenty
   // outages ... the board says the dashboard could not reach anything and
   // falls back to displaying on-box results -- it must NOT turn every row
-  // red."
+  // red." Fix round 1 (Task 8 review), C2b: the banner is now driven by a
+  // run-level record (`lastExternalSweep`), not an inference over
+  // per-hostname rows, and its wording says how long ago the sweep ran
+  // rather than claiming "this cycle" when the data cannot support it.
   describe('the fleet-wide external-failure banner (spec §9)', () => {
-    it('shows a probe-side banner instead of reddening every row', () => {
-      render(<FleetTable rows={[row({ verdict: 'healthy' })]} externalProbeFailedFleetWide />)
-      expect(screen.getByText(/could not reach/i)).toBeTruthy()
+    it('shows a probe-side banner naming how long ago the sweep ran, instead of reddening every row', () => {
+      render(
+        <FleetTable
+          rows={[row({ verdict: 'healthy' })]}
+          lastExternalSweep={{ reachedAnything: false, ageMs: 4 * 60_000 }}
+        />,
+      )
+      expect(screen.getByText(/reached nothing/i)).toBeTruthy()
+      expect(screen.getByText(/4m ago/)).toBeTruthy()
+      expect(screen.queryByText(/this cycle/i)).toBeNull()
       // The banner does not itself repaint a row -- a healthy row (as
       // fleet-query.ts would have ALREADY computed it, falling back to
       // on-box evidence) still reads healthy underneath the banner.
       expect(within(screen.getByTestId('answers-cell')).getByText(/^healthy$/i)).toBeTruthy()
     })
 
-    it('shows no banner at all when the flag is absent', () => {
+    it('shows no banner when the last sweep reached something', () => {
+      render(
+        <FleetTable
+          rows={[row({ verdict: 'healthy' })]}
+          lastExternalSweep={{ reachedAnything: true, ageMs: 4 * 60_000 }}
+        />,
+      )
+      expect(screen.queryByText(/reached nothing/i)).toBeNull()
+    })
+
+    it('shows no banner at all when no sweep has ever run', () => {
+      render(<FleetTable rows={[row({ verdict: 'healthy' })]} lastExternalSweep={null} />)
+      expect(screen.queryByText(/reached nothing/i)).toBeNull()
+    })
+
+    it('shows no banner when the prop is simply omitted', () => {
       render(<FleetTable rows={[row({ verdict: 'healthy' })]} />)
-      expect(screen.queryByText(/could not reach/i)).toBeNull()
+      expect(screen.queryByText(/reached nothing/i)).toBeNull()
+    })
+
+    // Minor 2 (Task 8 review): the banner must survive the empty-board
+    // early return, since it is a fact about the DASHBOARD's own probing,
+    // independent of whether any system happens to be enrolled.
+    it('still shows the banner on an empty board, alongside the "no systems" message', () => {
+      render(<FleetTable rows={[]} lastExternalSweep={{ reachedAnything: false, ageMs: 60_000 }} />)
+      expect(screen.getByText(/reached nothing/i)).toBeTruthy()
+      expect(screen.getByText(/no systems reported/i)).toBeTruthy()
     })
   })
 })

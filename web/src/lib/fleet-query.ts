@@ -3,8 +3,36 @@ import type { HostnameConfig, OnBoxProbeResult, ProbeOutcome } from '@bevora-ops
 import { prisma } from './db.js'
 import { displayState } from './staleness.js'
 import { buildBeatTrace, BEAT_WINDOW_MS, type Beat } from './beats.js'
-import { combine, primaryHostname, isFleetWideExternalFailure, type Axis, type Verdict } from './answers.js'
+import { combine, primaryHostname, type Axis, type Verdict } from './answers.js'
 import type { FleetRow, HostnameAnswer } from '../components/FleetTable.js'
+
+/**
+ * Five minutes -- the external probe's own cadence (spec §5.1). Recorded
+ * here, not imported from Task 9's not-yet-written scheduler, so this file
+ * carries no dependency on work that has not landed; Task 9 should import
+ * THIS constant rather than choosing the number a second, independent time.
+ */
+export const EXTERNAL_PROBE_INTERVAL_MS = 300_000
+
+/**
+ * Past this age, a stored external result is not merely old -- it is stale
+ * enough that treating it as a CURRENT opinion would be exactly the lie
+ * spec §5.1 exists to prevent: "an old result presented as current is the
+ * same lie this slice exists to remove." `buildHostnameAnswers` below
+ * refuses to feed a result older than this into `combine()`'s external
+ * axis, exactly as `displayState` (staleness.ts) refuses to vouch for a
+ * stale on-box observation rather than passing its raw health straight
+ * through. THREE cadences (15 minutes): one or two missed cycles is
+ * ordinary cadence jitter; crossing three means the axis's silence is
+ * itself the signal, not a fluke tick.
+ *
+ * The RAW age is still always reported on `HostnameAnswer.externalAgeMs`
+ * regardless of this ceiling -- an operator can and should see "checked 9
+ * days ago" even though the board stops trusting that reading as a live
+ * opinion. This mirrors `lastSeenAt`/`deployedSha` elsewhere on this board:
+ * a historical fact stays visible even once it has stopped being current.
+ */
+export const EXTERNAL_RESULT_STALE_AFTER_MS = EXTERNAL_PROBE_INTERVAL_MS * 3
 
 // Shape of one row returned by the DISTINCT ON query below. Typed
 // explicitly against the SystemObservation columns it selects, so the raw
@@ -184,37 +212,77 @@ export const NO_SYSTEMS_LABEL = '(no systems reported yet)'
  *     normal.
  */
 /**
- * `latestPerSystem`'s result: the board's rows, plus spec §9's fleet-wide
- * external-probe-failure flag, computed ONCE for the whole fetch (see
- * below) rather than per row -- it describes the dashboard's OWN probing,
- * not any one system's state, so it does not belong on `FleetRow` itself.
+ * The last recorded run of the external prober, whatever its outcome --
+ * see `ExternalProbeRun` in schema.prisma. `null` means no sweep has ever
+ * run (a fresh deploy, before Task 9's scheduler has fired once).
+ */
+export type LatestExternalProbeRun = { ranAt: Date; reachedAnything: boolean }
+
+/**
+ * Fix round 1 (Task 8 review), C2b: the fleet-wide banner used to be
+ * INFERRED from `isFleetWideExternalFailure` over
+ * `latestExternalResultsByHostname`'s per-hostname rows -- which have no
+ * time bound (Task 7a's rule keeps the previous good result as "latest"
+ * during an outage). Two applications failing three weeks apart could both
+ * read as "failing now", and the banner would announce a fleet-wide fault
+ * "this cycle" that never happened; meanwhile a REAL dashboard-network
+ * outage, which writes NOTHING to `ExternalProbeResult` (by the same rule),
+ * would produce no visible signal at all.
+ *
+ * `ExternalProbeRun` is written on every sweep, including one that reached
+ * nothing, specifically so this function has a single row to read instead
+ * of an inference over unrelated history.
+ */
+export async function latestExternalProbeRun(client: PrismaClient = prisma): Promise<LatestExternalProbeRun | null> {
+  const row = await client.externalProbeRun.findFirst({ orderBy: { ranAt: 'desc' } })
+  return row ? { ranAt: row.ranAt, reachedAnything: row.reachedAnything } : null
+}
+
+/**
+ * `latestPerSystem`'s result: the board's rows, plus the last external
+ * sweep's own status, computed ONCE for the whole fetch rather than per
+ * row -- it describes the dashboard's OWN probing, not any one system's
+ * state, so it does not belong on `FleetRow` itself.
  */
 export type FleetBoard = {
   rows: FleetRow[]
   /**
-   * True when every hostname with a stored external result on this board
-   * is currently failing (`isFleetWideExternalFailure`, Task 7) -- spec
-   * §9's guard against reading a local network fault as twenty
-   * simultaneous outages. Every row's own `verdict` already reflects the
-   * fallback this triggers (the external axis is treated as absent while
-   * this is true, see `latestPerSystem`'s body) -- this flag exists only
-   * to drive the banner text, not to change any row's colour a second time.
+   * `null` when no external sweep has ever run. Otherwise, whether that
+   * sweep reached anything and how long ago (relative to `now`) it ran.
+   * Every row's own `verdict` already reflects the fallback this triggers
+   * when `reachedAnything` is false (the external axis is treated as
+   * absent, see `latestPerSystem`'s body) -- this field exists to drive the
+   * banner's text, not to change any row's colour a second time.
    */
-  externalProbeFailedFleetWide: boolean
+  lastExternalSweep: { reachedAnything: boolean; ageMs: number } | null
 }
 
 export async function latestPerSystem(now: Date, client: PrismaClient = prisma): Promise<FleetBoard> {
+  // Independent of whether any host/system exists at all -- the sweep is a
+  // fact about the DASHBOARD's own probing, not about the fleet it probes.
+  const lastRun = await latestExternalProbeRun(client)
+  const lastExternalSweep = lastRun
+    ? { reachedAnything: lastRun.reachedAnything, ageMs: now.getTime() - lastRun.ranAt.getTime() }
+    : null
+  // Spec §9's fallback: while the last sweep reached nothing, every
+  // hostname's verdict is built as if the external axis were simply absent
+  // (`combine(onBox, null)`), which can only ever resolve to `unprobed` or
+  // `unconfirmed`, never a fault verdict -- so the guard's promise ("shows
+  // the on-box results ... does not turn every row red") holds by
+  // construction, not by a second, separate check.
+  const fleetWideFailure = lastRun !== null && !lastRun.reachedAnything
+
   // Hosts first, and ordered here, so the board's ordering is host-major
   // and stable regardless of what systems exist under each.
   const hosts = await client.host.findMany({ orderBy: { name: 'asc' } })
-  if (hosts.length === 0) return { rows: [], externalProbeFailedFleetWide: false }
+  if (hosts.length === 0) return { rows: [], lastExternalSweep }
 
   const systems = await client.system.findMany({ orderBy: { key: 'asc' } })
   if (systems.length === 0) {
     // Every enrolled host, all of them awaiting a first report.
     return {
       rows: hosts.map((h) => neverReportedRow(h.id, h.name, h.lastSeenAt)),
-      externalProbeFailedFleetWide: false,
+      lastExternalSweep,
     }
   }
 
@@ -265,17 +333,6 @@ export async function latestPerSystem(now: Date, client: PrismaClient = prisma):
   }
   const externalByHostname = await latestExternalResultsByHostname([...allHostnames], client)
 
-  // Spec §9: if every hostname this board currently has an external result
-  // for is failing, the far more likely cause is THIS SERVER's own network,
-  // not a simultaneous outage of every independent application being
-  // watched. `systemRow` below is handed this flag and, when true, builds
-  // every hostname's verdict as if the external axis were simply absent
-  // (`combine(onBox, null)`) -- which can only ever resolve to `unprobed` or
-  // `unconfirmed`, never a fault verdict, so the fleet-wide guard's promise
-  // ("shows the on-box results ... does not turn every row red") holds by
-  // construction rather than by a second, separate check.
-  const externalProbeFailedFleetWide = isFleetWideExternalFailure([...externalByHostname.values()])
-
   const byHostId = new Map<string, typeof systems>()
   for (const s of systems) {
     const arr = byHostId.get(s.hostId) ?? []
@@ -304,12 +361,12 @@ export async function latestPerSystem(now: Date, client: PrismaClient = prisma):
           beatsBySystemId.get(s.id) ?? [],
           now,
           externalByHostname,
-          externalProbeFailedFleetWide,
+          fleetWideFailure,
         ),
       )
     }
   }
-  return { rows, externalProbeFailedFleetWide }
+  return { rows, lastExternalSweep }
 }
 
 /** A host that is enrolled but has never reported a single system. */
@@ -346,6 +403,7 @@ function neverReportedRow(hostId: string, hostName: string, lastSeenAt: Date | n
     onBoxProbes: null,
     primaryHostname: null,
     verdict: 'unprobed',
+    leadHostnameAnswer: null,
     tlsConfigured: null,
     certDaysRemaining: null,
     hostnameAnswers: [],
@@ -363,6 +421,18 @@ function neverReportedRow(hostId: string, hostName: string, lastSeenAt: Date | n
  * holds. That is spec §9's fallback in code: a fleet-wide external failure
  * must fall back to on-box evidence, not report the (almost certainly
  * locally-caused) external failures as this system's own fault.
+ *
+ * Fix round 1 (Task 8 review), C3: a stored external result older than
+ * `EXTERNAL_RESULT_STALE_AFTER_MS` is likewise treated as NO CURRENT
+ * OPINION -- `externalOutcome`, `certExpiresAt` and `certDaysRemaining` all
+ * read `null`, and `combine()` never sees its axis -- exactly the same
+ * "absent" treatment `fleetWideFailure` already gets. Without this, a
+ * result from nine days ago (a hostname the sweep has quietly stopped
+ * reaching) would still count as a live "healthy" opinion forever, which is
+ * precisely the lie spec §5.1 exists to remove. `externalAgeMs` is the one
+ * field that is NEVER nulled by staleness -- an operator must still be able
+ * to see "checked 9 days ago" even though the board itself stops trusting
+ * the content of that reading.
  */
 function buildHostnameAnswers(
   hostnames: HostnameConfig[],
@@ -374,19 +444,25 @@ function buildHostnameAnswers(
   return hostnames.map((h) => {
     const onBoxEntry = onBoxProbes?.find((p) => p.hostname === h.hostname) ?? null
     const onBoxAxis = onBoxEntry ? toAxis(onBoxEntry.outcome, onBoxEntry.status) : null
+
     const external = fleetWideFailure ? undefined : externalByHostname.get(h.hostname)
-    const externalAxis = external ? toAxis(external.outcome, external.status) : null
-    const certDaysRemaining = external?.certExpiresAt
-      ? Math.floor((external.certExpiresAt.getTime() - now.getTime()) / 86_400_000)
-      : null
+    const externalAgeMs = external ? now.getTime() - external.observedAt.getTime() : null
+    const externalIsCurrent = external !== undefined && externalAgeMs !== null && externalAgeMs <= EXTERNAL_RESULT_STALE_AFTER_MS
+
+    const externalAxis = externalIsCurrent ? toAxis(external.outcome, external.status) : null
+    const certDaysRemaining =
+      externalIsCurrent && external.certExpiresAt
+        ? Math.floor((external.certExpiresAt.getTime() - now.getTime()) / 86_400_000)
+        : null
+
     return {
       hostname: h.hostname,
       verdict: combine(onBoxAxis, externalAxis),
       onBoxOutcome: onBoxAxis?.outcome ?? null,
       externalOutcome: externalAxis?.outcome ?? null,
-      externalAgeMs: external ? now.getTime() - external.observedAt.getTime() : null,
+      externalAgeMs,
       listensTls: h.listensTls,
-      certExpiresAt: external?.certExpiresAt ?? null,
+      certExpiresAt: externalIsCurrent ? (external.certExpiresAt ?? null) : null,
       certDaysRemaining,
     }
   })
@@ -419,6 +495,20 @@ function systemRow(
   const unnamedVerdicts: Verdict[] = unnamed.map((p) => combine(toAxis(p.outcome, p.status), null))
 
   const verdict = worstVerdict([...hostnameAnswers.map((h) => h.verdict), ...unnamedVerdicts])
+
+  // Fix round 1 (Task 8 review), I2: the Answers cell's parenthetical
+  // detail (spec §5's "proxy up, app not responding" / "TLS handshake
+  // failed") must come from the hostname that actually PRODUCED the row's
+  // worst verdict, never from `primaryAnswer` below -- `primaryHostname()`
+  // prefers a hostname that ANSWERS, so the two can disagree, and reading
+  // the detail off the wrong one produces a sentence that contradicts
+  // itself ("contradiction -- unreachable on-box, answering from outside
+  // (proxy up, app not responding)" when the PRIMARY hostname, not the one
+  // in contradiction, happened to see a 502). `null` when no NAMED hostname
+  // reaches the row's worst severity -- i.e. the worst verdict came from an
+  // unnamed on-box probe instead, which has no hostname to attribute a
+  // detail to.
+  const leadHostnameAnswer = hostnameAnswers.find((h) => h.verdict === verdict) ?? null
 
   // The clickable URL prefers a hostname that ANSWERS (see
   // `primaryHostname`'s own docstring) -- built from whichever axis has an
@@ -473,6 +563,7 @@ function systemRow(
     onBoxProbes,
     primaryHostname: primary,
     verdict,
+    leadHostnameAnswer,
     tlsConfigured: primaryAnswer?.listensTls ?? null,
     certDaysRemaining: primaryAnswer?.certDaysRemaining ?? null,
     hostnameAnswers,

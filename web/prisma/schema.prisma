@@ -146,6 +146,38 @@ model ExternalProbeResult {
   @@index([hostname, observedAt])
 }
 
+/// One row per RUN of the external prober (Task 9's scheduler calls
+/// `runExternalProbes` once per cycle), NOT per hostname -- deliberately a
+/// separate table from `ExternalProbeResult` above, and for the opposite
+/// storage rule: `ExternalProbeResult` writes NOTHING on a fleet-wide
+/// failure (to protect prior good per-hostname evidence from being
+/// overwritten by a local network fault -- see external-probe-runner.ts),
+/// but the board's fleet-wide banner needs the OPPOSITE: a record of every
+/// sweep, INCLUDING the ones that reached nothing, because that is the
+/// only honest signal it can be driven from.
+///
+/// Fix round 1 (Task 8 review): the banner was previously inferred from
+/// `isFleetWideExternalFailure` over `latestExternalResultsByHostname`'s
+/// per-hostname rows, which has no time bound -- two applications failing
+/// three weeks apart could both read as "failing now" and the banner would
+/// claim a fleet-wide fault "this cycle" that never happened. This table
+/// makes "when did the last sweep run, and did it reach anything" a single,
+/// directly-queryable fact instead of an inference over unrelated rows.
+model ExternalProbeRun {
+  id   String   @id @default(uuid())
+  /// Set by THIS SERVER's own clock, same reasoning as
+  /// `ExternalProbeResult.observedAt` -- no remote clock in this path.
+  ranAt DateTime @default(now())
+  /// True unless EVERY hostname probed this run failed (see
+  /// `isFleetWideExternalFailure`) -- i.e. the same test that decides
+  /// whether `ExternalProbeResult` gets written this run, but recorded
+  /// here regardless of the outcome, which is the whole point of this
+  /// table existing separately.
+  reachedAnything Boolean
+
+  @@index([ranAt])
+}
+
 model AgentEnrolment {
   id        String    @id @default(uuid())
   hostId    String

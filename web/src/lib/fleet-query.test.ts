@@ -1,7 +1,14 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { PrismaClient, type Prisma } from '@prisma/client'
 import { prisma } from './db.js'
-import { latestPerSystem, latestExternalResultsByHostname, worstVerdict, NO_SYSTEMS_LABEL } from './fleet-query.js'
+import {
+  latestPerSystem,
+  latestExternalResultsByHostname,
+  latestExternalProbeRun,
+  worstVerdict,
+  NO_SYSTEMS_LABEL,
+  EXTERNAL_RESULT_STALE_AFTER_MS,
+} from './fleet-query.js'
 import { BEAT_COUNT, BEAT_INTERVAL_MS } from './beats.js'
 
 beforeEach(async () => {
@@ -10,6 +17,7 @@ beforeEach(async () => {
   await prisma.agentEnrolment.deleteMany()
   await prisma.host.deleteMany()
   await prisma.externalProbeResult.deleteMany()
+  await prisma.externalProbeRun.deleteMany()
 })
 
 describe('latestPerSystem', () => {
@@ -810,73 +818,248 @@ describe('the Answers/Cert join (Task 8)', () => {
     expect(rows[0]!.primaryHostname).toBe(HOSTNAME_A) // the healthy one, chosen for the clickable URL
     expect(rows[0]!.verdict).not.toBe('healthy')
     expect(rows[0]!.verdict).toBe('app-down') // the worst of A's healthy and B's app-down
+    // I2: the Answers cell's detail must come from the hostname that
+    // PRODUCED the verdict (B), never from the primary (A) -- reading A's
+    // evidence here would describe a contradiction that does not exist.
+    expect(rows[0]!.leadHostnameAnswer?.hostname).toBe(HOSTNAME_B)
   })
 
-  // THE DENIAL TEST for spec §9's fleet-wide guard, at the point where it
-  // actually renders: a local probe fault must fall back to on-box
-  // evidence, not report the (almost certainly locally-caused) external
-  // failure as THIS system's own fault. One hostname, on-box healthy,
-  // external down -- with only one hostname on the whole board,
-  // `isFleetWideExternalFailure` reads this as fleet-wide. Without the
-  // fallback this would read `route-broken`; mutation-verified (see
-  // task-8-report.md) that removing the fallback reproduces exactly that.
-  it('falls back to on-box-only evidence, and does not report route-broken, when every external result on the board is failing', async () => {
-    const { system } = await makeSystem('sys-fleet-fail', 'host-fleet-fail')
-    const now = new Date('2026-08-03T12:00:00Z')
-    await prisma.systemObservation.create({
-      data: {
-        systemId: system.id,
-        receivedAt: now,
-        health: 'healthy',
-        containersTotal: 1,
-        containersRunning: 1,
-        hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
-        onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
-      },
-    })
-    await prisma.externalProbeResult.create({
-      data: { hostname: HOSTNAME_A, outcome: 'not-answering', status: null, observedAt: now },
+  // Fix round 1 (Task 8 review), C2b -- the fleet-wide flag is now a
+  // directly recorded fact (`ExternalProbeRun`, written by the runner on
+  // EVERY sweep including a failed one), not an inference over
+  // `latestExternalResultsByHostname`'s per-hostname rows. These tests
+  // exercise the QUERY side of that fix; `external-probe-runner.test.ts`
+  // exercises the WRITE side.
+  describe('the fleet-wide fallback, driven by ExternalProbeRun (C2b)', () => {
+    // THE DENIAL TEST for spec §9's fleet-wide guard, at the point where it
+    // actually renders: a local probe fault must fall back to on-box
+    // evidence, not report the (almost certainly locally-caused) external
+    // failure as THIS system's own fault.
+    it('falls back to on-box-only evidence, and does not report route-broken, when the last recorded sweep reached nothing', async () => {
+      const { system } = await makeSystem('sys-fleet-fail', 'host-fleet-fail')
+      const now = new Date('2026-08-03T12:00:00Z')
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      // A FRESH, non-stale stored result that -- if it were NOT suppressed
+      // by the fleet-wide fallback -- would combine with the healthy
+      // on-box axis into a definite `route-broken`. Seeded deliberately so
+      // this test actually DISCRIMINATES the fallback: without it, nothing
+      // is stored for HOSTNAME_A at all, and the axis would already read
+      // null/`unconfirmed` regardless of whether the fallback ran, so the
+      // assertion below would pass even with the fallback deleted.
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'not-answering', status: null, observedAt: now },
+      })
+      await prisma.externalProbeRun.create({
+        data: { ranAt: now, reachedAnything: false },
+      })
+
+      const board = await latestPerSystem(now)
+
+      expect(board.lastExternalSweep).not.toBeNull()
+      expect(board.lastExternalSweep!.reachedAnything).toBe(false)
+      expect(board.rows[0]!.verdict).not.toBe('route-broken')
+      expect(board.rows[0]!.verdict).not.toBe('app-down')
+      expect(board.rows[0]!.verdict).toBe('unconfirmed')
     })
 
-    const board = await latestPerSystem(now)
+    it('does not fall back when the last recorded sweep reached something, even for a genuine PARTIAL failure', async () => {
+      const { system } = await makeSystem('sys-partial', 'host-partial')
+      const now = new Date('2026-08-03T12:00:00Z')
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [
+            { hostname: HOSTNAME_A, listensTls: true },
+            { hostname: HOSTNAME_B, listensTls: true },
+          ],
+          onBoxProbes: [
+            { hostname: HOSTNAME_A, outcome: 'answering', status: 200 },
+            { hostname: HOSTNAME_B, outcome: 'answering', status: 200 },
+          ],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_B, outcome: 'not-answering', status: null, observedAt: now },
+      })
+      await prisma.externalProbeRun.create({ data: { ranAt: now, reachedAnything: true } })
 
-    expect(board.externalProbeFailedFleetWide).toBe(true)
-    expect(board.rows[0]!.verdict).not.toBe('route-broken')
-    expect(board.rows[0]!.verdict).not.toBe('app-down')
-    expect(board.rows[0]!.verdict).toBe('unconfirmed')
+      const board = await latestPerSystem(now)
+
+      expect(board.lastExternalSweep!.reachedAnything).toBe(true)
+      expect(board.rows[0]!.verdict).toBe('route-broken') // B's real fault must still surface
+    })
+
+    // THE scenario C2b's review specifically named: a REAL, ongoing
+    // dashboard-network outage must be visible even though Task 7a's own
+    // rule leaves the STORED per-hostname rows looking perfectly healthy
+    // (they are the last GOOD results from before the outage started, and
+    // a fleet-wide failure writes nothing on top of them). The OLD,
+    // inferred version of this flag read `externalByHostname`'s values --
+    // all "answering" here -- and would have missed this outage entirely.
+    it('shows the fleet-wide fallback even when every STORED per-hostname result still looks healthy (the outage wrote nothing on top of them)', async () => {
+      const { system } = await makeSystem('sys-quiet-outage', 'host-quiet-outage')
+      const now = new Date('2026-08-03T12:00:00Z')
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      // The last GOOD result, stored before the outage began -- exactly
+      // what Task 7a's write-nothing-on-fleet-wide-failure rule leaves
+      // behind.
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+      // The CURRENT sweep recorded that it reached nothing -- this is the
+      // one fact this test hinges on.
+      await prisma.externalProbeRun.create({ data: { ranAt: now, reachedAnything: false } })
+
+      const board = await latestPerSystem(now)
+
+      expect(board.lastExternalSweep!.reachedAnything).toBe(false)
+    })
+
+    // THE scenario C2b's review named on the OTHER side: two applications
+    // failing three weeks apart must not both read as "failing NOW" and
+    // trigger a fleet-wide banner that never happened. Here, HOSTNAME_A's
+    // stored result is old and failing (its own genuine, isolated
+    // route-broken finding), but the MOST RECENT sweep (recorded
+    // separately) reached plenty -- so no fallback applies, and A's real
+    // fault stays visible.
+    it('does not let an old, isolated failing hostname retroactively read as a fleet-wide fault', async () => {
+      const { system } = await makeSystem('sys-old-failure', 'host-old-failure')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const threeWeeksAgo = new Date(now.getTime() - 21 * 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'not-answering', status: null, observedAt: threeWeeksAgo },
+      })
+      // The most recent sweep succeeded (reached other hostnames fine) --
+      // recorded independently of HOSTNAME_A's own stale, failing result.
+      await prisma.externalProbeRun.create({ data: { ranAt: now, reachedAnything: true } })
+
+      const board = await latestPerSystem(now)
+
+      expect(board.lastExternalSweep!.reachedAnything).toBe(true)
+      // A's own three-week-old result is ALSO past the staleness ceiling
+      // (C3), so it reads unconfirmed, not a false route-broken from stale
+      // data -- but critically, it is NOT suppressed by a fleet-wide
+      // fallback that never applied.
+      expect(board.rows[0]!.verdict).toBe('unconfirmed')
+    })
   })
 
-  it('does not treat a genuine PARTIAL failure (one hostname down, its neighbour fine) as fleet-wide', async () => {
-    const { system } = await makeSystem('sys-partial', 'host-partial')
-    const now = new Date('2026-08-03T12:00:00Z')
-    await prisma.systemObservation.create({
-      data: {
-        systemId: system.id,
-        receivedAt: now,
-        health: 'healthy',
-        containersTotal: 1,
-        containersRunning: 1,
-        hostnames: [
-          { hostname: HOSTNAME_A, listensTls: true },
-          { hostname: HOSTNAME_B, listensTls: true },
-        ],
-        onBoxProbes: [
-          { hostname: HOSTNAME_A, outcome: 'answering', status: 200 },
-          { hostname: HOSTNAME_B, outcome: 'answering', status: 200 },
-        ],
-      },
-    })
-    await prisma.externalProbeResult.create({
-      data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
-    })
-    await prisma.externalProbeResult.create({
-      data: { hostname: HOSTNAME_B, outcome: 'not-answering', status: null, observedAt: now },
+  describe('latestExternalProbeRun', () => {
+    it('returns null when no sweep has ever run', async () => {
+      expect(await latestExternalProbeRun()).toBeNull()
     })
 
-    const board = await latestPerSystem(now)
+    it('returns the MOST RECENT run, not the first one written', async () => {
+      await prisma.externalProbeRun.create({
+        data: { ranAt: new Date('2026-08-01T00:00:00Z'), reachedAnything: true },
+      })
+      await prisma.externalProbeRun.create({
+        data: { ranAt: new Date('2026-08-03T00:00:00Z'), reachedAnything: false },
+      })
 
-    expect(board.externalProbeFailedFleetWide).toBe(false)
-    expect(board.rows[0]!.verdict).toBe('route-broken') // B's real fault must still surface
+      const latest = await latestExternalProbeRun()
+
+      expect(latest?.reachedAnything).toBe(false)
+      expect(latest?.ranAt.toISOString()).toBe('2026-08-03T00:00:00.000Z')
+    })
+  })
+
+  // Fix round 1 (Task 8 review), C3: spec §5.1's "an old result presented
+  // as current is the same lie this slice exists to remove," applied to
+  // the VERDICT itself, not just the age label already shown alongside it.
+  describe('the external result staleness ceiling (C3)', () => {
+    it('treats a result older than the staleness ceiling as NO current opinion -- never a green healthy row from stale data', async () => {
+      const { system } = await makeSystem('sys-stale-healthy', 'host-stale-healthy')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const nineDaysAgo = new Date(now.getTime() - 9 * 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      // A NINE-DAY-OLD "healthy" result -- ancient relative to the 5-minute
+      // cadence, but still the "latest" row on disk for this hostname.
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: nineDaysAgo },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.verdict).not.toBe('healthy')
+      expect(rows[0]!.verdict).toBe('unconfirmed')
+      expect(rows[0]!.hostnameAnswers[0]!.externalOutcome).toBeNull()
+      // The RAW age is still reported -- an operator can still see how long
+      // ago it was actually checked, even though it no longer counts.
+      expect(rows[0]!.hostnameAnswers[0]!.externalAgeMs).toBeGreaterThan(EXTERNAL_RESULT_STALE_AFTER_MS)
+    })
+
+    it('still treats a result just inside the ceiling as a current opinion', async () => {
+      const { system } = await makeSystem('sys-fresh-enough', 'host-fresh-enough')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const justInside = new Date(now.getTime() - (EXTERNAL_RESULT_STALE_AFTER_MS - 1_000))
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: justInside },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.verdict).toBe('healthy')
+    })
   })
 
   it('computes days-remaining from the external probe\'s own handshake, and flags a configured-but-missing certificate', async () => {

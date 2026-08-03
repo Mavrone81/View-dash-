@@ -9,6 +9,7 @@ import type { ExternalDeps } from './external-probe.js'
 // same pattern for `SystemObservation`.
 beforeEach(async () => {
   await prisma.externalProbeResult.deleteMany()
+  await prisma.externalProbeRun.deleteMany()
 })
 
 const HOST_A = 'runner-a.example.invalid'
@@ -191,5 +192,62 @@ describe('runExternalProbes', () => {
     const deps = depsFor({})
     await expect(runExternalProbes([], deps)).resolves.toEqual({ results: [], stored: true })
     expect(await prisma.externalProbeResult.count()).toBe(0)
+  })
+
+  // Task 8 fix round 1 (C2b): a run-level record, distinct from the
+  // per-hostname `ExternalProbeResult` table above, so the board's
+  // fleet-wide banner has a directly queryable "when did the last sweep
+  // run, and did it reach anything" fact instead of an inference over
+  // per-hostname rows that may span unrelated cycles.
+  describe('the ExternalProbeRun record', () => {
+    it('records a successful sweep as having reached something', async () => {
+      await runExternalProbes([HOST_A], depsFor({ [HOST_A]: { status: 200, certExpiresAt: null } }))
+
+      const runs = await prisma.externalProbeRun.findMany()
+      expect(runs).toHaveLength(1)
+      expect(runs[0]?.reachedAnything).toBe(true)
+    })
+
+    it('records a fleet-wide failure as having reached nothing -- EVEN THOUGH ExternalProbeResult itself writes nothing', async () => {
+      const deps = depsFor({ [HOST_A]: networkFailure(), [HOST_B]: tlsFailure() })
+
+      await runExternalProbes([HOST_A, HOST_B], deps)
+
+      const runs = await prisma.externalProbeRun.findMany()
+      expect(runs).toHaveLength(1)
+      expect(runs[0]?.reachedAnything).toBe(false)
+      // The per-hostname table stays empty -- Task 7a's rule is untouched.
+      expect(await prisma.externalProbeResult.count()).toBe(0)
+    })
+
+    it('records a PARTIAL failure (one hostname down, its neighbour fine) as having reached something', async () => {
+      const deps = depsFor({
+        [HOST_A]: { status: 200, certExpiresAt: null },
+        [HOST_B]: networkFailure(),
+      })
+
+      await runExternalProbes([HOST_A, HOST_B], deps)
+
+      const runs = await prisma.externalProbeRun.findMany()
+      expect(runs).toHaveLength(1)
+      expect(runs[0]?.reachedAnything).toBe(true)
+    })
+
+    it('records nothing for an empty hostname list -- "nothing to attempt" is not the same fact as "attempted and failed"', async () => {
+      await runExternalProbes([], depsFor({}))
+
+      expect(await prisma.externalProbeRun.count()).toBe(0)
+    })
+
+    it('carries an observation time set by this server\'s own clock', async () => {
+      const before = new Date()
+      await runExternalProbes([HOST_A], depsFor({ [HOST_A]: { status: 200, certExpiresAt: null } }))
+      const after = new Date()
+
+      const run = await prisma.externalProbeRun.findFirst()
+      expect(run?.ranAt).toBeInstanceOf(Date)
+      expect(run!.ranAt.getTime()).toBeGreaterThanOrEqual(before.getTime())
+      expect(run!.ranAt.getTime()).toBeLessThanOrEqual(after.getTime())
+    })
   })
 })
