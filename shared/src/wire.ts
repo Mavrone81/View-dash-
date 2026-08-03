@@ -73,6 +73,17 @@ export type ProbeOutcome = z.infer<typeof ProbeOutcomeSchema>
  * Measured across every hostname on the monitored host, a "200 is healthy"
  * rule would have marked 19 of 42 as broken while they were fine, and a
  * column that cries wolf is a column nobody reads.
+ *
+ * INPUT DOMAIN: a real HTTP status from a COMPLETED response, nothing else.
+ * A probe that never got a response — DNS failure, refused connection, TLS
+ * rejection, timeout — must go to `classifyProbeFailure` instead, and every
+ * caller in this repository does that. The distinction matters because this
+ * function cannot represent "no answer": it is a ladder of comparisons over
+ * a number, so it will cheerfully classify a value that is not a status at
+ * all. 0 and 199 fall through to `answering`; 1000 lands on `not-answering`.
+ * Neither is reachable today, and neither is meaningful — do not add
+ * validation to make them so, add it at the call site that produced a
+ * non-status.
  */
 export function classifyHttpStatus(status: number): ProbeOutcome {
   if (status === 502 || status === 504) return 'proxy-no-upstream'
