@@ -4,11 +4,10 @@ import {
   parseServerBlocks,
   discoverHostnamesByPort,
   discoverTlsByHostname,
-  discoverTlsFromDir,
   parseUpstreams,
   readVhostDir,
   nodeVhostFs,
-  discoverHostnamesFromDir,
+  discoverVhostsFromDir,
 } from './vhosts.js'
 import { mkdtemp, mkdir, writeFile, symlink, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -335,52 +334,6 @@ describe('reading the vhost directory', () => {
   })
 })
 
-describe('discoverHostnamesFromDir', () => {
-  it('discovers hostnames by port when the directory is reachable', async () => {
-    const byPort = await discoverHostnamesFromDir('/enabled', {
-      readdir: async () => ['a.conf'],
-      readFile: async () => 'server { server_name found.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }',
-    })
-    expect(byPort?.get(8081)).toEqual(['found.example.invalid'])
-  })
-
-  it('reports an empty map (not null) when the directory can be listed but genuinely holds no vhosts', async () => {
-    const byPort = await discoverHostnamesFromDir('/enabled', {
-      readdir: async () => [],
-      readFile: async () => '',
-    })
-    expect(byPort).toEqual(new Map())
-  })
-
-  it('reads the directory listing exactly ONCE -- no separate reachability check before it, which would open a TOCTOU window', async () => {
-    let readdirCalls = 0
-    await discoverHostnamesFromDir('/enabled', {
-      readdir: async () => {
-        readdirCalls++
-        return []
-      },
-      readFile: async () => '',
-    })
-    expect(readdirCalls).toBe(1)
-  })
-
-  // The discriminating case: a directory that cannot be listed must come
-  // back as null, never as an empty Map -- readVhostDir alone cannot tell
-  // the two apart (both are `[]`), so a naive implementation that skips the
-  // reachability check and just calls readVhostDir + discoverHostnamesByPort
-  // would silently produce an empty Map here instead, which is
-  // indistinguishable downstream from "this host genuinely has no vhosts".
-  it('returns null, not an empty map, when the directory cannot be read at all', async () => {
-    const byPort = await discoverHostnamesFromDir('/enabled', {
-      readdir: async () => {
-        throw new Error('EACCES')
-      },
-      readFile: async () => '',
-    })
-    expect(byPort).toBeNull()
-  })
-})
-
 describe('discoverTlsByHostname', () => {
   it('maps a hostname to true when its server block listens for TLS', () => {
     const tls = discoverTlsByHostname([{ text: VHOST }])
@@ -464,37 +417,28 @@ server { listen 80; server_name samefile.example.invalid; }
   })
 })
 
-describe('discoverTlsFromDir', () => {
-  it('discovers the TLS bit per hostname when the directory is reachable', async () => {
-    const tls = await discoverTlsFromDir('/enabled', {
+describe('discoverVhostsFromDir', () => {
+  it('discovers hostnames by port AND the TLS bit per hostname, from one reachable read', async () => {
+    const discovery = await discoverVhostsFromDir('/enabled', {
       readdir: async () => ['a.conf'],
-      readFile: async () => 'server { listen 443 ssl; server_name found.example.invalid; }',
+      readFile: async () =>
+        'server { listen 443 ssl; server_name found.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }',
     })
-    expect(tls?.get('found.example.invalid')).toBe(true)
+    expect(discovery?.byPort.get(8081)).toEqual(['found.example.invalid'])
+    expect(discovery?.tlsByHostname.get('found.example.invalid')).toBe(true)
   })
 
-  it('reports an empty map (not null) when the directory can be listed but genuinely holds no vhosts', async () => {
-    const tls = await discoverTlsFromDir('/enabled', { readdir: async () => [], readFile: async () => '' })
-    expect(tls).toEqual(new Map())
-  })
-
-  // The discriminating case: collapsing "unreadable" into "empty" here would
-  // render every TLS-configured hostname on the host as plain HTTP -- the
-  // same false claim discoverHostnamesFromDir's null return exists to
-  // prevent, one axis over.
-  it('returns null, not an empty map, when the directory cannot be read at all', async () => {
-    const tls = await discoverTlsFromDir('/enabled', {
-      readdir: async () => {
-        throw new Error('EACCES')
-      },
+  it('reports an empty discovery (not null) when the directory can be listed but genuinely holds no vhosts', async () => {
+    const discovery = await discoverVhostsFromDir('/enabled', {
+      readdir: async () => [],
       readFile: async () => '',
     })
-    expect(tls).toBeNull()
+    expect(discovery).toEqual({ byPort: new Map(), tlsByHostname: new Map() })
   })
 
-  it('reads the directory listing exactly ONCE -- no separate reachability check before it', async () => {
+  it('reads the directory listing exactly ONCE -- no separate reachability check before it, which would open a TOCTOU window', async () => {
     let readdirCalls = 0
-    await discoverTlsFromDir('/enabled', {
+    await discoverVhostsFromDir('/enabled', {
       readdir: async () => {
         readdirCalls++
         return []
@@ -503,12 +447,105 @@ describe('discoverTlsFromDir', () => {
     })
     expect(readdirCalls).toBe(1)
   })
+
+  // The discriminating case: a directory that cannot be listed must come
+  // back as null, never as an empty discovery -- readVhostDir alone cannot
+  // tell the two apart (both are `[]`), so a naive implementation that skips
+  // the reachability check and just calls readVhostDir + the two pure
+  // derivations would silently produce an empty discovery here instead,
+  // which is indistinguishable downstream from "this host genuinely has no
+  // vhosts".
+  it('returns null, not an empty discovery, when the directory cannot be read at all', async () => {
+    const discovery = await discoverVhostsFromDir('/enabled', {
+      readdir: async () => {
+        throw new Error('EACCES')
+      },
+      readFile: async () => '',
+    })
+    expect(discovery).toBeNull()
+  })
+
+  // Fix round 2's Critical: proves the SINGLE-READ property structurally.
+  // `discoverHostnamesByPort` and `discoverTlsByHostname` must be derived
+  // from the exact SAME `files` array, produced by exactly ONE pass of
+  // `readNamedFiles` -- never from two independent passes (the shape the
+  // predecessor functions `discoverHostnamesFromDir`/`discoverTlsFromDir`
+  // had). Counting `readFile` invocations per name is a direct, mechanical
+  // way to prove that: two independent composed reads would call `readFile`
+  // TWICE for every name (once per axis); a single combined read calls it
+  // once.
+  //
+  // MUTATION-VERIFIED AGAINST TODAY'S (PRE-FIX) TWO-READ ARRANGEMENT: this
+  // test was run against a version of `discoverVhostsFromDir` implemented as
+  // a thin wrapper composing the OLD `discoverHostnamesFromDir(dir, fs)` and
+  // `discoverTlsFromDir(dir, fs)` (each doing its own independent
+  // readdir+readFile pass) and FAILED with `expected [ 2, 2 ] to deeply
+  // equal [ 1, 1 ]` -- see task-5-report.md, fix round 2, for the exact
+  // transcript. Restored to the real single-read implementation below and
+  // verified passing before this suite was finalised.
+  it('reads each named file exactly ONCE per invocation, not once per axis', async () => {
+    const readCounts = new Map<string, number>()
+    await discoverVhostsFromDir('/enabled', {
+      readdir: async () => ['a.conf', 'b.conf'],
+      readFile: async (p) => {
+        readCounts.set(p, (readCounts.get(p) ?? 0) + 1)
+        return 'server { listen 443 ssl; server_name x.example.invalid; }'
+      },
+    })
+    expect([...readCounts.values()]).toEqual([1, 1])
+  })
+
+  // Fix round 2's Critical, the concrete consequence of the property above:
+  // the reviewer reproduced this live through a real `collectSnapshot` --
+  // the TLS block's own file mid-write during the (former) SECOND
+  // (TLS-axis) read, while the (former) FIRST (hostname-axis) read moments
+  // earlier had seen it fine. That produced a hostname present in `byPort`
+  // (mapped to a real port, via the TLS block's own `proxy_pass`, seen by
+  // the read that succeeded) with a WRONG confident `false` in
+  // `tlsByHostname` (derived only from the plain redirect block, because
+  // the OTHER read never saw the TLS block at all) -- a wrong claim that
+  // WAS wire-visible, because `byPort` having the hostname is what makes it
+  // become a real probe target and enter a system's `hostnames` list.
+  //
+  // With a single combined read, the file that fails is absent from the ONE
+  // `files` array BOTH derivations are built from: the block that would
+  // have resolved this hostname's upstream never runs through
+  // `discoverHostnamesByPort` OR `discoverTlsByHostname`, so the hostname
+  // is absent from `byPort` too -- it can never become a probe target or a
+  // wire-visible `hostnames` entry for any system THIS TICK, regardless of
+  // what `tlsByHostname` happens to say about it from whatever OTHER,
+  // successfully-read blocks still declare the same name. That `false`
+  // below is an honest reflection of the ONE block this read actually saw
+  // (a plain redirect, genuinely not listening for TLS) -- not a wrong
+  // claim, because it is inert: with the hostname absent from `byPort`,
+  // nothing in `collect.ts` ever looks this entry up.
+  it('when the block that would resolve a hostname\'s upstream fails to read, the hostname is absent from byPort -- so it can never surface a wrong TLS claim on the wire, whatever tlsByHostname says about it from other blocks', async () => {
+    const discovery = await discoverVhostsFromDir('/enabled', {
+      readdir: async () => ['a-redirect.conf', 'b-tls-block.conf'],
+      readFile: async (p) => {
+        if (p.endsWith('b-tls-block.conf')) throw new Error('EBUSY: file is being written')
+        // The plain port-80 redirect block: declares the SAME hostname, no
+        // TLS, no proxy_pass -- a redirect has nothing to proxy to, the
+        // live host's dominant pairing for this exact hostname.
+        return 'server { listen 80; server_name racy.example.invalid; return 301 https://$host$request_uri; }'
+      },
+    })
+    // The redirect file alone resolves to no upstream port -- if the
+    // hostname appeared here at all with the TLS block unread, THAT would
+    // be the bug (a dial target with no real evidence backing its port).
+    expect(discovery?.byPort.size).toBe(0)
+    // tlsByHostname DOES have an entry (from the redirect block it actually
+    // read), and `false` is the truthful answer for that one block -- this
+    // is fine precisely because the hostname's absence from byPort above
+    // means nothing ever reads this entry for this hostname this tick.
+    expect(discovery?.tlsByHostname.get('racy.example.invalid')).toBe(false)
+  })
 })
 
 describe('the production VhostFs', () => {
   // This runs the EXACT object agent-deps.ts hands to readVhostDir on a
-  // real host (via buildHostnamesByPort -> discoverHostnamesFromDir) --
-  // not a lookalike lambda written inline in a test. The earlier
+  // real host (via buildVhostDiscovery -> discoverVhostsFromDir) -- not a
+  // lookalike lambda written inline in a test. The earlier
   // "follows symlinks" suite above proves node:fs/promises' readFile
   // follows a symlink (an OS guarantee, not something this module decides);
   // this suite proves the shipped nodeVhostFs object itself doesn't

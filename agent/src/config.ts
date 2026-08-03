@@ -55,7 +55,7 @@ export type AgentConfig = {
    * proxy config instead of maintaining a list (see vhosts.ts's module
    * docstring). Defaulted rather than required, so an agent on a host that
    * genuinely has no nginx (or uses a different layout) still starts --
-   * `discoverHostnamesFromDir` reports an unreachable directory as `null`
+   * `discoverVhostsFromDir` reports an unreachable directory as `null`
    * and on-box probing is simply skipped, exactly like an unconfigured
    * `AGENT_SYSTEM_URLS` skips the external probe.
    */

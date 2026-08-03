@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { buildCollectDeps, buildHostnamesByPort, buildTlsByHostname, type DockerLike } from './agent-deps.js'
+import { buildCollectDeps, buildVhostDiscovery, type DockerLike } from './agent-deps.js'
 import type { AgentConfig } from './config.js'
 import type { FetchLike, OnBoxRequestLike } from './probe.js'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
@@ -28,14 +28,13 @@ const noContainers: DockerLike = { listContainers: async () => [] }
 // living only in main.ts, which nothing could import to test without also
 // running the whole agent (loadConfig() at module scope, a real Docker
 // connection, an immediately-started tick interval). Extracting
-// buildCollectDeps/buildHostnamesByPort into their own side-effect-free
+// buildCollectDeps/buildVhostDiscovery into their own side-effect-free
 // module is what makes these assertions possible at all.
 describe('buildCollectDeps', () => {
-  it('wires onBoxProbing as a real object with all three functions -- fix round 2: hostnamesByPort/probeOnBoxHostname used to be two separate OPTIONAL keys, either deletable without a type error; Task 5 adds tlsByHostname as a third REQUIRED member of the same object, not a fourth independently-optional field', () => {
+  it('wires onBoxProbing as a real object with both functions -- fix round 2: hostnamesByPort/probeOnBoxHostname used to be two separate OPTIONAL keys, either deletable without a type error; Task 5 initially split the vhost read into a third field (tlsByHostname), then fix round 2 (this shape) merged it back into ONE vhostDiscovery field precisely because two independent reads of the same directory could disagree with each other', () => {
     const deps = buildCollectDeps(makeConfig(), noContainers)
     expect(deps.onBoxProbing).not.toBeNull()
-    expect(deps.onBoxProbing!.hostnamesByPort).toBeTypeOf('function')
-    expect(deps.onBoxProbing!.tlsByHostname).toBeTypeOf('function')
+    expect(deps.onBoxProbing!.vhostDiscovery).toBeTypeOf('function')
     expect(deps.onBoxProbing!.probeOnBoxHostname).toBeTypeOf('function')
   })
 
@@ -130,54 +129,36 @@ describe('the real on-box transport, exercised end to end (not a recorded argume
   })
 })
 
-describe('buildHostnamesByPort', () => {
-  it('discovers hostnames by port when the vhost directory is reachable', async () => {
+describe('buildVhostDiscovery', () => {
+  it('discovers hostnames by port AND the TLS bit per hostname, from one reachable read', async () => {
     const root = await mkdtemp(join(tmpdir(), 'agent-deps-'))
     try {
       await mkdir(join(root, 'enabled'))
       await writeFile(
         join(root, 'enabled', 'a.conf'),
-        'server { server_name found.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }',
+        'server { listen 443 ssl; server_name found.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }',
       )
       const warn: unknown[][] = []
-      const byPort = await buildHostnamesByPort(join(root, 'enabled'), { warn: (...a) => warn.push(a) })()
-      expect(byPort?.get(8081)).toEqual(['found.example.invalid'])
+      const discovery = await buildVhostDiscovery(join(root, 'enabled'), { warn: (...a) => warn.push(a) })()
+      expect(discovery?.byPort.get(8081)).toEqual(['found.example.invalid'])
+      expect(discovery?.tlsByHostname.get('found.example.invalid')).toBe(true)
       expect(warn).toHaveLength(0)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
   })
 
-  it('logs and returns null, never an empty map, when the vhost directory cannot be read', async () => {
+  it('logs and returns null, never an empty discovery, when the vhost directory cannot be read', async () => {
     const warn: unknown[][] = []
-    const byPort = await buildHostnamesByPort('/definitely/does/not/exist/on/this/machine', { warn: (...a) => warn.push(a) })()
-    expect(byPort).toBeNull()
+    const discovery = await buildVhostDiscovery('/definitely/does/not/exist/on/this/machine', { warn: (...a) => warn.push(a) })()
+    expect(discovery).toBeNull()
     expect(warn).toHaveLength(1)
     expect(String(warn[0]![0])).toContain('vhost directory unreadable')
   })
 })
 
-describe('buildTlsByHostname', () => {
-  it('discovers the TLS bit per hostname when the vhost directory is reachable', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'agent-deps-tls-'))
-    try {
-      await mkdir(join(root, 'enabled'))
-      await writeFile(join(root, 'enabled', 'a.conf'), 'server { listen 443 ssl; server_name found.example.invalid; }')
-      const tls = await buildTlsByHostname(join(root, 'enabled'))()
-      expect(tls?.get('found.example.invalid')).toBe(true)
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('returns null, never an empty map, when the vhost directory cannot be read', async () => {
-    const tls = await buildTlsByHostname('/definitely/does/not/exist/on/this/machine')()
-    expect(tls).toBeNull()
-  })
-})
-
-describe('buildCollectDeps wires tlsByHostname through to real vhost data', () => {
-  it('genuinely reads the same vhost directory buildHostnamesByPort does, not a stub', async () => {
+describe('buildCollectDeps wires vhostDiscovery through to real vhost data', () => {
+  it('genuinely reads the vhost directory, not a stub -- both maps agree, because they come from the same read', async () => {
     const root = await mkdtemp(join(tmpdir(), 'agent-deps-wired-tls-'))
     try {
       await mkdir(join(root, 'enabled'))
@@ -186,11 +167,24 @@ describe('buildCollectDeps wires tlsByHostname through to real vhost data', () =
         'server { listen 443 ssl; server_name wired.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }',
       )
       const deps = buildCollectDeps(makeConfig({ vhostDir: join(root, 'enabled') }), noContainers)
-      const [byPort, tls] = await Promise.all([deps.onBoxProbing!.hostnamesByPort(), deps.onBoxProbing!.tlsByHostname()])
-      expect(byPort?.get(8081)).toEqual(['wired.example.invalid'])
-      expect(tls?.get('wired.example.invalid')).toBe(true)
+      const discovery = await deps.onBoxProbing!.vhostDiscovery()
+      expect(discovery?.byPort.get(8081)).toEqual(['wired.example.invalid'])
+      expect(discovery?.tlsByHostname.get('wired.example.invalid')).toBe(true)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
+  })
+
+  // Fix round 2: pins that the PRODUCTION wiring exposes exactly one
+  // vhost-discovery function, not the old hostnamesByPort/tlsByHostname
+  // pair each backed by its own independent directory read. The actual
+  // per-call read-COUNT assertion (proving `discoverVhostsFromDir` itself
+  // never reads a file twice) lives in vhosts.test.ts, closer to the real
+  // mechanism; this test only guards against `onBoxProbing`'s shape
+  // silently regressing back to two separate fields at this layer.
+  it('exposes exactly one vhost-discovery function on onBoxProbing, not a hostnamesByPort/tlsByHostname pair', async () => {
+    const deps = buildCollectDeps(makeConfig(), noContainers)
+    const keys = Object.keys(deps.onBoxProbing!).sort()
+    expect(keys).toEqual(['probeOnBoxHostname', 'vhostDiscovery'])
   })
 })

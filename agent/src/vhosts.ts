@@ -394,9 +394,14 @@ export const nodeVhostFs: VhostFs = {
 /**
  * Reads the text of every name in `names`, resolved against `dir`, skipping
  * (not failing on) any single one that cannot be read. Shared by
- * `readVhostDir` and `discoverHostnamesFromDir`, both of which need this
+ * `readVhostDir` and `discoverVhostsFromDir`, both of which need this
  * exact "read what you can, drop what you can't" loop after their own,
- * DIFFERENT handling of the initial `readdir`.
+ * DIFFERENT handling of the initial `readdir`. `discoverVhostsFromDir`
+ * calls this EXACTLY ONCE per invocation (fix round 2) -- both
+ * `discoverHostnamesByPort` and `discoverTlsByHostname` are derived from
+ * that one resulting array, never from two independent calls to this
+ * function, which is what makes "a file is either seen by both derivations
+ * or by neither" a structural guarantee rather than a hope.
  */
 async function readNamedFiles(dir: string, names: string[], fs: VhostFs): Promise<Array<{ text: string }>> {
   const out: Array<{ text: string }> = []
@@ -431,7 +436,7 @@ async function readNamedFiles(dir: string, names: string[], fs: VhostFs): Promis
  * gap: a host with genuinely zero vhosts and a misconfigured probe path
  * look identical here. Whatever calls this must not treat an empty result
  * as "this system serves nothing" without also checking that the
- * directory itself is reachable -- see `discoverHostnamesFromDir` below,
+ * directory itself is reachable -- see `discoverVhostsFromDir` below,
  * which is the composed call that actually makes that distinction, in one
  * `readdir`, rather than this function plus a second check.
  */
@@ -443,38 +448,6 @@ export async function readVhostDir(dir: string, fs: VhostFs): Promise<Array<{ te
     return []
   }
   return readNamedFiles(dir, names, fs)
-}
-
-/**
- * Composes a directory listing + file reads + `discoverHostnamesByPort`
- * into the single call `agent/src/collect.ts`'s `CollectDeps.hostnamesByPort`
- * needs -- this is the actual seam that joins vhost discovery to the
- * collection loop; see `agent/src/agent-deps.ts`.
- *
- * Returns `null`, NOT an empty `Map`, when the directory itself could not be
- * listed. Collapsing "unreadable" into "empty" here would let a
- * misconfigured or temporarily-inaccessible vhost path render as "no system
- * on this host has an HTTP surface" -- a false claim about every system on
- * the board, not merely a gap in one collection tick.
- *
- * Deliberately does ONE `readdir`, not `readVhostDir`'s own `readdir` after
- * a separate reachability check: an earlier version of this function called
- * a standalone `isVhostDirReachable` and then `readVhostDir`, which issued
- * two `readdir` syscalls with a real (if small) TOCTOU window between
- * them -- the directory could vanish or reappear between the two calls,
- * making the "reachable" answer stale by the time the second call ran.
- * Reading the names once and branching on whether THAT read succeeded
- * removes the window entirely, rather than narrowing it.
- */
-export async function discoverHostnamesFromDir(dir: string, fs: VhostFs): Promise<Map<number, string[]> | null> {
-  let names: string[]
-  try {
-    names = await fs.readdir(dir)
-  } catch {
-    return null
-  }
-  const files = await readNamedFiles(dir, names, fs)
-  return discoverHostnamesByPort(files)
 }
 
 export function discoverHostnamesByPort(files: Array<{ text: string }>): Map<number, string[]> {
@@ -527,16 +500,22 @@ export function discoverHostnamesByPort(files: Array<{ text: string }>): Map<num
  * `byPort` via the TLS block's own `proxy_pass`, so `collect.ts`'s `?? null`
  * miss-fallback never fires -- `false` ships as a POSITIVE claim that a
  * TLS-configured hostname is plain HTTP by design, which is strictly worse
- * than a `null` gap. The same wrong answer is also reachable via a race,
- * not just static ordering: `readNamedFiles` silently skips a file it
- * cannot read, so if the TLS block's own file is mid-write while the
- * redirect file reads fine, the hostname is PRESENT with `false` for a
- * completely different reason.
+ * than a `null` gap.
  *
  * Fixed by OR-accumulating across every block that declares the hostname,
  * which is the actual semantics the question asks and is order-independent
  * by construction: once any block for a hostname sets it to `true`, no
- * later (or earlier) plain block can un-set it.
+ * later (or earlier) plain block can un-set it. **This fixes ordering among
+ * blocks that were actually READ.** It does NOT, by itself, fix a hostname
+ * whose TLS-declaring block was never read into evidence at all -- see
+ * `discoverVhostsFromDir` below for that half of fix round 1's Critical,
+ * closed in fix round 2: this function and `discoverHostnamesByPort` must
+ * always be called on the SAME `files` list from a SINGLE directory read,
+ * never on two independent reads that could each see a different set of
+ * readable files (the TLS block's own file mid-write while the redirect
+ * file reads fine, reproduced live through a real `collectSnapshot` by fix
+ * round 2's review). OR-accumulation cannot recover a block that one read
+ * never saw; it only orders the blocks that particular read DID see.
  *
  * ORPHAN TLS VHOSTS -- RECORDED HONESTLY, NOT FIXED HERE: this map is
  * deliberately unfiltered by upstream resolution (see above), so it DOES
@@ -564,26 +543,68 @@ export function discoverTlsByHostname(files: Array<{ text: string }>): Map<strin
   return tlsByHostname
 }
 
+/** Both facts `agent/src/collect.ts` needs from the host's reverse-proxy
+ * config, derived from the exact same on-disk read -- see
+ * `discoverVhostsFromDir`'s docstring for why that sameness is the whole
+ * point. */
+export type VhostDiscovery = {
+  byPort: Map<number, string[]>
+  tlsByHostname: Map<string, boolean>
+}
+
 /**
- * Composes a directory listing + file reads + `discoverTlsByHostname` into
- * the single call `agent/src/collect.ts`'s `CollectDeps.onBoxProbing.tlsByHostname`
- * needs -- the TLS-axis sibling of `discoverHostnamesFromDir` immediately
- * above, same discipline for the same reason: ONE `readdir` (no separate
- * reachability check, no TOCTOU window), `null` (never an empty `Map`) when
- * the directory itself could not be listed, because collapsing "unreadable"
- * into "found no TLS vhosts" would render every TLS-configured hostname on
- * this host as plain HTTP -- the exact false claim spec §8 exists to catch,
- * reappearing one axis over.
+ * Composes ONE directory listing + ONE set of file reads into BOTH
+ * `discoverHostnamesByPort` and `discoverTlsByHostname` -- the single call
+ * `agent/src/collect.ts`'s `CollectDeps.onBoxProbing.vhostDiscovery` needs;
+ * this is the actual seam that joins vhost discovery to the collection
+ * loop, see `agent/src/agent-deps.ts`.
  *
- * A separate directory read from `discoverHostnamesFromDir`'s, not a shared
- * one: the two axes are independent facts (hostname→port vs hostname→TLS)
- * computed from the same on-disk files, and reading twice per tick trades a
- * second small `readdir` + a handful of file reads (this project's own
- * survey counted 28 files on the live host) for not perturbing
- * `discoverHostnamesFromDir`'s already-hardened, already-reviewed contract.
- * See task-5-report.md for the reasoning against consolidating them.
+ * FIX ROUND 2's CRITICAL (the half of round 1's fix that did not close):
+ * this function used to be two independent functions
+ * (`discoverHostnamesFromDir` and `discoverTlsFromDir`), each doing its OWN
+ * `readdir` + file reads over the same directory, in the same tick. Round
+ * 1's OR-accumulate fix to `discoverTlsByHostname` closed ordering
+ * disagreements AMONG BLOCKS ONE READ ACTUALLY SAW, but two SEPARATE reads
+ * of a directory whose contents can change between them (a file being
+ * written, replaced, or made briefly unreadable) can each see a DIFFERENT
+ * set of readable files -- and OR-accumulation has no way to recover
+ * evidence from a block that a given read never saw at all. Round 2's
+ * review reproduced this live, through a real `collectSnapshot`: the TLS
+ * block's file mid-write during the (second) TLS-axis read, while the
+ * (first) hostname-axis read moments earlier had seen it fine -- byPort
+ * ends up with the hostname mapped to a real port (from the TLS block's own
+ * `proxy_pass`, seen by the FIRST read), while `tlsByHostname` ends up with
+ * `false` for that same hostname (derived only from the plain redirect
+ * block, because the SECOND read never saw the TLS block at all). That is
+ * the identical positive-wrong-claim the original Critical exists to
+ * eliminate, arriving through the read boundary instead of through
+ * processing order.
+ *
+ * Fixed structurally, not documented around: ONE `readdir` + ONE pass of
+ * `readNamedFiles` produces ONE `files` array, and BOTH
+ * `discoverHostnamesByPort(files)` and `discoverTlsByHostname(files)` are
+ * derived from that SAME array. A file that fails to read is therefore
+ * either present for BOTH derivations or absent from BOTH -- there is
+ * nothing left for the two axes to disagree about, because there is only
+ * one on-disk read for them to disagree ABOUT THE RESULT OF. This is also
+ * strictly cheaper (one directory read + one set of file reads instead of
+ * two of each per tick) and closes the TOCTOU window between the two former
+ * independent reads rather than narrowing it.
+ *
+ * Returns `null`, NOT an empty `VhostDiscovery`, when the directory itself
+ * could not be listed -- the same discipline the two predecessor functions
+ * each applied on their own: collapsing "unreadable" into "found nothing"
+ * would render every hostname on this host, on both axes, as having no HTTP
+ * surface and no TLS configuration, which is a false claim about every
+ * system on the board, not merely a gap in one collection tick.
+ *
+ * Deliberately does ONE `readdir`, not `readVhostDir`'s own `readdir` after
+ * a separate reachability check, for the identical TOCTOU reason the
+ * predecessor functions already documented: reading the names once and
+ * branching on whether THAT read succeeded removes the window entirely,
+ * rather than narrowing it.
  */
-export async function discoverTlsFromDir(dir: string, fs: VhostFs): Promise<Map<string, boolean> | null> {
+export async function discoverVhostsFromDir(dir: string, fs: VhostFs): Promise<VhostDiscovery | null> {
   let names: string[]
   try {
     names = await fs.readdir(dir)
@@ -591,5 +612,8 @@ export async function discoverTlsFromDir(dir: string, fs: VhostFs): Promise<Map<
     return null
   }
   const files = await readNamedFiles(dir, names, fs)
-  return discoverTlsByHostname(files)
+  return {
+    byPort: discoverHostnamesByPort(files),
+    tlsByHostname: discoverTlsByHostname(files),
+  }
 }

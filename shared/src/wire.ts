@@ -40,15 +40,19 @@ export type ProbeOutcome = z.infer<typeof ProbeOutcomeSchema>
  * (very real) `hostname: null` probe results that have no declaring vhost
  * to read it from.
  *
- * `null`, not just `true`/`false`: the hostname list and the TLS map are
- * two INDEPENDENT per-tick reads of the same vhost directory (see
- * `agent/src/vhosts.ts`'s `discoverHostnamesFromDir`/`discoverTlsFromDir`
- * and `agent/src/collect.ts`), so a hostname can be known (the first read
- * succeeded) while its TLS bit is not (the second read failed this tick, or
- * -- should the two ever disagree -- simply has no entry for it). Reporting
- * `false` in that case would silently misrepresent a TLS-configured
- * hostname as plain HTTP, hiding the exact finding spec §8 exists to
- * surface; `null` says plainly "not determined this tick".
+ * `null`, not just `true`/`false`: on `agent/src/collect.ts`'s side, the
+ * whole on-box vhost read can fail this tick (see
+ * `agent/src/vhosts.ts`'s `discoverVhostsFromDir`, which derives BOTH the
+ * hostname->port map and the hostname->TLS map from ONE read specifically
+ * so the two can never disagree with each other -- fix round 2 closed a
+ * Critical where two INDEPENDENT reads of the same directory could each see
+ * a different set of readable files and disagree). `null` here covers that
+ * read failure, plus a defensive fallback for the (now structurally
+ * unreachable in production, but not type-excluded) case of a hostname
+ * present in one derived map and missing from the other. Reporting `false`
+ * in either case would silently misrepresent a TLS-configured hostname as
+ * plain HTTP, hiding the exact finding spec §8 exists to surface; `null`
+ * says plainly "not determined this tick".
  */
 export const HostnameConfigSchema = z.object({
   hostname: z.string().min(1),

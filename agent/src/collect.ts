@@ -4,6 +4,7 @@ import { discoverSystems, type ContainerSummary } from './docker.js'
 import { parseDeployLog } from './deploy-log.js'
 import { readGitState } from './git.js'
 import { hostnamesForSystem, worstOf } from './probe.js'
+import type { VhostDiscovery } from './vhosts.js'
 
 export type CollectDeps = {
   listContainers: () => Promise<ContainerSummary[]>
@@ -44,7 +45,7 @@ export type CollectDeps = {
    * `agent-deps.test.ts` for the reproduction of both the old failure mode
    * and this compile-time guard against it.
    *
-   * `hostnamesByPort` is read ONCE per tick (not once per system) --
+   * `vhostDiscovery` is read ONCE per tick (not once per system) --
    * resolving a named `upstream` block may require every vhost file to
    * have been seen first, see `discoverHostnamesByPort` in
    * `agent/src/vhosts.ts`. It returns `null` when the vhost directory
@@ -52,34 +53,35 @@ export type CollectDeps = {
    * whatever) -- see `agent/src/vhosts.ts`'s `readVhostDir` docstring for
    * why an empty result and an unreadable directory must never be reported
    * as the same fact. `null` here is deliberately NOT the same as an empty
-   * `Map`: an empty map means "read the config, found no vhosts for any
-   * port", whereas `null` means "did not read the config at all", and only
-   * the former is a real fact about the host worth acting on. Both result
-   * in no on-box probing this tick, which is the safe behaviour either
-   * way, but only `null` is worth a caller logging as a diagnostic failure
-   * -- see `agent/src/agent-deps.ts`'s `buildHostnamesByPort`.
+   * `VhostDiscovery`: an empty one means "read the config, found no vhosts
+   * anywhere", whereas `null` means "did not read the config at all", and
+   * only the former is a real fact about the host worth acting on. Both
+   * result in no on-box probing this tick, which is the safe behaviour
+   * either way, but only `null` is worth a caller logging as a diagnostic
+   * failure -- see `agent/src/agent-deps.ts`'s `buildVhostDiscovery`.
+   *
+   * FIX ROUND 2: `hostnamesByPort` and `tlsByHostname` used to be two
+   * SEPARATE fields here, each backed by its OWN independent per-tick
+   * directory read. That let the two reads see different sets of readable
+   * files if the directory changed between them (a file mid-write during
+   * the second read but not the first) -- reproduced live through a real
+   * `collectSnapshot` -- producing a hostname present in one axis's result
+   * with a value derived from the OTHER axis's incomplete view (a
+   * TLS-configured hostname reported as plain HTTP, the exact false claim
+   * spec §8 exists to catch). `vhostDiscovery` is now the SINGLE field for
+   * both, backed by `agent/src/vhosts.ts`'s `discoverVhostsFromDir`, which
+   * derives both maps from ONE read -- see its docstring for the full
+   * account. A file is therefore either seen by both derivations or by
+   * neither; there is nothing left for the two axes to disagree about.
    *
    * `probeOnBoxHostname` probes one hostname FROM the monitored host
    * itself, by addressing its resolved loopback PORT directly with an
    * explicit `Host` header when a hostname is known (see
    * `agent/src/probe.ts`'s `probeHostnameOnBox` and the spec's §3.1
    * correction) -- NOT by resolving the hostname over DNS.
-   *
-   * `tlsByHostname` is Task 5's addition: maps a hostname to whether its
-   * declaring vhost listens for TLS (see `agent/src/vhosts.ts`'s
-   * `discoverTlsByHostname`/`discoverTlsFromDir`). Read ONCE per tick, same
-   * as `hostnamesByPort` and for the identical reason, but via its OWN
-   * independent read of the vhost directory rather than sharing
-   * `hostnamesByPort`'s -- see `discoverTlsFromDir`'s docstring for why
-   * that duplication is deliberate. `null` means the read failed this
-   * tick, exactly as for `hostnamesByPort`, and must not be treated as
-   * "read successfully, no hostname listens for TLS" -- that would render
-   * spec §8's "no certificate where TLS is configured without one" finding
-   * as plain, unremarkable HTTP.
    */
   onBoxProbing: {
-    hostnamesByPort: () => Promise<Map<number, string[]> | null>
-    tlsByHostname: () => Promise<Map<string, boolean> | null>
+    vhostDiscovery: () => Promise<VhostDiscovery | null>
     probeOnBoxHostname: (hostname: string | null, port: number) => Promise<{ outcome: ProbeOutcome; status: number | null }>
   } | null
 }
@@ -88,11 +90,14 @@ export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot>
   const discovered = discoverSystems(await deps.listContainers())
 
   // Read the host's reverse-proxy config ONCE for the whole tick, not once
-  // per system: discoverHostnamesByPort needs every vhost file to resolve a
-  // named upstream block that may be declared in a different file than the
-  // vhost referencing it. `null` means the read failed -- see
-  // `hostnamesByPort`'s docstring on CollectDeps -- and must not be treated
-  // as "read successfully, found nothing".
+  // per system, and not once per axis: discoverHostnamesByPort needs every
+  // vhost file to resolve a named upstream block that may be declared in a
+  // different file than the vhost referencing it, and (fix round 2) BOTH
+  // the hostname->port map and the hostname->TLS map must come from this
+  // SAME read -- see `vhostDiscovery`'s docstring on `CollectDeps` for why
+  // two independent reads could disagree with each other and a single one
+  // structurally cannot. `null` means the read failed -- and must not be
+  // treated as "read successfully, found nothing".
   //
   // Wrapped in try/catch: this call sits OUTSIDE the per-system Promise.all
   // below, so an uncaught throw here would fail the ENTIRE snapshot -- every
@@ -103,25 +108,14 @@ export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot>
   // tick", the same outcome as the directory being unreachable.
   const onBoxProbing = deps.onBoxProbing // captured once: see the per-system use below for why
   let byPort: Map<number, string[]> | null = null
-  if (onBoxProbing) {
-    try {
-      byPort = await onBoxProbing.hostnamesByPort()
-    } catch {
-      byPort = null
-    }
-  }
-
-  // TLS is a separate per-tick read from `byPort` above -- see
-  // `tlsByHostname`'s docstring on `CollectDeps` for why the two are not
-  // shared. Guarded and defaulted to `null` for the identical reason as
-  // `byPort`: this call sits outside the per-system `Promise.all`, so an
-  // uncaught throw here would fail the entire snapshot for what is, at
-  // worst, one unreadable directory.
   let tlsByHostname: Map<string, boolean> | null = null
   if (onBoxProbing) {
     try {
-      tlsByHostname = await onBoxProbing.tlsByHostname()
+      const discovery = await onBoxProbing.vhostDiscovery()
+      byPort = discovery?.byPort ?? null
+      tlsByHostname = discovery?.tlsByHostname ?? null
     } catch {
+      byPort = null
       tlsByHostname = null
     }
   }

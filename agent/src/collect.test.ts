@@ -200,9 +200,9 @@ describe('collectSnapshot', () => {
   // config (agent/src/vhosts.ts), and each of those hostnames probed
   // on-box (agent/src/probe.ts) -- with NO operator configuration, unlike
   // the urlFor/probe block above. `onBoxProbing` (a bundled
-  // hostnamesByPort/tlsByHostname/probeOnBoxHostname trio, fix round 2 +
-  // Task 5) is the seam; see
-  // its docstring on CollectDeps.
+  // vhostDiscovery/probeOnBoxHostname pair -- fix round 2 unified
+  // hostnamesByPort+tlsByHostname into the single vhostDiscovery read, see
+  // its docstring on CollectDeps) is the seam.
   describe('on-box probing of derived hostnames folded into health', () => {
     it('does not render green when every container is up but the on-box probe finds the proxy has no upstream', async () => {
       const snap = await collectSnapshot(
@@ -211,8 +211,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['alpha.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname: async () => ({ outcome: 'proxy-no-upstream' as const, status: 502 }),
           },
         }),
@@ -236,8 +235,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['other.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname,
           },
         }),
@@ -259,8 +257,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [9999] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['other.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname: async (hostname, port) => {
               calls.push({ hostname, port })
               return { outcome: 'answering' as const, status: 200 }
@@ -294,8 +291,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [9999] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['other.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname: async () => ({ outcome: 'not-probed' as const, status: null }),
           },
         }),
@@ -311,21 +307,21 @@ describe('collectSnapshot', () => {
     })
 
     it('does not downgrade anything when the vhost directory could not be read this tick', async () => {
-      // `hostnamesByPort` returning `null` means the read FAILED -- not
+      // `vhostDiscovery` returning `null` means the read FAILED -- not
       // "read successfully and found zero vhosts". Collapsing those two
       // would report a diagnostic failure as a fact about the host (every
       // system reads "no HTTP surface"), which is exactly the false claim
       // this task's brief calls out by name.
       //
       // Honestly labelled: this is a CONTRACT test, not a discriminating
-      // one. At the collectSnapshot layer, `null` and an empty `Map` both
-      // already produce "no on-box probing, health untouched" -- a naive
-      // implementation that collapsed the two would pass this exact
+      // one. At the collectSnapshot layer, `null` and an empty discovery
+      // both already produce "no on-box probing, health untouched" -- a
+      // naive implementation that collapsed the two would pass this exact
       // assertion too, because this fixture's port (8081) is absent from
       // an empty map in exactly the same way it is absent given `null`.
       // The distinction that DOES discriminate lives one layer down, in
-      // `discoverHostnamesFromDir`'s own test in vhosts.test.ts ("returns
-      // null, not an empty map, when the directory cannot be read at
+      // `discoverVhostsFromDir`'s own test in vhosts.test.ts ("returns
+      // null, not an empty discovery, when the directory cannot be read at
       // all"), which is mutation-verified. This test exists to document
       // and pin collectSnapshot's side of the contract, not to prove it.
       const probeOnBoxHostname = vi.fn()
@@ -335,8 +331,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => null,
+            vhostDiscovery: async () => null,
             probeOnBoxHostname,
           },
         }),
@@ -345,7 +340,7 @@ describe('collectSnapshot', () => {
       expect(probeOnBoxHostname).not.toHaveBeenCalled()
     })
 
-    it('never lets the whole snapshot fail when hostnamesByPort() itself rejects, unlike every other on-box call which is per-system', async () => {
+    it('never lets the whole snapshot fail when vhostDiscovery() itself rejects, unlike every other on-box call which is per-system', async () => {
       // This call sits OUTSIDE the per-system Promise.all (it runs once,
       // before any system is processed), so it needs its own guard: without
       // one, a rejection here would fail collectSnapshot entirely --
@@ -357,8 +352,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => {
+            vhostDiscovery: async () => {
               throw new Error('vhost read exploded')
             },
             probeOnBoxHostname: vi.fn(),
@@ -382,8 +376,7 @@ describe('collectSnapshot', () => {
             { names: ['/b'], project: 'beta', state: 'running', health: null, publishedPorts: [9001] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => byPort,
+            vhostDiscovery: async () => ({ byPort, tlsByHostname: new Map() }),
             probeOnBoxHostname: async (hostname) => {
               probed.push(hostname ?? '')
               return { outcome: 'answering' as const, status: 200 }
@@ -406,8 +399,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081, 9001] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => byPort,
+            vhostDiscovery: async () => ({ byPort, tlsByHostname: new Map() }),
             probeOnBoxHostname: async (hostname) => {
               const h = hostname ?? ''
               events.push(`start:${h}`)
@@ -429,8 +421,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['alpha.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname: async () => {
               throw new Error('boom')
             },
@@ -457,8 +448,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [9999] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['other.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname: async () => {
               throw new Error('boom')
             },
@@ -488,8 +478,7 @@ describe('collectSnapshot', () => {
             { names: ['/b'], project: 'beta', state: 'running', health: null, publishedPorts: [] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['alpha.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname: syncThrow,
           },
         }),
@@ -512,8 +501,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'exited', health: null, publishedPorts: [8081] },
           ],
           onBoxProbing: {
-            tlsByHostname: async () => new Map(),
-            hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['alpha.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname: async () => ({ outcome: 'answering' as const, status: 200 }),
           },
         }),
@@ -561,8 +549,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
           onBoxProbing: {
-            hostnamesByPort: async () => null, // the vhost read failed this tick
-            tlsByHostname: async () => new Map(),
+            vhostDiscovery: async () => null, // the vhost read failed this tick
             probeOnBoxHostname: vi.fn(),
           },
         }),
@@ -582,8 +569,10 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
           onBoxProbing: {
-            hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
-            tlsByHostname: async () => new Map([['alpha.example.invalid', true]]),
+            vhostDiscovery: async () => ({
+              byPort: new Map([[8081, ['alpha.example.invalid']]]),
+              tlsByHostname: new Map([['alpha.example.invalid', true]]),
+            }),
             probeOnBoxHostname: async () => ({ outcome: 'proxy-no-upstream' as const, status: 502 }),
           },
         }),
@@ -600,8 +589,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [9999] },
           ],
           onBoxProbing: {
-            hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
-            tlsByHostname: async () => new Map(),
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['other.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname: async () => ({ outcome: 'answering' as const, status: 200 }),
           },
         }),
@@ -613,20 +601,30 @@ describe('collectSnapshot', () => {
       expect(alpha.hostnames).toEqual([])
     })
 
-    it('reports listensTls as null (not false) when the TLS read failed this tick even though the hostname read succeeded', async () => {
-      // Two INDEPENDENT per-tick reads of the same directory (see
-      // agent-deps.ts's buildTlsByHostname docstring): the hostname is
-      // real and known, but its TLS bit genuinely is not, this tick.
-      // Guessing `false` would misrepresent a possibly-TLS hostname as
-      // plain HTTP.
+    // Fix round 2 made "byPort has the hostname but tlsByHostname's whole
+    // read failed independently" structurally IMPOSSIBLE in production --
+    // `vhostDiscovery` returns ONE object (`{byPort, tlsByHostname}`) or
+    // `null`; there is no shape in which one map exists and the other
+    // doesn't. This test now exercises the one remaining path to that same
+    // `?? null` fallback in collect.ts: a `tlsByHostname` map that IS
+    // present but happens not to contain a hostname `byPort` has. Given the
+    // real `discoverVhostsFromDir` this can no longer actually occur either
+    // (both maps are derived from identical parses of the identical files,
+    // so any hostname in byPort is guaranteed to also be a key in
+    // tlsByHostname -- see vhosts.ts), but the fixture can still construct
+    // this combination because nothing at the TYPE level forbids an
+    // inconsistent pair of maps, only a real single read's OWN internal
+    // consistency does. Kept as a defensive test of the fallback itself,
+    // not of a reachable production scenario: guessing `false` here would
+    // misrepresent a hostname of UNKNOWN TLS status as plain HTTP.
+    it('reports listensTls as null (not false) when a hostname is present in byPort but missing from tlsByHostname -- defensive; unreachable via a real single-read discoverVhostsFromDir', async () => {
       const snap = await collectSnapshot(
         deps({
           listContainers: async () => [
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
           onBoxProbing: {
-            hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
-            tlsByHostname: async () => null,
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['alpha.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname: async () => ({ outcome: 'answering' as const, status: 200 }),
           },
         }),
@@ -641,8 +639,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [] },
           ],
           onBoxProbing: {
-            hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
-            tlsByHostname: async () => new Map(),
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['other.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname: vi.fn(),
           },
         }),
@@ -663,8 +660,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
           onBoxProbing: {
-            hostnamesByPort: async () => null,
-            tlsByHostname: async () => new Map(),
+            vhostDiscovery: async () => null,
             probeOnBoxHostname: vi.fn(),
           },
         }),
@@ -696,8 +692,7 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
           onBoxProbing: {
-            hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
-            tlsByHostname: async () => new Map(),
+            vhostDiscovery: async () => ({ byPort: new Map([[8081, ['alpha.example.invalid']]]), tlsByHostname: new Map() }),
             probeOnBoxHostname: syncThrow,
           },
         }),
@@ -714,12 +709,13 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081, 9001] },
           ],
           onBoxProbing: {
-            hostnamesByPort: async () =>
-              new Map([
+            vhostDiscovery: async () => ({
+              byPort: new Map([
                 [8081, ['shared.example.invalid']],
                 [9001, ['shared.example.invalid']],
               ]),
-            tlsByHostname: async () => new Map([['shared.example.invalid', false]]),
+              tlsByHostname: new Map([['shared.example.invalid', false]]),
+            }),
             probeOnBoxHostname: async () => ({ outcome: 'answering' as const, status: 200 }),
           },
         }),

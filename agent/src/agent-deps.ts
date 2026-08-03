@@ -4,7 +4,7 @@ import type { CollectDeps } from './collect.js'
 import { toSummary } from './docker.js'
 import { httpOnBoxRequest, probeHostnameOnBox, probeUrl, type FetchLike, type OnBoxRequestLike } from './probe.js'
 import { resolveDeployLogPath, resolveRepoDir } from './paths.js'
-import { discoverHostnamesFromDir, discoverTlsFromDir, nodeVhostFs } from './vhosts.js'
+import { discoverVhostsFromDir, nodeVhostFs, type VhostDiscovery } from './vhosts.js'
 
 /**
  * The one method of dockerode's `Docker` this module actually calls,
@@ -26,53 +26,46 @@ export type DockerLike = {
 export type Logger = { warn: (...args: unknown[]) => void }
 
 /**
- * Reads the host's own reverse-proxy config and derives which hostnames
- * serve which loopback port -- see `agent/src/vhosts.ts`'s module docstring
- * for why this is derived rather than configured.
+ * Reads the host's own reverse-proxy config ONCE and derives BOTH which
+ * hostnames serve which loopback port AND which hostnames listen for TLS --
+ * see `agent/src/vhosts.ts`'s module docstring for why this is derived
+ * rather than configured, and `discoverVhostsFromDir`'s docstring for why
+ * BOTH facts come from the SAME read.
+ *
+ * FIX ROUND 2: this used to be two separate functions
+ * (`buildHostnamesByPort`/`buildTlsByHostname`), each wrapping its own
+ * independent per-tick directory read. Round 1's OR-accumulate fix to
+ * `discoverTlsByHostname` closed the ordering half of that Critical but not
+ * the read-boundary half: two independent reads of a directory whose
+ * contents can change between them could each see a different set of
+ * readable files, producing a hostname present in one axis's result with a
+ * value derived from the OTHER axis's incomplete view -- reproduced live
+ * through a real `collectSnapshot` by fix round 2's review. A single
+ * function, a single read, makes that disagreement structurally impossible:
+ * see `discoverVhostsFromDir`.
  *
  * Logs (never throws) when the vhost directory itself could not be read
  * this tick: that is a diagnostic failure worth an operator seeing, quite
  * different from "read it fine, this host has zero vhosts" -- collapsing
- * the two would render every system on the board as having no HTTP surface,
- * which is the false claim `discoverHostnamesFromDir`'s `null` return
- * exists to prevent. See its docstring and `agent/src/collect.ts`'s
- * `hostnamesByPort` for the contract this satisfies.
+ * the two would render every system on the board as having no HTTP surface
+ * AND no TLS configuration, which is the false claim `discoverVhostsFromDir`'s
+ * `null` return exists to prevent. See its docstring and
+ * `agent/src/collect.ts`'s `vhostDiscovery` for the contract this satisfies.
  *
- * Returns a closure (not the `Map | null` itself) because `CollectDeps`
- * wants this read to happen ONCE PER TICK, not once at startup -- a vhost
- * file can change between ticks (certbot renewing, a new stack deploying),
- * and `collectSnapshot` calls this closure fresh every time it runs.
+ * Returns a closure (not the `VhostDiscovery | null` itself) because
+ * `CollectDeps` wants this read to happen ONCE PER TICK, not once at
+ * startup -- a vhost file can change between ticks (certbot renewing, a new
+ * stack deploying), and `collectSnapshot` calls this closure fresh every
+ * time it runs.
  */
-export function buildHostnamesByPort(
-  vhostDir: string,
-  log: Logger = console,
-): () => Promise<Map<number, string[]> | null> {
+export function buildVhostDiscovery(vhostDir: string, log: Logger = console): () => Promise<VhostDiscovery | null> {
   return async () => {
-    const byPort = await discoverHostnamesFromDir(vhostDir, nodeVhostFs)
-    if (byPort === null) {
-      log.warn(`[agent] vhost directory unreadable (${vhostDir}); on-box hostname probing skipped this tick`)
+    const discovery = await discoverVhostsFromDir(vhostDir, nodeVhostFs)
+    if (discovery === null) {
+      log.warn(`[agent] vhost directory unreadable (${vhostDir}); on-box hostname/TLS discovery skipped this tick`)
     }
-    return byPort
+    return discovery
   }
-}
-
-/**
- * The TLS-axis sibling of `buildHostnamesByPort` immediately above: reads
- * the SAME vhost directory, on its own independent per-tick read, and
- * derives which hostnames listen for TLS (see `agent/src/vhosts.ts`'s
- * `discoverTlsFromDir`).
- *
- * Deliberately does NOT log on a `null` read the way `buildHostnamesByPort`
- * does: the two closures read the same directory, so a failure here fires
- * in the same tick as `buildHostnamesByPort`'s own failure and its warning
- * already tells the operator the vhost directory is unreadable this tick --
- * a second, differently-worded warning for the identical root cause would
- * be noise, not a second diagnostic. `collect.ts` still treats this
- * closure's `null` on its own terms (skips populating `hostnames`/
- * `onBoxProbes` for this tick), it just doesn't ALSO log about it.
- */
-export function buildTlsByHostname(vhostDir: string): () => Promise<Map<string, boolean> | null> {
-  return () => discoverTlsFromDir(vhostDir, nodeVhostFs)
 }
 
 /**
@@ -133,11 +126,11 @@ export function buildCollectDeps(
     // `CollectDeps.onBoxProbing`'s type only for a test that wants this
     // axis off; production always wants it on.
     onBoxProbing: {
-      hostnamesByPort: buildHostnamesByPort(cfg.vhostDir),
-      // TLS is a config fact, not a probe result -- see
-      // `shared/src/wire.ts`'s `HostnameConfigSchema` docstring for why it
-      // travels on the hostname list rather than on a probe result.
-      tlsByHostname: buildTlsByHostname(cfg.vhostDir),
+      // ONE read of the vhost directory feeds BOTH the hostname→port map
+      // and the hostname→TLS map -- see `buildVhostDiscovery`/
+      // `discoverVhostsFromDir` for why fix round 2 made this a single call
+      // rather than two independent ones.
+      vhostDiscovery: buildVhostDiscovery(cfg.vhostDir),
       probeOnBoxHostname: (hostname, port) => probeHostnameOnBox(hostname, port, onBoxRequestImpl, cfg.probeTimeoutMs),
     },
   }
