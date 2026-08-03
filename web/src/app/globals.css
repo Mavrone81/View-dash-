@@ -217,6 +217,155 @@ h1 {
   color: var(--ink);
 }
 
+/* --- URL / Answers / Cert: slice 2a, "a green row tells the truth" --- */
+
+/* Fleet-wide external-probe failure banner (spec §9): a probe fault, not
+   twenty outages -- bordered in --warn like the vault's other "pay
+   attention" surfaces, never --alarm, because nothing here asserts any
+   application is actually down. */
+.fleet-banner {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--warn);
+  border-left-width: 4px;
+  border-radius: 4px;
+  background: var(--field);
+  color: var(--ink);
+  font-size: 0.8125rem;
+}
+
+.col-url,
+.col-url--unknown,
+.col-url--none {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+}
+
+/* Both the "never told us" and the confirmed "no HTTP surface" cases are
+   muted alike -- neither is an alarm -- but their TEXT differs (see
+   FleetTable.tsx's HOSTNAMES_UNKNOWN_LABEL / NO_HTTP_SURFACE_LABEL), which is
+   the fact that actually distinguishes them, not colour. */
+.col-url--unknown,
+.col-url--none {
+  color: var(--ink-muted);
+}
+
+.url-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.url-link:hover {
+  text-decoration: underline;
+}
+
+.url-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* The Answers column: the wording carries the fact, colour only reinforces
+   it -- never colour-only, per spec §8. */
+.col-answers {
+  font-size: 0.75rem;
+  max-width: 260px;
+}
+
+.col-answers[data-verdict='healthy'] {
+  color: var(--good);
+}
+
+.col-answers[data-verdict='route-broken'],
+.col-answers[data-verdict='app-down'] {
+  color: var(--alarm);
+}
+
+/* Contradiction is flagged, never guessed (spec §3) -- --warn, the same
+   "look at this" weight as the fleet-wide banner, not --alarm: the evidence
+   is confusing, not conclusively an outage. */
+.col-answers[data-verdict='contradiction'] {
+  color: var(--warn);
+}
+
+/* `unconfirmed` and `unprobed` both read as "we do not know yet" -- neither
+   an alarm nor reassurance, so both get the same neutral --ink-muted as the
+   State column's own `stale`/`unknown`. This is deliberately the MOST
+   COMMON verdict on first deploy, before the external axis's first
+   five-minute cycle completes. */
+.col-answers[data-verdict='unconfirmed'],
+.col-answers[data-verdict='unprobed'] {
+  color: var(--ink-muted);
+}
+
+.answer-detail,
+.answer-age,
+.answer-unnamed {
+  color: var(--ink-muted);
+  font-size: 0.6875rem;
+}
+
+.answer-unnamed {
+  margin: 2px 0 0;
+}
+
+.answer-expand,
+.cert-expand,
+.hostname-expand {
+  margin-top: 2px;
+}
+
+.answer-expand summary,
+.cert-expand summary,
+.hostname-expand summary {
+  cursor: pointer;
+  color: var(--ink-muted);
+  font-size: 0.6875rem;
+}
+
+.answer-expand summary:focus-visible,
+.cert-expand summary:focus-visible,
+.hostname-expand summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.answer-expand ul,
+.cert-expand ul,
+.hostname-expand ul {
+  margin: 4px 0 0;
+  padding-left: 14px;
+  font-size: 0.6875rem;
+  color: var(--ink-muted);
+  list-style: none;
+}
+
+/* The Cert column: same three-tier severity language as everywhere else on
+   this board (--good/--warn/--alarm), plus a fourth, deliberately neutral
+   `unknown`/`none` state so an undetermined or not-applicable cert reads as
+   neither a pass nor a fault. */
+.col-cert {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.75rem;
+}
+
+.col-cert[data-severity='ok'] {
+  color: var(--good);
+}
+
+.col-cert[data-severity='amber'] {
+  color: var(--warn);
+}
+
+.col-cert[data-severity='red'] {
+  color: var(--alarm);
+}
+
+.col-cert[data-severity='unknown'],
+.col-cert[data-severity='none'] {
+  color: var(--ink-muted);
+}
+
 /* Never-reported (em dash), NOT a genuine 0/0 -- these two must stay visibly
    distinct, see FleetRow.containersRunning. */
 .col-containers--unknown {

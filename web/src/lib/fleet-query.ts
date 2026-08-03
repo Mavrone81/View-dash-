@@ -1,9 +1,10 @@
-import { PrismaClient } from '@prisma/client'
-import type { ProbeOutcome } from '@bevora-ops/shared'
+import { PrismaClient, Prisma } from '@prisma/client'
+import type { HostnameConfig, OnBoxProbeResult, ProbeOutcome } from '@bevora-ops/shared'
 import { prisma } from './db.js'
 import { displayState } from './staleness.js'
 import { buildBeatTrace, BEAT_WINDOW_MS, type Beat } from './beats.js'
-import type { FleetRow } from '../components/FleetTable.js'
+import { combine, primaryHostname, isFleetWideExternalFailure, type Axis, type Verdict } from './answers.js'
+import type { FleetRow, HostnameAnswer } from '../components/FleetTable.js'
 
 // Shape of one row returned by the DISTINCT ON query below. Typed
 // explicitly against the SystemObservation columns it selects, so the raw
@@ -18,6 +19,84 @@ type LatestObservationRow = {
   deployedAt: Date | null
   driftCommits: number | null
   receivedAt: Date
+  // Raw JSONB, `Prisma.JsonValue` (effectively `unknown` at this boundary) --
+  // parsed by `parseHostnames`/`parseOnBoxProbes` below, which are the only
+  // places that trust the shape. NULL (a genuine SQL NULL, per
+  // ingest.ts/Task 5's own discipline) means "no opinion this tick", never
+  // "confirmed empty" -- see FleetRow.hostnames's docstring.
+  hostnames: Prisma.JsonValue
+  onBoxProbes: Prisma.JsonValue
+}
+
+/**
+ * `SystemObservation.hostnames`/`onBoxProbes` arrive from Postgres as
+ * `Prisma.JsonValue` (a union that includes `null`, objects, arrays...).
+ * These two functions are the ONLY place that casts them to the typed
+ * shapes `shared/src/wire.ts` defines -- the same trust boundary
+ * `latestExternalResultsByHostname` below already crosses with its own
+ * `r.outcome as ProbeOutcome` cast, extended here to a whole array: every
+ * row that reaches this column was written by `ingestSnapshot`, which
+ * validated the ENTIRE incoming payload against `FleetSnapshotSchema`
+ * before writing anything (see ingest.ts), so nothing malformed can be
+ * sitting in this column. `null` passes straight through -- it is not a
+ * parse failure, it is Task 5's own "no opinion" sentinel.
+ */
+function parseHostnames(raw: Prisma.JsonValue): HostnameConfig[] | null {
+  if (raw === null) return null
+  return raw as unknown as HostnameConfig[]
+}
+
+function parseOnBoxProbes(raw: Prisma.JsonValue): OnBoxProbeResult[] | null {
+  if (raw === null) return null
+  return raw as unknown as OnBoxProbeResult[]
+}
+
+/**
+ * How "worse" each `Verdict` (Task 7) is, for folding several hostnames'
+ * individual verdicts into ONE row-level answer (`FleetRow.verdict`).
+ *
+ * `healthy` is the only good outcome. `unprobed`/`unconfirmed` outrank it
+ * DELIBERATELY, even though neither is a fault: a row with one healthy
+ * hostname and one never-probed hostname must not read as a flat
+ * "healthy" summary, because that would assert something about the second
+ * hostname nobody has checked -- the same "claim only what the evidence
+ * supports" rule every other absence on this board follows. `contradiction`
+ * outranks the two definite-fault states because confused evidence (spec
+ * §3's "flagged, never guessed") is at least as urgent as a named one.
+ */
+const VERDICT_SEVERITY: Record<Verdict, number> = {
+  healthy: 0,
+  unprobed: 1,
+  unconfirmed: 2,
+  'route-broken': 3,
+  'app-down': 4,
+  contradiction: 5,
+}
+
+/**
+ * The WORST (highest-severity) of several verdicts -- see `VERDICT_SEVERITY`
+ * above. This is the mechanism behind spec §8's "one failing hostname on a
+ * multi-hostname system must not be averaged away into a green row":
+ * `primaryHostname()` picks a hostname that ANSWERS to show as the
+ * clickable URL, so using its verdict alone as the row's summary would let
+ * exactly that averaging happen. `worstVerdict` instead looks at every
+ * hostname (and every unnamed on-box probe) this system has and reports the
+ * worst one, regardless of which hostname `primaryHostname()` chose to
+ * display. An empty input (no hostname and no unnamed probe produced any
+ * verdict at all) is `unprobed` -- there was nothing to check either axis
+ * against.
+ */
+export function worstVerdict(verdicts: Verdict[]): Verdict {
+  if (verdicts.length === 0) return 'unprobed'
+  return verdicts.reduce((worst, v) => (VERDICT_SEVERITY[v] > VERDICT_SEVERITY[worst] ? v : worst))
+}
+
+/** Builds the `Axis` `combine()` (Task 7) expects, or `null` when there is
+ * nothing to build one from -- kept as one place so every caller below
+ * expresses "no opinion" identically. */
+function toAxis(outcome: ProbeOutcome | undefined, status: number | null | undefined): Axis | null {
+  if (outcome === undefined) return null
+  return { outcome, status: status ?? null }
 }
 
 /** One row of the bounded beat-window fetch below. */
@@ -104,16 +183,39 @@ export const NO_SYSTEMS_LABEL = '(no systems reported yet)'
  *     token would previously have seen a board that looked completely
  *     normal.
  */
-export async function latestPerSystem(now: Date, client: PrismaClient = prisma): Promise<FleetRow[]> {
+/**
+ * `latestPerSystem`'s result: the board's rows, plus spec §9's fleet-wide
+ * external-probe-failure flag, computed ONCE for the whole fetch (see
+ * below) rather than per row -- it describes the dashboard's OWN probing,
+ * not any one system's state, so it does not belong on `FleetRow` itself.
+ */
+export type FleetBoard = {
+  rows: FleetRow[]
+  /**
+   * True when every hostname with a stored external result on this board
+   * is currently failing (`isFleetWideExternalFailure`, Task 7) -- spec
+   * §9's guard against reading a local network fault as twenty
+   * simultaneous outages. Every row's own `verdict` already reflects the
+   * fallback this triggers (the external axis is treated as absent while
+   * this is true, see `latestPerSystem`'s body) -- this flag exists only
+   * to drive the banner text, not to change any row's colour a second time.
+   */
+  externalProbeFailedFleetWide: boolean
+}
+
+export async function latestPerSystem(now: Date, client: PrismaClient = prisma): Promise<FleetBoard> {
   // Hosts first, and ordered here, so the board's ordering is host-major
   // and stable regardless of what systems exist under each.
   const hosts = await client.host.findMany({ orderBy: { name: 'asc' } })
-  if (hosts.length === 0) return []
+  if (hosts.length === 0) return { rows: [], externalProbeFailedFleetWide: false }
 
   const systems = await client.system.findMany({ orderBy: { key: 'asc' } })
   if (systems.length === 0) {
     // Every enrolled host, all of them awaiting a first report.
-    return hosts.map((h) => neverReportedRow(h.id, h.name, h.lastSeenAt))
+    return {
+      rows: hosts.map((h) => neverReportedRow(h.id, h.name, h.lastSeenAt)),
+      externalProbeFailedFleetWide: false,
+    }
   }
 
   // Fetch exactly one observation row PER SYSTEM, in the database, via
@@ -138,7 +240,8 @@ export async function latestPerSystem(now: Date, client: PrismaClient = prisma):
   const observations = await client.$queryRaw<LatestObservationRow[]>`
     SELECT DISTINCT ON ("systemId")
       "systemId", "health", "containersTotal", "containersRunning",
-      "deployedSha", "deployedSubject", "deployedAt", "driftCommits", "receivedAt"
+      "deployedSha", "deployedSubject", "deployedAt", "driftCommits", "receivedAt",
+      "hostnames", "onBoxProbes"
     FROM "SystemObservation"
     WHERE "systemId" = ANY(${systemIds})
     ORDER BY "systemId", "receivedAt" DESC
@@ -149,6 +252,29 @@ export async function latestPerSystem(now: Date, client: PrismaClient = prisma):
   // query above: that query is bounded by system count, this one by a time
   // window, and neither can serve the other's purpose.
   const beatsBySystemId = await fetchRecentBeats(systemIds, now, client)
+
+  // The union of every hostname CURRENTLY configured across the whole
+  // fleet's latest observations -- fetched ONCE, batched, the same reason
+  // `fetchRecentBeats` above is batched rather than queried per system.
+  // Bounding `latestExternalResultsByHostname` (Task 7a) by exactly this
+  // set is what lets a retired hostname stop appearing on its own, with no
+  // retention pass -- see that function's own docstring.
+  const allHostnames = new Set<string>()
+  for (const o of observations) {
+    for (const h of parseHostnames(o.hostnames) ?? []) allHostnames.add(h.hostname)
+  }
+  const externalByHostname = await latestExternalResultsByHostname([...allHostnames], client)
+
+  // Spec §9: if every hostname this board currently has an external result
+  // for is failing, the far more likely cause is THIS SERVER's own network,
+  // not a simultaneous outage of every independent application being
+  // watched. `systemRow` below is handed this flag and, when true, builds
+  // every hostname's verdict as if the external axis were simply absent
+  // (`combine(onBox, null)`) -- which can only ever resolve to `unprobed` or
+  // `unconfirmed`, never a fault verdict, so the fleet-wide guard's promise
+  // ("shows the on-box results ... does not turn every row red") holds by
+  // construction rather than by a second, separate check.
+  const externalProbeFailedFleetWide = isFleetWideExternalFailure([...externalByHostname.values()])
 
   const byHostId = new Map<string, typeof systems>()
   for (const s of systems) {
@@ -169,10 +295,21 @@ export async function latestPerSystem(now: Date, client: PrismaClient = prisma):
       continue
     }
     for (const s of hostSystems) {
-      rows.push(systemRow(s, host.name, host.lastSeenAt, bySystemId.get(s.id) ?? null, beatsBySystemId.get(s.id) ?? [], now))
+      rows.push(
+        systemRow(
+          s,
+          host.name,
+          host.lastSeenAt,
+          bySystemId.get(s.id) ?? null,
+          beatsBySystemId.get(s.id) ?? [],
+          now,
+          externalByHostname,
+          externalProbeFailedFleetWide,
+        ),
+      )
     }
   }
-  return rows
+  return { rows, externalProbeFailedFleetWide }
 }
 
 /** A host that is enrolled but has never reported a single system. */
@@ -202,7 +339,57 @@ function neverReportedRow(hostId: string, hostName: string, lastSeenAt: Date | n
     // 40-slot array of `absent`, not an empty one). `FleetTable` renders an
     // em dash for the empty case, same as any other "nothing to show" field.
     beats: [],
+    // No system exists here at all, so there is nothing to have hostnames
+    // (`null`, not `[]` -- there is no observation to have confirmed an
+    // empty list from), no probes, no verdict beyond `unprobed`.
+    hostnames: null,
+    onBoxProbes: null,
+    primaryHostname: null,
+    verdict: 'unprobed',
+    tlsConfigured: null,
+    certDaysRemaining: null,
+    hostnameAnswers: [],
+    unnamedOnBoxProbes: [],
   }
+}
+
+/**
+ * Builds every named hostname's `HostnameAnswer`, this system's unnamed
+ * on-box probe results, its row-level `verdict` (spec §8, via
+ * `worstVerdict`), and the primary hostname's own flattened cert/TLS facts.
+ *
+ * `fleetWideFailure` -- when true, the EXTERNAL axis is treated as absent
+ * for every hostname, regardless of what `externalByHostname` actually
+ * holds. That is spec §9's fallback in code: a fleet-wide external failure
+ * must fall back to on-box evidence, not report the (almost certainly
+ * locally-caused) external failures as this system's own fault.
+ */
+function buildHostnameAnswers(
+  hostnames: HostnameConfig[],
+  onBoxProbes: OnBoxProbeResult[] | null,
+  externalByHostname: Map<string, LatestExternalResult>,
+  fleetWideFailure: boolean,
+  now: Date,
+): HostnameAnswer[] {
+  return hostnames.map((h) => {
+    const onBoxEntry = onBoxProbes?.find((p) => p.hostname === h.hostname) ?? null
+    const onBoxAxis = onBoxEntry ? toAxis(onBoxEntry.outcome, onBoxEntry.status) : null
+    const external = fleetWideFailure ? undefined : externalByHostname.get(h.hostname)
+    const externalAxis = external ? toAxis(external.outcome, external.status) : null
+    const certDaysRemaining = external?.certExpiresAt
+      ? Math.floor((external.certExpiresAt.getTime() - now.getTime()) / 86_400_000)
+      : null
+    return {
+      hostname: h.hostname,
+      verdict: combine(onBoxAxis, externalAxis),
+      onBoxOutcome: onBoxAxis?.outcome ?? null,
+      externalOutcome: externalAxis?.outcome ?? null,
+      externalAgeMs: external ? now.getTime() - external.observedAt.getTime() : null,
+      listensTls: h.listensTls,
+      certExpiresAt: external?.certExpiresAt ?? null,
+      certDaysRemaining,
+    }
+  })
 }
 
 function systemRow(
@@ -212,7 +399,44 @@ function systemRow(
   o: LatestObservationRow | null,
   beats: Beat[],
   now: Date,
+  externalByHostname: Map<string, LatestExternalResult>,
+  fleetWideFailure: boolean,
 ): FleetRow {
+  const hostnames = o ? parseHostnames(o.hostnames) : null
+  const onBoxProbes = o ? parseOnBoxProbes(o.onBoxProbes) : null
+
+  const hostnameAnswers = buildHostnameAnswers(hostnames ?? [], onBoxProbes, externalByHostname, fleetWideFailure, now)
+
+  // `hostname: null` entries are a published port with no vhost mapping --
+  // Task 5's positive "a port with no name answered" fact, not tied to any
+  // named hostname so it cannot enter `hostnameAnswers` above. Only
+  // `answering` is ever kept for DISPLAY (see FleetRow.unnamedOnBoxProbes's
+  // docstring), but ALL of them (including a `not-probed` one) contribute to
+  // `worstVerdict` below via `combine(axis, null)`, which folds a
+  // no-opinion entry to `unprobed` on its own and so cannot distort the
+  // result either way.
+  const unnamed = (onBoxProbes ?? []).filter((p) => p.hostname === null)
+  const unnamedVerdicts: Verdict[] = unnamed.map((p) => combine(toAxis(p.outcome, p.status), null))
+
+  const verdict = worstVerdict([...hostnameAnswers.map((h) => h.verdict), ...unnamedVerdicts])
+
+  // The clickable URL prefers a hostname that ANSWERS (see
+  // `primaryHostname`'s own docstring) -- built from whichever axis has an
+  // opinion, external preferred, since that is the path a real visitor
+  // takes. A hostname with neither axis's opinion is simply absent from
+  // this map, which `primaryHostname` treats identically to an explicit
+  // non-answering entry.
+  const outcomeForPrimary = new Map<string, ProbeOutcome>()
+  for (const h of hostnameAnswers) {
+    const outcome = h.externalOutcome ?? h.onBoxOutcome
+    if (outcome) outcomeForPrimary.set(h.hostname, outcome)
+  }
+  const primary = primaryHostname(
+    hostnameAnswers.map((h) => h.hostname),
+    outcomeForPrimary,
+  )
+  const primaryAnswer = hostnameAnswers.find((h) => h.hostname === primary) ?? null
+
   return {
     // Host-scoped, because `key` alone is not unique across hosts.
     id: `${s.hostId}:${s.key}`,
@@ -245,6 +469,14 @@ function systemRow(
     // becomes a full trace of `absent`, not an empty array. An empty array
     // here is reserved for the "no system exists" placeholder row.
     beats,
+    hostnames,
+    onBoxProbes,
+    primaryHostname: primary,
+    verdict,
+    tlsConfigured: primaryAnswer?.listensTls ?? null,
+    certDaysRemaining: primaryAnswer?.certDaysRemaining ?? null,
+    hostnameAnswers,
+    unnamedOnBoxProbes: unnamed.filter((p) => p.outcome === 'answering'),
   }
 }
 

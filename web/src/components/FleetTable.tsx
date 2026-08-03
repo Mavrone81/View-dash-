@@ -1,5 +1,40 @@
 import type { DisplayState } from '../lib/staleness.js'
 import type { Beat } from '../lib/beats.js'
+import type { HostnameConfig, OnBoxProbeResult, ProbeOutcome } from '@bevora-ops/shared'
+import type { Verdict } from '../lib/answers.js'
+
+/**
+ * One named hostname's own two-axis result, computed by fleet-query.ts via
+ * `combine()` (Task 7) from that hostname's on-box probe (matched by name
+ * out of `FleetRow.onBoxProbes`) and its latest external result (Task 7a's
+ * `latestExternalResultsByHostname`).
+ *
+ * Task 5/7a's certificate facts travel here per hostname, not per row,
+ * because a system with several hostnames can have them disagree on BOTH
+ * axes (spec §8) -- a shared vhost with one hostname's certificate expiring
+ * and a sibling's fine must not be flattened into one row-level number.
+ *
+ * `listensTls` is the vhost's CONFIG fact (from `hostnames` on the wire);
+ * `certDaysRemaining`/`certExpiresAt` are what the external probe's OWN TLS
+ * handshake most recently observed. These are deliberately not conflated --
+ * spec §6/§8's "no certificate where TLS is configured without one" needs
+ * BOTH: the config says TLS is expected, the handshake says none was
+ * presented.
+ */
+export type HostnameAnswer = {
+  hostname: string
+  verdict: Verdict
+  onBoxOutcome: ProbeOutcome | null
+  externalOutcome: ProbeOutcome | null
+  /** Milliseconds between `now` (the query's own clock) and the external
+   * probe's `observedAt` -- spec §5.1's "show the age of the last external
+   * result, so a stale one is never mistaken for a fresh one." `null` when
+   * no external result exists for this hostname at all. */
+  externalAgeMs: number | null
+  listensTls: boolean | null
+  certExpiresAt: Date | null
+  certDaysRemaining: number | null
+}
 
 export type FleetRow = {
   /**
@@ -68,9 +103,187 @@ export type FleetRow = {
    * nothing", but only one of them is a system that exists.
    */
   beats: Beat[]
+
+  /**
+   * This system's hostnames per the host's own reverse-proxy config, THIS
+   * TICK -- see shared/src/wire.ts's `HostnameConfigSchema` and
+   * `SystemObservation.hostnames`.
+   *
+   * `null` and `[]` are BOTH legal and must render differently (Task 5's
+   * obligation, handed to this task): `null` means NO OPINION -- no
+   * observation yet, an older agent, or this tick's vhost read failed --
+   * and `[]` is a POSITIVE fact, the agent looked and this system has no
+   * HTTP surface at all. Collapsing them would let a transient read
+   * failure render as the settled, permanent "no HTTP surface" claim.
+   */
+  hostnames: HostnameConfig[] | null
+  /**
+   * One entry per on-box probe target this system had this tick. Same
+   * null-vs-`[]` discipline as `hostnames`, for the same reason -- see
+   * shared/src/wire.ts's `OnBoxProbeResultSchema`.
+   *
+   * An entry's own `hostname` field is independently nullable: `null` there
+   * means a published port with no vhost mapping, probed anyway with no
+   * `Host` header -- a positive fact ("a port with no name answered"), not
+   * an unknown. `unnamedOnBoxProbes` below pulls those out for display;
+   * this field keeps the raw, complete list.
+   */
+  onBoxProbes: OnBoxProbeResult[] | null
+  /**
+   * The one hostname this row names in its URL column, chosen by
+   * `primaryHostname()` (Task 7) -- arbitrary but total, so it never
+   * flickers between refreshes for no reason. `null` iff `hostnames` is
+   * `null` or `[]` -- there is nothing to name.
+   */
+  primaryHostname: string | null
+  /**
+   * This row's OWN two-axis verdict, spec §8's "Answers" column -- the
+   * WORST (most alarming) of every named hostname's own `HostnameAnswer`
+   * verdict, plus any unnamed on-box probe's. Deliberately NOT just the
+   * primary hostname's verdict: `primaryHostname` is chosen preferring one
+   * that ANSWERS (so the clickable URL is a live link), and using its
+   * verdict alone here would let a genuinely failing sibling hostname
+   * disappear into a green row precisely because a healthy sibling was
+   * picked to represent it -- the "averaged into a green row" spec §8
+   * forbids explicitly. See `worstVerdict` in fleet-query.ts.
+   */
+  verdict: Verdict
+  /** The primary hostname's own `listensTls` -- convenience flattening of
+   * `hostnameAnswers`, matching this row's other flat fields (`state`,
+   * `beats`, etc). `null` when there is no primary hostname to read it
+   * from. */
+  tlsConfigured: boolean | null
+  /** The primary hostname's own `certDaysRemaining` -- see `tlsConfigured`
+   * above for why this is flattened rather than requiring a lookup into
+   * `hostnameAnswers` on every render. */
+  certDaysRemaining: number | null
+  /**
+   * One entry per NAMED hostname (i.e. `hostnames`, when non-null) --
+   * always includes the primary. Spec §8: "the row shows the primary and
+   * reveals the rest on expansion, each with its own result."
+   */
+  hostnameAnswers: HostnameAnswer[]
+  /**
+   * `onBoxProbes` entries with `hostname: null` that actually answered --
+   * Task 5's "a port with no name answered" positive fact. `not-probed`
+   * entries are filtered out here: they carry no opinion (see
+   * `answers.ts`'s `opinion()`), so there is nothing to report about them.
+   */
+  unnamedOnBoxProbes: OnBoxProbeResult[]
 }
 
 const DASH = '—'
+
+/**
+ * What the URL column renders for a system whose latest observation
+ * confirms zero hostnames -- a POSITIVE fact (the agent looked and there is
+ * nothing here), never the bare em dash, which would read as "unknown"
+ * rather than "settled: no HTTP surface". Exported so a test names the same
+ * string this renders rather than asserting on a copy of it.
+ */
+export const NO_HTTP_SURFACE_LABEL = 'no HTTP surface'
+
+/**
+ * What the URL column renders when `hostnames` itself is `null` -- the
+ * agent never told us this tick (no observation yet, an older agent, or a
+ * failed vhost read), which is a DIFFERENT fact from the confirmed-empty
+ * case above and must read differently, per Task 5's obligation.
+ */
+export const HOSTNAMES_UNKNOWN_LABEL = 'hostname data not available this tick'
+
+/**
+ * What the Cert column renders when there is no hostname at all to have a
+ * certificate for -- reuses the URL column's own wording rather than
+ * inventing a third phrase for the identical underlying fact.
+ */
+const CERT_NO_SURFACE_LABEL = NO_HTTP_SURFACE_LABEL
+
+/**
+ * The words the Answers column shows for each `Verdict` -- spec §8's "the
+ * wording names the fault, not a colour". `unconfirmed` is Task 7's
+ * addition (see answers.ts's own docstring): it will be the MOST COMMON
+ * verdict on first deploy, before the external axis has completed its
+ * first 5-minute cycle, so its wording is deliberately neutral -- neither
+ * an alarm ("down") nor reassurance ("healthy"), just "we do not have both
+ * axes yet". `unprobed` reads distinctly from it ("not probed" vs "not yet
+ * confirmed") because they are different facts: nothing ran at all, versus
+ * one axis ran and the other has not.
+ */
+const VERDICT_COPY: Record<Verdict, string> = {
+  healthy: 'healthy',
+  'route-broken': 'app up, route broken',
+  'app-down': 'app down',
+  contradiction: 'contradiction — unreachable on-box, answering from outside',
+  unconfirmed: 'not yet confirmed',
+  unprobed: 'not probed',
+}
+
+/**
+ * A parenthetical naming the SPECIFIC failure mode behind a bad outcome,
+ * layered on top of `VERDICT_COPY`'s word -- spec §5's rule that a 502/504
+ * is the proxy testifying the application is not responding, and that a
+ * TLS failure is "a separate state, not app down". Returns `null` for every
+ * outcome that needs no elaboration (an answering outcome, or a generic
+ * `not-answering`/`not-probed`, both already fully named by the verdict
+ * word alone).
+ */
+function outcomeDetail(outcome: ProbeOutcome | null): string | null {
+  if (outcome === 'proxy-no-upstream') return 'proxy up, app not responding'
+  if (outcome === 'tls-failed') return 'TLS handshake failed'
+  return null
+}
+
+/** `ms` to a short, human age string -- spec §5.1's "show the age of the
+ * last external result, so a stale one is never mistaken for a fresh one." */
+function formatAge(ms: number): string {
+  if (ms < 60_000) return 'just now'
+  const minutes = Math.floor(ms / 60_000)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  return `${Math.floor(hours / 24)}d ago`
+}
+
+/**
+ * The Cert column's severity, from the CONFIG fact (`listensTls`) and the
+ * HANDSHAKE fact (`certDaysRemaining`) kept deliberately separate, per this
+ * task's instruction not to conflate them: a hostname can be TLS-configured
+ * with no certificate ever observed, and that is its own distinct, urgent
+ * state, not "unknown" and not "fine".
+ *
+ * Thresholds are spec §6's: amber under 21 days, red under 7 -- and a
+ * configured-but-missing certificate reads red, on the reasoning that
+ * "we have never verified this handshake works" is at least as urgent as
+ * "it works today but expires within a week".
+ */
+export type CertSeverity = 'red' | 'amber' | 'ok' | 'unknown' | 'none'
+
+function certSeverity(h: Pick<HostnameAnswer, 'listensTls' | 'certDaysRemaining'> | null): CertSeverity {
+  if (h === null) return 'unknown'
+  if (h.listensTls === false) return 'none'
+  if (h.listensTls === null) return 'unknown'
+  if (h.certDaysRemaining === null) return 'red'
+  if (h.certDaysRemaining < 7) return 'red'
+  if (h.certDaysRemaining < 21) return 'amber'
+  return 'ok'
+}
+
+function certLabel(h: Pick<HostnameAnswer, 'listensTls' | 'certDaysRemaining'> | null): string {
+  if (h === null) return CERT_NO_SURFACE_LABEL
+  if (h.listensTls === false) return 'no TLS configured'
+  if (h.listensTls === null) return 'TLS status unknown this tick'
+  if (h.certDaysRemaining === null) return 'no certificate'
+  return `${h.certDaysRemaining}d remaining`
+}
+
+/**
+ * `https://<hostname>/` -- the URL column links the way a real visitor
+ * reaches the system (the external axis's own path), never the on-box
+ * loopback address a probe uses internally.
+ */
+function externalUrl(hostname: string): string {
+  return `https://${hostname}/`
+}
 
 /**
  * `/vault?host=<hostId>&system=<systemKey>` for this row, so the board is a
@@ -194,15 +407,152 @@ function BeatLegend() {
   )
 }
 
-export function FleetTable({ rows }: { rows: FleetRow[] }) {
+/**
+ * The URL column: the primary hostname, linked out to the real (external)
+ * address. `hostnames === null` and `hostnames === []` are TWO DIFFERENT
+ * absences (see `FleetRow.hostnames`'s docstring) and must read as two
+ * different sentences, neither of them a bare dash -- a dash reads as
+ * "unknown", which is the wrong fact in the confirmed-empty case.
+ */
+function UrlCell({ r }: { r: FleetRow }) {
+  if (r.hostnames === null) {
+    return <span className="col-url col-url--unknown">{HOSTNAMES_UNKNOWN_LABEL}</span>
+  }
+  if (r.hostnames.length === 0 || r.primaryHostname === null) {
+    return <span className="col-url col-url--none">{NO_HTTP_SURFACE_LABEL}</span>
+  }
+  const others = r.hostnameAnswers.filter((h) => h.hostname !== r.primaryHostname)
+  return (
+    <span className="col-url">
+      <a href={externalUrl(r.primaryHostname)} className="url-link">
+        {r.primaryHostname}
+      </a>
+      {others.length > 0 && (
+        <details className="hostname-expand">
+          <summary>+{others.length} more</summary>
+          <ul>
+            {others.map((h) => (
+              <li key={h.hostname}>
+                <a href={externalUrl(h.hostname)} className="url-link">
+                  {h.hostname}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </span>
+  )
+}
+
+/**
+ * The Answers column: spec §8's two-axis verdict, named in words. Shows the
+ * row's overall (worst-of, see `FleetRow.verdict`) verdict plus, when the
+ * failing axis names a specific cause (a 502/504, a TLS failure),
+ * `outcomeDetail`'s parenthetical -- so `route-broken` reads as "app up,
+ * route broken", and if the external side specifically saw a 502/504 it
+ * additionally says "proxy up, app not responding", never colour-only.
+ *
+ * A multi-hostname system reveals each hostname's OWN verdict on expansion
+ * -- spec §8's requirement that a failing hostname stay visible rather than
+ * being averaged away into the row's green summary.
+ */
+function AnswersCell({ r }: { r: FleetRow }) {
+  const primary = r.hostnameAnswers.find((h) => h.hostname === r.primaryHostname) ?? null
+  const detail = outcomeDetail(primary?.externalOutcome ?? primary?.onBoxOutcome ?? null)
+  return (
+    <td className="col-answers" data-verdict={r.verdict} data-testid="answers-cell">
+      <span className="answer-word">{VERDICT_COPY[r.verdict]}</span>
+      {detail && <span className="answer-detail"> ({detail})</span>}
+      {primary?.externalAgeMs != null && (
+        <span className="answer-age"> — external checked {formatAge(primary.externalAgeMs)}</span>
+      )}
+      {r.unnamedOnBoxProbes.length > 0 && (
+        <p className="answer-unnamed">
+          a port with no name answered on-box ({r.unnamedOnBoxProbes.length})
+        </p>
+      )}
+      {r.hostnameAnswers.length > 1 && (
+        <details className="answer-expand">
+          <summary>{r.hostnameAnswers.length} hostnames</summary>
+          <ul>
+            {r.hostnameAnswers.map((h) => {
+              const hDetail = outcomeDetail(h.externalOutcome ?? h.onBoxOutcome ?? null)
+              return (
+                <li key={h.hostname}>
+                  <span className="mono">{h.hostname}</span>: {VERDICT_COPY[h.verdict]}
+                  {hDetail ? ` (${hDetail})` : ''}
+                </li>
+              )
+            })}
+          </ul>
+        </details>
+      )}
+    </td>
+  )
+}
+
+/**
+ * The Cert column: days remaining, amber under 21, red under 7, and "no
+ * certificate" where TLS is configured without one -- spec §6/§8. Shows the
+ * primary hostname's own facts, with the rest revealed on expansion, the
+ * same primary+expand pattern as `UrlCell` and `AnswersCell`.
+ */
+function CertCell({ r }: { r: FleetRow }) {
+  const primary = r.hostnameAnswers.find((h) => h.hostname === r.primaryHostname) ?? null
+  const others = r.hostnameAnswers.filter((h) => h.hostname !== r.primaryHostname)
+  return (
+    <td className="col-cert" data-severity={certSeverity(primary)} data-testid="cert-cell">
+      {certLabel(primary)}
+      {others.length > 0 && (
+        <details className="cert-expand">
+          <summary>{others.length} more</summary>
+          <ul>
+            {others.map((h) => (
+              <li key={h.hostname} data-severity={certSeverity(h)}>
+                <span className="mono">{h.hostname}</span>: {certLabel(h)}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </td>
+  )
+}
+
+export function FleetTable({
+  rows,
+  externalProbeFailedFleetWide = false,
+}: {
+  rows: FleetRow[]
+  /**
+   * Spec §9's fleet-wide guard, computed by fleet-query.ts from
+   * `isFleetWideExternalFailure` (Task 7) over the current hostname set's
+   * latest external results. When true, every row's own `verdict` was
+   * ALREADY computed treating the external axis as absent (falling back to
+   * on-box evidence) -- this prop only controls the banner text, it does
+   * not itself change any row's colour. That is the point: the failure
+   * mode this guards against is turning a local probe fault into twenty
+   * false outages, not hiding the banner.
+   */
+  externalProbeFailedFleetWide?: boolean
+}) {
   if (rows.length === 0) return <p>No systems reported yet.</p>
   return (
     <div className="fleet-board">
+      {externalProbeFailedFleetWide && (
+        <p className="fleet-banner" role="status">
+          The dashboard could not reach anything externally this cycle — showing on-box results only.
+        </p>
+      )}
       <table className="fleet-table">
         <thead>
           <tr>
             <th scope="col">System</th>
+            <th scope="col">URL</th>
             <th scope="col">State</th>
+            <th scope="col">Answers</th>
+            <th scope="col">Cert</th>
             <th scope="col">Containers</th>
             <th scope="col">Last 40 beats</th>
             <th scope="col">Version</th>
@@ -221,9 +571,14 @@ export function FleetTable({ rows }: { rows: FleetRow[] }) {
                   {r.displayName}
                 </a>
               </td>
+              <td className="col-url-cell">
+                <UrlCell r={r} />
+              </td>
               <td className="col-state" data-state={r.state}>
                 {stateLabel(r)}
               </td>
+              <AnswersCell r={r} />
+              <CertCell r={r} />
               <td
                 className={
                   r.containersRunning === null || r.containersTotal === null
