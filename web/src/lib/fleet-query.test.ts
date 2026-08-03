@@ -1020,9 +1020,19 @@ describe('the Answers/Cert join (Task 8)', () => {
       const { rows } = await latestPerSystem(now)
 
       const answer = rows[0]!.hostnameAnswers[0]!
-      // Content correctly suppressed by the fallback.
+      // REACHABILITY content is correctly suppressed by the fallback.
       expect(answer.externalOutcome).toBeNull()
-      expect(answer.certDaysRemaining).toBeNull()
+      // Fix round 4 (Task 8 review), C2 -- THIS TEST used to pin the
+      // opposite of this assertion (`certDaysRemaining` expected `null`
+      // here), which was itself the defect the round 4 review found: every
+      // certificate figure on the board fell to grey for the whole duration
+      // of a fleet-wide failure. An expiry date can only ever move LATER
+      // (renewal), never earlier, so a stale/suppressed reading of it can
+      // only ever over-alarm, never under-alarm -- the safe direction, so
+      // it is no longer gated on `fleetWideFailure` at all. Fixing the test
+      // that pinned the old (wrong) behaviour, recorded here rather than
+      // changed quietly.
+      expect(answer.certDaysRemaining).toBe(3)
       // Age is NOT suppressed -- it is a fact about the stored evidence,
       // independent of whether this tick trusts its content.
       expect(answer.externalAgeMs).not.toBeNull()
@@ -1107,6 +1117,52 @@ describe('the Answers/Cert join (Task 8)', () => {
       const { rows } = await latestPerSystem(now)
 
       expect(rows[0]!.verdict).toBe('healthy')
+    })
+
+    // THE DENIAL TEST for fix round 4's C2, under the STALENESS ceiling
+    // specifically (the fleet-wide-failure case is covered separately,
+    // above in "the fleet-wide fallback" describe block). The reviewer's
+    // exact reproduction: a nine-day-old reading of a certificate expiring
+    // in 3 days. Reachability correctly stops counting as a current
+    // opinion past the ceiling -- but the certificate figure itself must
+    // NOT vanish, because a stale reading of EXPIRY can only ever
+    // over-alarm (renewal moves it later, never earlier), which is the
+    // safe direction, unlike a stale reading of reachability (which can be
+    // wrong either way).
+    it('does not let the staleness ceiling erase a certificate figure -- a stale reading can only over-alarm, never under-alarm', async () => {
+      const { system } = await makeSystem('sys-stale-cert', 'host-stale-cert')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const nineDaysAgo = new Date(now.getTime() - 9 * 24 * 60 * 60_000)
+      const expiresIn3Days = new Date(now.getTime() + 3 * 86_400_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: {
+          hostname: HOSTNAME_A,
+          outcome: 'answering',
+          status: 200,
+          certExpiresAt: expiresIn3Days,
+          observedAt: nineDaysAgo,
+        },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      const answer = rows[0]!.hostnameAnswers[0]!
+      // Reachability correctly no longer counts as current.
+      expect(answer.externalOutcome).toBeNull()
+      // The certificate figure survives, ungated by the same ceiling.
+      expect(answer.certDaysRemaining).toBe(3)
+      expect(answer.externalAgeMs).toBeGreaterThan(EXTERNAL_RESULT_STALE_AFTER_MS)
     })
   })
 
@@ -1201,7 +1257,25 @@ describe('the Answers/Cert join (Task 8)', () => {
     expect(emptyRow.verdict).toBe('unprobed')
   })
 
-  it('surfaces an unnamed on-box probe (a published port with no vhost) that answered, and reads healthy on that evidence alone', async () => {
+  // Fix round 4 (Task 8 review), C1 -- THE bug, PINNED BY THIS TEST as
+  // correct at the end of round 2 (`verdict` asserted `'healthy'` here).
+  // The round 4 review found the render: a system with NO NAMED HOSTNAMES
+  // AT ALL, whose URL column reads "no HTTP surface" and whose external
+  // axis has never run, rendered a fully GREEN row on the strength of one
+  // port spec §3.1 itself says "may be a database, a cache, a mail relay, a
+  // UDP service". Spec §2: "a row is green only when the application
+  // answers." Round 2's fix (contribute `'healthy'` to the worst-of fold)
+  // stopped an unmapped port from DRAGGING A ROW DOWN, which was that
+  // round's real finding -- but a max-fold cannot express "positive but
+  // non-dispositive" evidence by lowering its floor; lowering it BELOW
+  // every absence state is what manufactures a green verdict out of
+  // nothing. The correct fix contributes NOTHING at all: `verdict` reads
+  // `unprobed` (nothing named was ever checked), while the fact itself
+  // stays fully visible via `unnamedOnBoxProbes` (and, independently,
+  // `AnswersCell`'s "a port with no name answered on-box (N)" text, which
+  // does not depend on `verdict`). Fixing the test that pinned the old,
+  // wrong behaviour, recorded here rather than changed quietly.
+  it('does NOT read healthy on an unmapped port\'s answer alone -- a system with no named hostnames stays unprobed', async () => {
     const { system } = await makeSystem('sys-unnamed-port', 'host-unnamed-port')
     const now = new Date('2026-08-03T00:00:00Z')
     await prisma.systemObservation.create({
@@ -1218,13 +1292,12 @@ describe('the Answers/Cert join (Task 8)', () => {
 
     const { rows } = await latestPerSystem(now)
 
+    // The fact itself is NOT hidden -- it is simply not allowed to BECOME
+    // the row's own verdict.
     expect(rows[0]!.unnamedOnBoxProbes).toHaveLength(1)
     expect(rows[0]!.unnamedOnBoxProbes[0]!.outcome).toBe('answering')
-    // Fix round 2 (Task 8 review), C2: an unmapped port's answer is
-    // evidence that can only be POSITIVE (spec §3.1) -- with no named
-    // hostname on this system at all, it is the only evidence there is,
-    // and it must not be worth LESS than nothing.
-    expect(rows[0]!.verdict).toBe('healthy')
+    expect(rows[0]!.verdict).not.toBe('healthy')
+    expect(rows[0]!.verdict).toBe('unprobed')
   })
 
   // THE DENIAL TEST for fix round 2's C2: the reviewer's exact

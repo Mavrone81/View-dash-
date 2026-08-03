@@ -51,10 +51,23 @@ export type HostnameAnswer = {
    * board has stopped trusting that reading's content. */
   externalAgeMs: number | null
   listensTls: boolean | null
-  /** `null` whenever `externalOutcome` is (no result, or stale -- see
-   * above), in addition to every reason `certExpiresAt` was already `null`
-   * on the stored `ExternalProbeResult` row itself (no handshake
-   * completed). */
+  /**
+   * Fix round 4 (Task 8 review), C2: UNLIKE `externalOutcome`, this is
+   * NEVER nulled by `fleetWideFailure` or the staleness ceiling -- only by
+   * the stored `ExternalProbeResult` row itself carrying no certificate
+   * (no handshake completed, or one that failed). Reachability can flip in
+   * either direction between two checks, so a stale reachability reading
+   * is untrustworthy either way and IS suppressed; a certificate's expiry
+   * date can only ever move LATER (renewal), never earlier, so a stale
+   * reading of it can only ever over-alarm, never under-alarm -- the safe
+   * direction, and suppressing it (as every round before this one did) was
+   * the actual defect: every certificate figure on the board fell to grey
+   * for the full duration of any fleet-wide failure or three missed
+   * cycles, exactly when the column is least able to re-check anything.
+   * `certLabel` (below) states this reading's provenance explicitly
+   * whenever `externalOutcome` is null but this is not, so an old figure
+   * is never presented as indistinguishable from a fresh one.
+   */
   certExpiresAt: Date | null
   certDaysRemaining: number | null
 }
@@ -161,14 +174,24 @@ export type FleetRow = {
   primaryHostname: string | null
   /**
    * This row's OWN two-axis verdict, spec §8's "Answers" column -- the
-   * WORST (most alarming) of every named hostname's own `HostnameAnswer`
-   * verdict, plus any unnamed on-box probe's. Deliberately NOT just the
-   * primary hostname's verdict: `primaryHostname` is chosen preferring one
-   * that ANSWERS (so the clickable URL is a live link), and using its
-   * verdict alone here would let a genuinely failing sibling hostname
-   * disappear into a green row precisely because a healthy sibling was
-   * picked to represent it -- the "averaged into a green row" spec §8
-   * forbids explicitly. See `worstVerdict` in fleet-query.ts.
+   * WORST (most alarming) of every NAMED hostname's own `HostnameAnswer`
+   * verdict. Deliberately NOT just the primary hostname's verdict:
+   * `primaryHostname` is chosen preferring one that ANSWERS (so the
+   * clickable URL is a live link), and using its verdict alone here would
+   * let a genuinely failing sibling hostname disappear into a green row
+   * precisely because a healthy sibling was picked to represent it -- the
+   * "averaged into a green row" spec §8 forbids explicitly. See
+   * `worstVerdict` in fleet-query.ts.
+   *
+   * Fix round 4 (Task 8 review), C1: an UNNAMED on-box probe (a published
+   * port with no vhost -- `FleetRow.unnamedOnBoxProbes` below) NEVER
+   * contributes to this value, in either direction -- an earlier version
+   * fed an answering one in as a synthesized `'healthy'` entry, and for a
+   * system with NO named hostnames at all that single entry became the
+   * ENTIRE row's verdict, rendering green a system the same row's URL
+   * column calls "no HTTP surface". The fact itself is never hidden --
+   * `AnswersCell` prints "a port with no name answered on-box (N)"
+   * regardless of `verdict` -- it simply cannot BECOME the verdict.
    */
   verdict: Verdict
   /**
@@ -332,21 +355,33 @@ export type CertSeverity = 'red' | 'amber' | 'ok' | 'unknown' | 'none'
  * the Cert-column equivalent of `fleet-query.ts`'s `VERDICT_SEVERITY`,
  * which Answers already had and Cert did not.
  *
- * `ok` and `none` tie at the bottom: a plain-HTTP-by-design hostname is not
- * a certificate concern at all, so it must not make a row look WORSE, but
- * it also must not be allowed to hide a genuine problem elsewhere on the
- * same row -- ties resolve in `worstCertSeverity` by simply not being the
- * max. `unknown` outranks both of them on purpose, the same reasoning
+ * Fix round 4 (Task 8 review), I4: this MUST be a TOTAL order -- every
+ * value gets its own rank, no ties -- exactly the hazard spec §5.2 wrote a
+ * total order for `primaryHostname()` to avoid, reintroduced here. Round 2
+ * tied `ok` and `none` at 0 on the reasoning that neither is a certificate
+ * PROBLEM, but `worstCertSeverity`'s fold uses strict `>`, so a tie is
+ * decided by whichever happens to be FIRST in `hostnameAnswers`' array
+ * order -- which comes from an unsorted `readdir` over vhost files. The
+ * same system could render green `"60d remaining"` or grey `"no TLS
+ * configured (beta)"` depending purely on file order, and adding an
+ * unrelated plain-HTTP vhost to a system could flip an existing row's
+ * colour with no change to anything a certificate actually says. `none`
+ * now ranks its own tier BELOW `ok`: a hostname with a config fact and
+ * nothing to check (`none`) is less noteworthy than one with a VERIFIED
+ * healthy certificate (`ok`), so a tie between them resolves to naming the
+ * verified one, deterministically, regardless of hostname order.
+ *
+ * `unknown` outranks both on purpose, the same reasoning
  * `fleet-query.ts`'s `VERDICT_SEVERITY` gives for `unprobed`/`unconfirmed`
  * outranking `healthy`: a row must not read as fully fine while one of its
  * hostnames' certificate status is simply unverified.
  */
 const CERT_SEVERITY_RANK: Record<CertSeverity, number> = {
-  ok: 0,
   none: 0,
-  unknown: 1,
-  amber: 2,
-  red: 3,
+  ok: 1,
+  unknown: 2,
+  amber: 3,
+  red: 4,
 }
 
 type CertEvidence = Pick<HostnameAnswer, 'listensTls' | 'certDaysRemaining' | 'externalOutcome' | 'externalAgeMs'>
@@ -437,12 +472,34 @@ function worstCertAnswer(answers: readonly HostnameAnswer[]): HostnameAnswer | n
  * as "not checked yet" -- a sentence the evidence does not support, and one
  * that actively contradicts the Answers cell on the SAME row, which shows
  * that age plainly (spec §5.1).
+ *
+ * Fix round 4 (Task 8 review), C2: `certDaysRemaining` is now UNGATED by
+ * staleness/fleet-wide suppression (see `HostnameAnswer.certExpiresAt`'s
+ * own docstring for why that asymmetry is safe), so it can now be non-null
+ * at the SAME TIME `externalOutcome` is null -- exactly the "stale but
+ * still real" case. When that happens, the figure is shown WITH its
+ * provenance stated plainly ("3d remaining, from a check 9d ago") rather
+ * than either hiding it (the pre-round-4 defect: every cert figure fell to
+ * grey during a fleet-wide failure or past the staleness ceiling, silent
+ * exactly when the column could least re-check anything) or presenting it
+ * as indistinguishable from a fresh reading (which would be its own lie).
+ * The ordinary, current case (`externalOutcome` present) is unchanged --
+ * no provenance clause, since there is nothing to qualify.
  */
 function certLabel(h: CertEvidence | null): string {
   if (h === null) return CERT_NO_SURFACE_LABEL
   if (h.listensTls === false) return 'no TLS configured'
   if (h.listensTls === null) return 'TLS status unknown this tick'
-  if (h.certDaysRemaining !== null) return `${h.certDaysRemaining}d remaining`
+  if (h.certDaysRemaining !== null) {
+    if (h.externalOutcome !== null) return `${h.certDaysRemaining}d remaining`
+    // Stale or fleet-wide-suppressed, but a real figure still exists.
+    // `externalAgeMs` cannot be null here: it is null only when NO external
+    // result was ever stored for this hostname, and this figure is derived
+    // from exactly such a stored result.
+    return h.externalAgeMs === null
+      ? `${h.certDaysRemaining}d remaining`
+      : `${h.certDaysRemaining}d remaining, from a check ${formatAge(h.externalAgeMs)}`
+  }
   if (h.externalOutcome === 'tls-failed') return 'no certificate'
   if (h.externalOutcome === null) {
     return h.externalAgeMs === null
@@ -611,17 +668,25 @@ function UrlCell({ r }: { r: FleetRow }) {
     return <span className="col-url col-url--none">{NO_HTTP_SURFACE_LABEL}</span>
   }
   const primaryAnswer = r.hostnameAnswers.find((h) => h.hostname === r.primaryHostname) ?? null
-  const others = r.hostnameAnswers.filter((h) => h.hostname !== r.primaryHostname)
   return (
     <span className="col-url">
       <a href={externalUrl(r.primaryHostname, primaryAnswer?.listensTls ?? null)} className="url-link">
         {r.primaryHostname}
       </a>
-      {others.length > 0 && (
+      {/* Fix round 4 (Task 8 review), I3: the expansion lists EVERY
+          hostname, including the primary already shown above -- matching
+          `AnswersCell`'s own pattern, which already iterates all of
+          `hostnameAnswers`. `CertCell` had the acute version of this bug
+          (excluding the primary meant its own certificate figure could
+          become unreachable from the whole row); `UrlCell` never had that
+          specific defect (the primary's own link is always shown
+          collapsed), but there was no stated reason for the two sibling
+          columns to disagree, so this one is made consistent too. */}
+      {r.hostnameAnswers.length > 1 && (
         <details className="hostname-expand">
-          <summary>+{others.length} more</summary>
+          <summary>{r.hostnameAnswers.length} hostnames</summary>
           <ul>
-            {others.map((h) => (
+            {r.hostnameAnswers.map((h) => (
               <li key={h.hostname}>
                 <a href={externalUrl(h.hostname, h.listensTls)} className="url-link">
                   {h.hostname}
@@ -636,8 +701,16 @@ function UrlCell({ r }: { r: FleetRow }) {
 }
 
 /** `null` -> "never checked externally"; otherwise the human age string. */
+/**
+ * Fix round 4 (Task 8 review), M7: EVERY call site of this function already
+ * prefixes its result with the literal word "external" (`— external
+ * {ageDetail(...)}` in both `AnswersCell` and its per-hostname expansion --
+ * see below), so the null case must NOT repeat it, or the most-shown
+ * string on the whole board (before the external axis has run even once)
+ * reads "not yet confirmed — external never checked externally".
+ */
 function ageDetail(ms: number | null): string {
-  return ms == null ? 'never checked externally' : `checked ${formatAge(ms)}`
+  return ms == null ? 'never checked' : `checked ${formatAge(ms)}`
 }
 
 /**
@@ -726,36 +799,36 @@ function CertCell({ r }: { r: FleetRow }) {
     )
   }
   const primary = r.hostnameAnswers.find((h) => h.hostname === r.primaryHostname) ?? null
-  const others = r.hostnameAnswers.filter((h) => h.hostname !== r.primaryHostname)
   const worstAnswer = worstCertAnswer(r.hostnameAnswers)
-  // The ordinary case -- the worst hostname IS the primary, or there is
-  // only one hostname at all -- renders EXACTLY as before: just its own
-  // label, no qualifier. Only when the worst hostname is a DIFFERENT one
-  // from the primary does the text name whose figure it is, so the URL
-  // column's primary hostname is never contradicted by a number that is
-  // not actually its own.
+  const worstSeverity = worstCertSeverity(r.hostnameAnswers)
+  // Fix round 4 (Task 8 review), I5: the qualifier fires ONLY when the
+  // worst hostname is BOTH a different one from the primary AND actually
+  // ACTIONABLE (`amber`/`red`) -- round 3 qualified on "different from the
+  // primary" alone, which meant an entirely ordinary row (60d primary, 45d
+  // sibling, nothing wrong anywhere) named an uninvolved sibling hostname
+  // in green text on a row where nothing needs attention. The common case
+  // -- worst is the primary, or the worst sibling's own state is `ok`,
+  // `none`, or merely `unknown` -- renders EXACTLY the primary's own label,
+  // no parenthetical, matching round 2's original "don't qualify the
+  // ordinary case" intent, now actually achieved.
   const text =
-    worstAnswer && worstAnswer.hostname !== r.primaryHostname
+    worstAnswer && worstAnswer.hostname !== r.primaryHostname && (worstSeverity === 'amber' || worstSeverity === 'red')
       ? `${certLabel(worstAnswer)} (${worstAnswer.hostname})`
       : certLabel(primary)
   return (
-    <td className="col-cert" data-severity={worstCertSeverity(r.hostnameAnswers)} data-testid="cert-cell">
+    <td className="col-cert" data-severity={worstSeverity} data-testid="cert-cell">
       {text}
-      {others.length > 0 && (
-        // RECORDED, NOT FIXED (fix round 3, Task 8 review): each expansion
-        // row already names its own hostname next to its own figure, so it
-        // cannot individually contradict itself the way the collapsed cell
-        // could -- but the same "which number is this system's actionable
-        // one" question this round settled for the collapsed text has not
-        // been asked of a THREE-OR-MORE-hostname system's expansion as a
-        // whole (e.g. whether the worst-of sibling should be pinned first,
-        // or the list should read differently once it is doing double duty
-        // with the collapsed text's own qualifier). Left as a follow-up,
-        // not this round's scope.
+      {/* Fix round 4 (Task 8 review), I3: lists EVERY hostname, including
+          the primary -- see `UrlCell`'s identical comment. The acute
+          version of this bug lived here: excluding the primary from this
+          list meant that whenever the collapsed text named a DIFFERENT
+          (worst) hostname, the primary's own certificate figure became
+          unreachable from the entire row -- rendered nowhere at all. */}
+      {r.hostnameAnswers.length > 1 && (
         <details className="cert-expand">
-          <summary>{others.length} more</summary>
+          <summary>{r.hostnameAnswers.length} hostnames</summary>
           <ul>
-            {others.map((h) => (
+            {r.hostnameAnswers.map((h) => (
               <li key={h.hostname} data-severity={certSeverity(h)}>
                 <span className="mono">{h.hostname}</span>: {certLabel(h)}
               </li>

@@ -117,12 +117,20 @@ const VERDICT_SEVERITY: Record<Verdict, number> = {
  * multi-hostname system must not be averaged away into a green row":
  * `primaryHostname()` picks a hostname that ANSWERS to show as the
  * clickable URL, so using its verdict alone as the row's summary would let
- * exactly that averaging happen. `worstVerdict` instead looks at every
- * hostname (and every unnamed on-box probe) this system has and reports the
- * worst one, regardless of which hostname `primaryHostname()` chose to
- * display. An empty input (no hostname and no unnamed probe produced any
- * verdict at all) is `unprobed` -- there was nothing to check either axis
- * against.
+ * exactly that averaging happen. `worstVerdict` looks at every NAMED
+ * hostname this system has and reports the worst one, regardless of which
+ * hostname `primaryHostname()` chose to display. An empty input is
+ * `unprobed` -- there was nothing to check either axis against.
+ *
+ * Fix round 4 (Task 8 review), C1, stated here because it is this
+ * function's own contract, not just its caller's: an UNNAMED on-box probe
+ * (a published port with no vhost) NEVER contributes to this fold, in
+ * either direction. `worstVerdict` is a MAX, and a max-fold has no way to
+ * express "positive evidence that should not decide the outcome on its
+ * own" except by lowering the floor -- and lowering it below every absence
+ * state is exactly how one answering, unnamed port turned into an entire
+ * system's `healthy` verdict, for a system with no named hostnames at all.
+ * See `systemRow`'s own comment at the call site for the full history.
  */
 export function worstVerdict(verdicts: Verdict[]): Verdict {
   if (verdicts.length === 0) return 'unprobed'
@@ -434,15 +442,36 @@ function neverReportedRow(hostId: string, hostName: string, lastSeenAt: Date | n
  *
  * Fix round 1 (Task 8 review), C3: a stored external result older than
  * `EXTERNAL_RESULT_STALE_AFTER_MS` is likewise treated as NO CURRENT
- * OPINION -- `externalOutcome`, `certExpiresAt` and `certDaysRemaining` all
- * read `null`, and `combine()` never sees its axis -- exactly the same
- * "absent" treatment `fleetWideFailure` already gets. Without this, a
- * result from nine days ago (a hostname the sweep has quietly stopped
- * reaching) would still count as a live "healthy" opinion forever, which is
- * precisely the lie spec §5.1 exists to remove. `externalAgeMs` is the one
- * field that is NEVER nulled by staleness -- an operator must still be able
- * to see "checked 9 days ago" even though the board itself stops trusting
- * the content of that reading.
+ * OPINION for REACHABILITY -- `externalOutcome` reads `null`, and
+ * `combine()` never sees its axis -- exactly the same "absent" treatment
+ * `fleetWideFailure` already gets. Without this, a result from nine days
+ * ago (a hostname the sweep has quietly stopped reaching) would still
+ * count as a live "healthy" opinion forever, which is precisely the lie
+ * spec §5.1 exists to remove. `externalAgeMs` is the one field that is
+ * NEVER nulled by staleness -- an operator must still be able to see
+ * "checked 9 days ago" even though the board itself stops trusting the
+ * content of that reading.
+ *
+ * Fix round 4 (Task 8 review), C2: `certExpiresAt`/`certDaysRemaining` are
+ * DELIBERATELY NOT part of that gate -- rounds 1-3 nulled them together
+ * with `externalOutcome`, which meant every certificate figure on the
+ * board vanished (fell to grey "not checked"/"no longer current") for the
+ * entire duration of a fleet-wide failure or any three missed cycles, the
+ * one window the column is least able to re-check anything. The asymmetry
+ * is deliberate and load-bearing: REACHABILITY can flip in either
+ * direction between two checks (an app that was down can come back, and
+ * vice versa), so a stale reachability reading genuinely cannot be trusted
+ * either way -- but a certificate's EXPIRY DATE can only ever move LATER
+ * (renewal) or stay the same; it never moves earlier. A stale reading of
+ * expiry can therefore only ever OVER-alarm (the cert may since have been
+ * renewed to a later date), never under-alarm (an expiry the board saw was
+ * 3 days out cannot have secretly become 30 days out on its own). Since
+ * over-alarming is the safe direction and under-alarming is the one this
+ * whole slice exists to prevent, suppressing the stale figure was the one
+ * direction that was actually unsafe. `certLabel` (FleetTable.tsx) states
+ * the reading's provenance explicitly whenever it is not current, so an
+ * old figure is never presented as a fresh one -- it is presented as
+ * exactly what it is: real, and possibly out of date.
  */
 function buildHostnameAnswers(
   hostnames: HostnameConfig[],
@@ -467,16 +496,20 @@ function buildHostnameAnswers(
     const rawExternal = externalByHostname.get(h.hostname)
     const externalAgeMs = rawExternal ? now.getTime() - rawExternal.observedAt.getTime() : null
 
-    // The CONTENT (axis, cert) is what the fleet-wide guard and the
-    // staleness ceiling actually gate -- never the age above.
+    // The REACHABILITY content (axis) is what the fleet-wide guard and the
+    // staleness ceiling actually gate -- never the age above, and (fix
+    // round 4, C2) never the certificate figures below either.
     const external = fleetWideFailure ? undefined : rawExternal
     const externalIsCurrent = external !== undefined && externalAgeMs !== null && externalAgeMs <= EXTERNAL_RESULT_STALE_AFTER_MS
 
     const externalAxis = externalIsCurrent ? toAxis(external.outcome, external.status) : null
-    const certDaysRemaining =
-      externalIsCurrent && external.certExpiresAt
-        ? Math.floor((external.certExpiresAt.getTime() - now.getTime()) / 86_400_000)
-        : null
+
+    // Fix round 4 (Task 8 review), C2: read from `rawExternal`, NOT
+    // `external` -- ungated by `fleetWideFailure` or the staleness ceiling,
+    // for the reasoning in this function's own docstring above (expiry only
+    // ever moves later, so a stale reading can only over-alarm).
+    const certExpiresAt = rawExternal?.certExpiresAt ?? null
+    const certDaysRemaining = certExpiresAt ? Math.floor((certExpiresAt.getTime() - now.getTime()) / 86_400_000) : null
 
     return {
       hostname: h.hostname,
@@ -485,7 +518,7 @@ function buildHostnameAnswers(
       externalOutcome: externalAxis?.outcome ?? null,
       externalAgeMs,
       listensTls: h.listensTls,
-      certExpiresAt: externalIsCurrent ? (external.certExpiresAt ?? null) : null,
+      certExpiresAt,
       certDaysRemaining,
     }
   })
@@ -520,22 +553,34 @@ function systemRow(
   // either into `worstVerdict` alongside a genuinely healthy NAMED hostname
   // DOWNGRADED the row -- a silent unmapped database/cache/exporter port
   // (common on a multi-stack host) could drag a fully healthy system down
-  // to `unprobed` or `unconfirmed`, exactly the "picking a winner"/inventing
-  // a fact this whole design exists to refuse, just aimed at an evidence
-  // source instead of a named hostname.
+  // to `unprobed` or `unconfirmed`.
   //
-  // Spec §3.1 is explicit that an unmapped port is evidence that can ONLY
-  // be positive ("only `answering` counts. Every other outcome is
-  // `not-probed`"), so its contribution here must be able to ONLY help,
-  // never hurt: an `answering` entry contributes `healthy` (severity 0,
-  // the floor of `VERDICT_SEVERITY` -- it can never make `worstVerdict`
-  // read worse than whatever the named hostnames already produced), and
-  // every other outcome (in practice only `not-probed`, per the agent's own
-  // discipline -- see shared/src/wire.ts) contributes NOTHING at all.
+  // Fix round 2's OWN chosen fix was ALSO wrong, and round 4's review found
+  // it: it made an `answering` unmapped entry contribute the string
+  // `'healthy'` to the array `worstVerdict` folds over. That comment argued
+  // correctly that `'healthy'` (severity 0, the floor) "can never make
+  // `worstVerdict` read worse" -- true, and it is exactly the wrong half of
+  // the argument, because `worstVerdict` is a MAX over its input, and a
+  // system with NO NAMED HOSTNAMES AT ALL has nothing else in that array.
+  // `worstVerdict(['healthy'])` is `'healthy'` -- the synthesized entry
+  // becomes the ENTIRE row's verdict, on the strength of one port spec
+  // §3.1 says "may be a database, a cache, a mail relay, a UDP service",
+  // for a system the row's own URL column calls "no HTTP surface" and whose
+  // external axis has never run. Spec §2: "a row is green only when the
+  // application answers." A max-fold cannot express "positive but
+  // non-dispositive evidence" by lowering its floor -- lowering it BELOW
+  // every absence state (`unprobed`/`unconfirmed`, severity 1/2) is exactly
+  // what manufactures a false green out of nothing.
+  //
+  // The fix: an unmapped port's result contributes NOTHING to `verdict`,
+  // ever, regardless of outcome. It is not thrown away -- `unnamedOnBoxProbes`
+  // below still carries it, and `AnswersCell` (FleetTable.tsx) prints "a
+  // port with no name answered on-box (N)" independently of `verdict` --
+  // but a fact that can only be positive must never be allowed to BECOME
+  // the verdict on its own; it may only ever fail to move one.
   const unnamed = (onBoxProbes ?? []).filter((p) => p.hostname === null)
-  const unnamedVerdicts: Verdict[] = unnamed.filter((p) => p.outcome === 'answering').map(() => 'healthy')
 
-  const verdict = worstVerdict([...hostnameAnswers.map((h) => h.verdict), ...unnamedVerdicts])
+  const verdict = worstVerdict(hostnameAnswers.map((h) => h.verdict))
 
   // Fix round 1 (Task 8 review), I2: the Answers cell's parenthetical
   // detail (spec §5's "proxy up, app not responding" / "TLS handshake

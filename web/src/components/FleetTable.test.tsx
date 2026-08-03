@@ -393,10 +393,41 @@ describe('FleetTable', () => {
       const details = cell.querySelector('details.hostname-expand')
       expect(details).not.toBeNull()
       expect(details?.hasAttribute('open')).toBe(false)
-      expect(within(cell).getByText(/\+1 more/i)).toBeTruthy()
+      expect(within(cell).getByText(/2 hostnames/i)).toBeTruthy()
       // ...but the sibling hostname is genuinely present in the markup, not
       // silently dropped -- reachable by anyone who expands the summary.
       expect(within(cell).getByRole('link', { name: 'beta.example.invalid' })).toBeTruthy()
+    })
+
+    // Fix round 4 (Task 8 review), I3: the expansion lists EVERY hostname,
+    // including the one already shown collapsed -- `CertCell` had the acute
+    // version of this defect (a hostname's own figure becoming unreachable
+    // from the whole row); `UrlCell` is made consistent with `AnswersCell`
+    // for the same reason even though its own defect was less severe.
+    it('lists the primary hostname too inside the expansion, not just the siblings', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [
+                { hostname: 'alpha.example.invalid', listensTls: true },
+                { hostname: 'beta.example.invalid', listensTls: true },
+              ],
+              primaryHostname: 'alpha.example.invalid',
+              hostnameAnswers: [
+                healthyHostnameAnswer(),
+                healthyHostnameAnswer({ hostname: 'beta.example.invalid' }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const cell = document.querySelector<HTMLElement>('.col-url-cell')!
+      const expansion = cell.querySelector<HTMLElement>('details.hostname-expand')!
+      // Both hostnames -- alpha (the primary, already shown collapsed above)
+      // AND beta -- appear inside the expansion's own link list.
+      expect(within(expansion).getByRole('link', { name: 'alpha.example.invalid' })).toBeTruthy()
+      expect(within(expansion).getByRole('link', { name: 'beta.example.invalid' })).toBeTruthy()
     })
   })
 
@@ -632,11 +663,19 @@ describe('FleetTable', () => {
 
     // M2 (fix round 2): `ageDetail(null)`'s exact wording was unpinned --
     // changing it to an outright lie about evidence age ('checked just
-    // now' instead of 'never checked externally') passed the full suite.
+    // now' instead of the neutral 'never checked') passed the full suite.
     // This is the phrase that appears on nearly every row on first deploy
     // (before any external result exists at all), so it matters more than
     // most.
-    it('says "never checked externally", not a fabricated recency, when no external result exists at all', () => {
+    //
+    // Fix round 4 (Task 8 review), M7: the string is now just "never
+    // checked", not "never checked externally" -- every call site already
+    // prefixes the result with the literal word "external" (see
+    // `AnswersCell`'s own `— external {ageDetail(...)}`), so the old wording
+    // rendered "not yet confirmed — external never checked externally",
+    // saying "external" twice. This test's own substring match used to miss
+    // that duplication entirely.
+    it('says "never checked", not a fabricated recency or a doubled "external", when no external result exists at all', () => {
       render(
         <FleetTable
           rows={[
@@ -651,8 +690,11 @@ describe('FleetTable', () => {
         />,
       )
       const cell = screen.getByTestId('answers-cell')
-      expect(within(cell).getByText(/never checked externally/i)).toBeTruthy()
+      const age = cell.querySelector('.answer-age')
+      expect(age?.textContent).toMatch(/— external never checked$/)
       expect(within(cell).queryByText(/checked just now/i)).toBeNull()
+      // THE regression M7 found: the old wording said "external" twice.
+      expect(age?.textContent?.match(/external/gi)).toHaveLength(1)
     })
   })
 
@@ -900,6 +942,39 @@ describe('FleetTable', () => {
       expect(collapsedText).toMatch(/2d remaining/)
       expect(collapsedText).toMatch(/beta\.example\.invalid/)
       expect(collapsedText).not.toMatch(/60d remaining/)
+      // THE DENIAL TEST for fix round 4's I3: the primary's OWN figure
+      // (alpha, 60d) must still be reachable from this row -- it used to
+      // render NOWHERE at all, because the expansion excluded the primary
+      // ("others"), so this scenario rendered beta twice (collapsed AND in
+      // the expansion) and alpha zero times.
+      const expansion = cell.querySelector<HTMLElement>('details.cert-expand')!
+      expect(within(expansion).getByText(/alpha\.example\.invalid/)).toBeTruthy()
+      expect(within(expansion).getByText(/60d remaining/)).toBeTruthy()
+    })
+
+    // The qualifier must ALSO fire for `amber`, not only `red` -- an
+    // expiring-soon sibling is just as actionable as a near-expiry one.
+    it('also names the sibling when the worst is merely amber, not just red', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [
+                { hostname: 'alpha.example.invalid', listensTls: true },
+                { hostname: 'beta.example.invalid', listensTls: true },
+              ],
+              primaryHostname: 'alpha.example.invalid',
+              hostnameAnswers: [
+                healthyHostnameAnswer({ certDaysRemaining: 60 }),
+                healthyHostnameAnswer({ hostname: 'beta.example.invalid', certDaysRemaining: 15 }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('cert-cell')
+      expect(cell.getAttribute('data-severity')).toBe('amber')
+      expect(cell.childNodes[0]?.textContent).toBe('15d remaining (beta.example.invalid)')
     })
 
     // The ordinary case must not regress: when the worst hostname IS the
@@ -970,7 +1045,17 @@ describe('FleetTable', () => {
           ]}
         />,
       )
-      expect(screen.getByTestId('cert-cell').getAttribute('data-severity')).toBe('ok')
+      const cell = screen.getByTestId('cert-cell')
+      expect(cell.getAttribute('data-severity')).toBe('ok')
+      // THE DENIAL TEST for fix round 4's I5: on this fully ORDINARY row --
+      // nothing wrong anywhere, a 45-day sibling is not remotely urgent --
+      // the collapsed text must be the PRIMARY's own, unqualified figure.
+      // Before this fix, "different from the primary" alone was enough to
+      // trigger the qualifier, so this exact scenario rendered green
+      // "45d remaining (beta.example.invalid)" -- naming an uninvolved
+      // hostname, in the URL column's shadow, on a row where nothing
+      // needed the operator's attention at all.
+      expect(cell.childNodes[0]?.textContent).toBe('60d remaining')
     })
 
     // `unknown` must outrank `ok` in the worst-of fold, the same reasoning
@@ -1004,6 +1089,55 @@ describe('FleetTable', () => {
       expect(screen.getByTestId('cert-cell').getAttribute('data-severity')).toBe('unknown')
     })
 
+    // THE DENIAL TEST for fix round 4's I4 (I6's first pin): `none` must
+    // rank its OWN tier, strictly below `ok` -- a plain-HTTP-by-design
+    // sibling must never hide a genuinely near-expiry certificate
+    // elsewhere on the row. Before this fix, `ok`/`none` tied at the same
+    // rank and `worstCertSeverity`'s reduce used strict `>`, so whichever
+    // was FIRST in `hostnameAnswers` array order (itself downstream of an
+    // unsorted `readdir` over vhost files) silently won the tie -- the
+    // same system could render green or grey depending purely on file
+    // order, and adding an unrelated plain-HTTP vhost to a system could
+    // flip an EXISTING row's colour with no change to any certificate.
+    // THE precise reproduction: `none` and `ok` are the pair that used to
+    // TIE at rank 0. A `none`/`red` pair (a plain-HTTP sibling next to a
+    // near-expiry one) was NEVER actually at risk -- `red` outranked `none`
+    // either way -- so that pairing does not exercise this defect at all.
+    // The order-dependent hazard only appears between two hostnames that
+    // are BOTH otherwise "fine" (a verified healthy cert vs. nothing to
+    // check): with `none` listed FIRST in `hostnameAnswers` (itself
+    // downstream of an unsorted `readdir`), the OLD tied ranking made
+    // `.reduce`'s strict `>` keep the FIRST element on a tie, so the row
+    // rendered grey `"no TLS configured"` instead of the verified-healthy
+    // hostname's own `"60d remaining"` -- with NO certificate problem
+    // anywhere on the row. Reversing the array order used to flip the
+    // answer; it must not, now.
+    it('deterministically prefers the VERIFIED-healthy ("ok") hostname over a plain-HTTP one ("none") when they tie, regardless of array order', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [
+                { hostname: 'alpha.example.invalid', listensTls: false },
+                { hostname: 'beta.example.invalid', listensTls: true },
+              ],
+              // `alpha` (none) is listed BEFORE `beta` (ok) -- the ordering
+              // that exposed the old bug, since `.reduce` without ties
+              // resolved keeps whichever element it saw FIRST.
+              primaryHostname: 'beta.example.invalid',
+              hostnameAnswers: [
+                healthyHostnameAnswer({ hostname: 'alpha.example.invalid', listensTls: false, certDaysRemaining: null, certExpiresAt: null }),
+                healthyHostnameAnswer({ hostname: 'beta.example.invalid', certDaysRemaining: 60 }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('cert-cell')
+      expect(cell.getAttribute('data-severity')).toBe('ok')
+      expect(cell.childNodes[0]?.textContent).toBe('60d remaining')
+    })
+
     // M2: the cert-expansion's `data-severity` was purely decorative --
     // nothing in globals.css styled it, confirmed by the reviewer deleting
     // the attribute and watching all 797 tests stay green. jsdom in this
@@ -1017,6 +1151,41 @@ describe('FleetTable', () => {
       for (const severity of ['red', 'amber', 'ok', 'unknown', 'none']) {
         expect(css).toMatch(new RegExp(`\\.cert-expand li\\[data-severity=['"]${severity}['"]\\]`))
       }
+    })
+
+    // THE DENIAL TEST for fix round 4's I6 (second pin): the round 2 test
+    // above proves the CSS RULE exists for every severity value, but never
+    // asserted that an expansion row's `data-severity` ATTRIBUTE actually
+    // carries the CORRECT value for its own hostname -- it takes BOTH the
+    // rule and the right attribute to colour anything. Hardcoding the
+    // attribute to `"ok"` would still pass that CSS-coverage test.
+    it('gives each expansion row its OWN computed severity, not a fixed value', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [
+                { hostname: 'alpha.example.invalid', listensTls: true },
+                { hostname: 'beta.example.invalid', listensTls: true },
+              ],
+              primaryHostname: 'alpha.example.invalid',
+              hostnameAnswers: [
+                healthyHostnameAnswer({ certDaysRemaining: 60 }),
+                healthyHostnameAnswer({ hostname: 'beta.example.invalid', certDaysRemaining: 2 }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const expansion = screen.getByTestId('cert-cell').querySelector<HTMLElement>('details.cert-expand')!
+      const betaRow = within(expansion)
+        .getAllByRole('listitem')
+        .find((li) => li.textContent?.includes('beta'))!
+      const alphaRow = within(expansion)
+        .getAllByRole('listitem')
+        .find((li) => li.textContent?.includes('alpha'))!
+      expect(betaRow.getAttribute('data-severity')).toBe('red')
+      expect(alphaRow.getAttribute('data-severity')).toBe('ok')
     })
 
     // M1: staleness/fleet-wide suppression nulls `externalOutcome`
@@ -1048,6 +1217,58 @@ describe('FleetTable', () => {
       const cell = screen.getByTestId('cert-cell')
       expect(within(cell).queryByText(/not checked yet/i)).toBeNull()
       expect(within(cell).getByText(/last checked 9d ago, no longer current/i)).toBeTruthy()
+    })
+
+    // THE DENIAL TEST for fix round 4's C2, at the component level (the
+    // query-layer version lives in fleet-query.test.ts): a REAL
+    // days-remaining figure, checked 9 days ago (stale) or during a
+    // fleet-wide failure, must still be SHOWN -- with its provenance
+    // stated, not hidden behind the "not checked"/"no longer current"
+    // wording certLabel uses when there is no figure at all.
+    it('shows a stale certificate figure WITH its provenance, never hiding it the way a fleet-wide failure or the staleness ceiling used to', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: oneHostname,
+              primaryHostname: 'alpha.example.invalid',
+              tlsConfigured: true,
+              certDaysRemaining: 3,
+              hostnameAnswers: [
+                healthyHostnameAnswer({
+                  certDaysRemaining: 3,
+                  externalOutcome: null,
+                  externalAgeMs: 9 * 24 * 60 * 60_000,
+                }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('cert-cell')
+      expect(within(cell).queryByText(/no longer current/i)).toBeNull()
+      expect(within(cell).queryByText(/not checked yet/i)).toBeNull()
+      expect(within(cell).getByText(/3d remaining, from a check 9d ago/i)).toBeTruthy()
+      // The severity must ALSO survive -- a 3-day certificate reads red,
+      // never grey, even while its own reading is not current.
+      expect(cell.getAttribute('data-severity')).toBe('red')
+    })
+
+    it('does not add a provenance clause to an ORDINARY, current certificate reading', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: oneHostname,
+              primaryHostname: 'alpha.example.invalid',
+              tlsConfigured: true,
+              certDaysRemaining: 60,
+              hostnameAnswers: [healthyHostnameAnswer({ certDaysRemaining: 60 })],
+            }),
+          ]}
+        />,
+      )
+      expect(screen.getByTestId('cert-cell').childNodes[0]?.textContent).toBe('60d remaining')
     })
 
     it('still says "not checked yet" when there is truly no age at all -- distinct from the stale case above', () => {
