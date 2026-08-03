@@ -1,4 +1,5 @@
 import { PrismaClient } from '@prisma/client'
+import type { ProbeOutcome } from '@bevora-ops/shared'
 import { prisma } from './db.js'
 import { displayState } from './staleness.js'
 import { buildBeatTrace, BEAT_WINDOW_MS, type Beat } from './beats.js'
@@ -245,4 +246,72 @@ function systemRow(
     // here is reserved for the "no system exists" placeholder row.
     beats,
   }
+}
+
+/**
+ * One hostname's most recent external probe result -- the second axis
+ * Task 7's `combine` consumes, and the row Task 8's board join reads.
+ * `outcome` is typed as the shared `ProbeOutcome` (not left as the raw
+ * `string` the column stores) because every value ever written here comes
+ * from `probeExternally` (Task 6), whose result is already constrained to
+ * that type -- see `external-probe-runner.ts`.
+ */
+export type LatestExternalResult = {
+  hostname: string
+  outcome: ProbeOutcome
+  status: number | null
+  certExpiresAt: Date | null
+  observedAt: Date
+}
+
+/** Raw shape `$queryRaw` returns, before the `outcome` cast above. */
+type LatestExternalResultRow = {
+  hostname: string
+  outcome: string
+  status: number | null
+  certExpiresAt: Date | null
+  observedAt: Date
+}
+
+/**
+ * The latest `ExternalProbeResult` row for each of the given hostnames,
+ * via the same `DISTINCT ON` shape `latestPerSystem` above uses for
+ * `SystemObservation` -- and for the identical reason: `ExternalProbeResult`
+ * is a history (a fresh row is INSERTED every probe run, never updated in
+ * place, so a result can persist and age across restarts -- see its own
+ * docstring in schema.prisma), so "the latest result" must be a query, not
+ * a row identity, and it must be one Postgres can serve via the
+ * `[hostname, observedAt]` index rather than by scanning every historical
+ * row for every hostname and slicing afterwards.
+ *
+ * DELIBERATELY bounded by the caller's own `hostnames` list, the same way
+ * `latestPerSystem` bounds its beat fetch by the CURRENT `systemIds`
+ * rather than every system id that ever existed. This is what answers the
+ * question of what happens when a hostname stops being served: its rows
+ * are never deleted (no retention is built by this task -- see
+ * `external-probe-runner.ts`'s report), so left unbounded, its last result
+ * WOULD read as newest forever, on a hostname nothing serves any more. By
+ * requiring the caller to pass the CURRENTLY discovered hostname set
+ * (e.g. from the latest `SystemObservation.hostnames`), a retired
+ * hostname simply stops appearing in the argument and therefore stops
+ * appearing in the result -- the stale row is still on disk, but nothing
+ * ever asks for it again. That is a caller-side filter, not a database
+ * one: this function does not know which hostnames are current, it only
+ * knows how to fetch the latest result for whichever ones it is asked
+ * about.
+ */
+export async function latestExternalResultsByHostname(
+  hostnames: string[],
+  client: PrismaClient = prisma,
+): Promise<Map<string, LatestExternalResult>> {
+  if (hostnames.length === 0) return new Map()
+
+  const rows = await client.$queryRaw<LatestExternalResultRow[]>`
+    SELECT DISTINCT ON ("hostname")
+      "hostname", "outcome", "status", "certExpiresAt", "observedAt"
+    FROM "ExternalProbeResult"
+    WHERE "hostname" = ANY(${hostnames})
+    ORDER BY "hostname", "observedAt" DESC
+  `
+  return new Map(rows.map((r) => [r.hostname, { ...r, outcome: r.outcome as ProbeOutcome }]))
 }

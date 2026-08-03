@@ -88,6 +88,64 @@ model SystemObservation {
   @@index([systemId, receivedAt])
 }
 
+/// One external probe's result for ONE hostname, at the time it ran --
+/// Task 6's `probeExternally` is the only thing that produces the shape
+/// this table stores (see external-probe.ts's `ExternalResult`).
+///
+/// Stored per HOSTNAME, never per system or per host: a system can carry
+/// several hostnames and they can genuinely disagree (that disagreement
+/// is spec §8's whole reason for expanding a row) -- keying this table on
+/// `hostname`, never on `System.id`, is what keeps a failing hostname
+/// visible instead of letting its write average into, or get clobbered
+/// by, a sibling hostname's result.
+///
+/// No unique constraint on `hostname`, and no update-in-place: a fresh row
+/// is INSERTED every run. This table is a history, the same shape as
+/// `SystemObservation` -- "the latest external result" is a QUERY
+/// (`DISTINCT ON ("hostname") ... ORDER BY "observedAt" DESC`, see
+/// `fleet-query.ts`'s `latestExternalResultsByHostname`), never a row
+/// identity. That is what lets a result persist and AGE across restarts,
+/// rather than resetting on every deploy -- Task 7's reviewer relied on
+/// the `unconfirmed` window being a cold-start cost, not a recurring gap,
+/// and an update-in-place table would still satisfy that, but a history
+/// costs nothing extra now and is what a later "how long has this been
+/// failing" feature, or a retention pass, would need.
+///
+/// Purely additive: a brand-new table with no existing rows to migrate,
+/// so there is nothing here for old code (running against this schema
+/// during a rolling deploy, before new code starts) to be broken by --
+/// old code simply never queries a table it does not know exists. A
+/// rollback is symmetric: new-schema rows sit unread by old code, nothing
+/// to reconcile.
+model ExternalProbeResult {
+  id       String @id @default(uuid())
+  hostname String
+  outcome  String
+  status   Int?
+  // NULL whenever the handshake did not complete, or completed but this
+  // probe is not what observed a certificate -- NEVER inferred, and NEVER
+  // carried forward from a previous successful probe of the SAME
+  // hostname. See `probeExternally`'s own docstring (external-probe.ts)
+  // for why: a remembered expiry would let an expired, or now entirely
+  // unreachable, certificate read as healthy for as long as the memory
+  // lasted -- spec §6's rule, one layer below where §6 states it.
+  certExpiresAt DateTime?
+  // Set by THIS SERVER's own clock at write time. Unlike
+  // `SystemObservation.observedAt` (claimed by a remote agent over the
+  // wire, and therefore untrusted -- see that model's own comment), there
+  // is no remote clock in this path at all: this process ran the probe
+  // and writes the row in the same breath, so one DB-defaulted timestamp
+  // is trustworthy on its own and a second "received" column would have
+  // nothing distinct left to measure.
+  observedAt DateTime @default(now())
+
+  // Serves the per-hostname "latest" query (DISTINCT ON "hostname" ORDER
+  // BY "observedAt" DESC) directly, and doubles as what a future
+  // age-bounded retention pass would filter on -- see this task's report
+  // for why retention is flagged, not built, here.
+  @@index([hostname, observedAt])
+}
+
 model AgentEnrolment {
   id        String    @id @default(uuid())
   hostId    String

@@ -1,0 +1,195 @@
+import { describe, it, expect, beforeEach } from 'vitest'
+import { prisma } from './db.js'
+import { runExternalProbes } from './external-probe-runner.js'
+import type { ExternalDeps } from './external-probe.js'
+
+// This table is new in this migration and touched by no other spec file,
+// so a wholesale wipe here is safe under `vitest.config.ts`'s
+// `fileParallelism: false` -- see fleet-query.test.ts's own comment on the
+// same pattern for `SystemObservation`.
+beforeEach(async () => {
+  await prisma.externalProbeResult.deleteMany()
+})
+
+const HOST_A = 'runner-a.example.invalid'
+const HOST_B = 'runner-b.example.invalid'
+const HOST_C = 'runner-c.example.invalid'
+
+/** A network failure with the shape `probeExternally` expects to classify as `not-answering`. */
+function networkFailure(): Error {
+  return Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+}
+
+/** A TLS verification failure `probeExternally` classifies as `tls-failed`. */
+function tlsFailure(): Error {
+  return Object.assign(new Error('certificate has expired'), { code: 'CERT_HAS_EXPIRED' })
+}
+
+/** Builds fake `ExternalDeps` from a hostname -> outcome map. */
+function depsFor(
+  outcomes: Record<string, { status: number; certExpiresAt: Date | null } | Error>,
+): ExternalDeps {
+  return {
+    request: async (hostname: string) => {
+      const outcome = outcomes[hostname]
+      if (outcome === undefined) throw new Error(`unexpected hostname in test: ${hostname}`)
+      if (outcome instanceof Error) throw outcome
+      return outcome
+    },
+  }
+}
+
+describe('runExternalProbes', () => {
+  it('stores a result per hostname and it is readable back from the database', async () => {
+    const certExpiresAt = new Date('2030-01-01T00:00:00Z')
+    const deps = depsFor({ [HOST_A]: { status: 200, certExpiresAt } })
+
+    await runExternalProbes([HOST_A], deps)
+
+    // Asserting on the STORED ROW, not on the value `runExternalProbes`
+    // happened to return -- a test that only checked the return value
+    // would pass even if the `createMany` call were silently dropped.
+    const rows = await prisma.externalProbeResult.findMany({ where: { hostname: HOST_A } })
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.hostname).toBe(HOST_A)
+    expect(rows[0]?.outcome).toBe('answering')
+    expect(rows[0]?.status).toBe(200)
+    expect(rows[0]?.certExpiresAt?.toISOString()).toBe(certExpiresAt.toISOString())
+  })
+
+  it('stores two hostnames on one system independently -- a failing one is not averaged into a passing sibling', async () => {
+    const deps = depsFor({
+      [HOST_A]: { status: 200, certExpiresAt: null },
+      [HOST_B]: networkFailure(),
+    })
+
+    await runExternalProbes([HOST_A, HOST_B], deps)
+
+    const rows = await prisma.externalProbeResult.findMany({ orderBy: { hostname: 'asc' } })
+    expect(rows).toHaveLength(2)
+    const byHostname = new Map(rows.map((r) => [r.hostname, r]))
+    expect(byHostname.get(HOST_A)?.outcome).toBe('answering')
+    expect(byHostname.get(HOST_B)?.outcome).toBe('not-answering')
+  })
+
+  it('stores certExpiresAt as null when the handshake failed', async () => {
+    // HOST_B is a passing companion so this run is a PARTIAL failure, not a
+    // fleet-wide one -- a run where the only hostname probed also happens
+    // to be the only one that failed is indistinguishable, to
+    // `isFleetWideExternalFailure`, from every hostname on the whole board
+    // failing at once, and correctly stores nothing (see the fleet-wide
+    // tests below). That guard is not what this test means to exercise.
+    const deps = depsFor({
+      [HOST_A]: tlsFailure(),
+      [HOST_B]: { status: 200, certExpiresAt: null },
+    })
+
+    await runExternalProbes([HOST_A, HOST_B], deps)
+
+    const row = await prisma.externalProbeResult.findFirst({ where: { hostname: HOST_A } })
+    expect(row?.outcome).toBe('tls-failed')
+    expect(row?.certExpiresAt).toBeNull()
+  })
+
+  it('never carries a previous successful probe\'s certExpiresAt forward into a later failed one for the SAME hostname', async () => {
+    const firstExpiry = new Date('2031-05-05T00:00:00Z')
+    await runExternalProbes(
+      [HOST_A, HOST_B],
+      depsFor({
+        [HOST_A]: { status: 200, certExpiresAt: firstExpiry },
+        [HOST_B]: { status: 200, certExpiresAt: null },
+      }),
+    )
+
+    // Confirm the first row really did land with a non-null expiry, so the
+    // second assertion below is testing "did not carry forward", not
+    // "was never set in the first place".
+    const afterFirst = await prisma.externalProbeResult.findMany({ where: { hostname: HOST_A } })
+    expect(afterFirst).toHaveLength(1)
+    expect(afterFirst[0]?.certExpiresAt).not.toBeNull()
+
+    // HOST_B stays passing so this second run is also partial, not
+    // fleet-wide, and HOST_A's new failing row is actually stored.
+    await runExternalProbes(
+      [HOST_A, HOST_B],
+      depsFor({ [HOST_A]: networkFailure(), [HOST_B]: { status: 200, certExpiresAt: null } }),
+    )
+
+    const afterSecond = await prisma.externalProbeResult.findMany({
+      where: { hostname: HOST_A },
+      orderBy: { observedAt: 'desc' },
+    })
+    expect(afterSecond).toHaveLength(2)
+    // The newest row is this run's failure, and its certExpiresAt must be
+    // null -- not the previous row's remembered value.
+    expect(afterSecond[0]?.outcome).toBe('not-answering')
+    expect(afterSecond[0]?.certExpiresAt).toBeNull()
+  })
+
+  it('stores a result carrying an observation time', async () => {
+    const before = new Date()
+    await runExternalProbes([HOST_A], depsFor({ [HOST_A]: { status: 200, certExpiresAt: null } }))
+    const after = new Date()
+
+    const row = await prisma.externalProbeResult.findFirst({ where: { hostname: HOST_A } })
+    expect(row?.observedAt).toBeInstanceOf(Date)
+    expect(row!.observedAt.getTime()).toBeGreaterThanOrEqual(before.getTime())
+    expect(row!.observedAt.getTime()).toBeLessThanOrEqual(after.getTime())
+  })
+
+  it('writes nothing when every probed hostname fails in the same run (fleet-wide guard)', async () => {
+    const deps = depsFor({
+      [HOST_A]: networkFailure(),
+      [HOST_B]: tlsFailure(),
+      [HOST_C]: networkFailure(),
+    })
+
+    const result = await runExternalProbes([HOST_A, HOST_B, HOST_C], deps)
+
+    expect(result.stored).toBe(false)
+    expect(result.results).toHaveLength(3) // the probes still ran and are still returned to the caller
+    const count = await prisma.externalProbeResult.count()
+    expect(count).toBe(0)
+  })
+
+  it('does NOT overwrite a previous good result with a fleet-wide failure -- the prior row remains the latest', async () => {
+    await runExternalProbes([HOST_A], depsFor({ [HOST_A]: { status: 200, certExpiresAt: null } }))
+
+    await runExternalProbes(
+      [HOST_A, HOST_B],
+      depsFor({ [HOST_A]: networkFailure(), [HOST_B]: networkFailure() }),
+    )
+
+    const rows = await prisma.externalProbeResult.findMany({ where: { hostname: HOST_A } })
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.outcome).toBe('answering')
+  })
+
+  it('a PARTIAL failure is still stored in full -- the fleet-wide guard must not swallow a genuine route-broken finding', async () => {
+    const deps = depsFor({
+      [HOST_A]: { status: 200, certExpiresAt: null },
+      [HOST_B]: networkFailure(),
+    })
+
+    const result = await runExternalProbes([HOST_A, HOST_B], deps)
+
+    expect(result.stored).toBe(true)
+    const rows = await prisma.externalProbeResult.findMany()
+    expect(rows).toHaveLength(2)
+  })
+
+  it('never throws even when every probe fails, including a synchronous throw from the transport', async () => {
+    const deps: ExternalDeps = {
+      request: () => {
+        throw networkFailure()
+      },
+    }
+    await expect(runExternalProbes([HOST_A, HOST_B], deps)).resolves.toMatchObject({ stored: false })
+  })
+
+  it('does nothing, without throwing, for an empty hostname list', async () => {
+    const deps = depsFor({})
+    await expect(runExternalProbes([], deps)).resolves.toEqual({ results: [], stored: true })
+    expect(await prisma.externalProbeResult.count()).toBe(0)
+  })
+})

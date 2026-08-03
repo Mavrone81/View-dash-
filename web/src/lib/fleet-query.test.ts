@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { PrismaClient, type Prisma } from '@prisma/client'
 import { prisma } from './db.js'
-import { latestPerSystem, NO_SYSTEMS_LABEL } from './fleet-query.js'
+import { latestPerSystem, latestExternalResultsByHostname, NO_SYSTEMS_LABEL } from './fleet-query.js'
 import { BEAT_COUNT, BEAT_INTERVAL_MS } from './beats.js'
 
 beforeEach(async () => {
@@ -9,6 +9,7 @@ beforeEach(async () => {
   await prisma.system.deleteMany()
   await prisma.agentEnrolment.deleteMany()
   await prisma.host.deleteMany()
+  await prisma.externalProbeResult.deleteMany()
 })
 
 describe('latestPerSystem', () => {
@@ -534,6 +535,82 @@ describe('latestPerSystem', () => {
       } finally {
         await logging.$disconnect()
       }
+    })
+  })
+
+  describe('latestExternalResultsByHostname', () => {
+    const HOST_X = 'fq-external-x.example.invalid'
+    const HOST_Y = 'fq-external-y.example.invalid'
+    const HOST_RETIRED = 'fq-external-retired.example.invalid'
+
+    it('returns the most recently OBSERVED row per hostname, not the most recently inserted one', async () => {
+      // Two rows for the same hostname, inserted in one order but observed
+      // in the other -- if this read picked "last inserted" rather than
+      // "greatest observedAt", it would report the stale result as latest.
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_X, outcome: 'not-answering', status: null, observedAt: new Date('2026-08-03T09:00:00Z') },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_X, outcome: 'answering', status: 200, observedAt: new Date('2026-08-03T08:00:00Z') },
+      })
+
+      const result = await latestExternalResultsByHostname([HOST_X])
+
+      expect(result.size).toBe(1)
+      expect(result.get(HOST_X)?.outcome).toBe('not-answering')
+      expect(result.get(HOST_X)?.observedAt.toISOString()).toBe('2026-08-03T09:00:00.000Z')
+    })
+
+    it('keeps two hostnames independent -- a failing one is never merged into a passing one', async () => {
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_X, outcome: 'answering', status: 200 },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_Y, outcome: 'not-answering', status: null },
+      })
+
+      const result = await latestExternalResultsByHostname([HOST_X, HOST_Y])
+
+      expect(result.size).toBe(2)
+      expect(result.get(HOST_X)?.outcome).toBe('answering')
+      expect(result.get(HOST_Y)?.outcome).toBe('not-answering')
+    })
+
+    it('never invents an entry for a hostname with no stored result -- absence must stay absent, not become a definite verdict', async () => {
+      const result = await latestExternalResultsByHostname(['fq-external-never-probed.example.invalid'])
+      expect(result.size).toBe(0)
+      expect(result.get('fq-external-never-probed.example.invalid')).toBeUndefined()
+    })
+
+    it('excludes a hostname that stopped being served when the caller does not ask about it, even though its row is never deleted', async () => {
+      // A hostname whose last real probe was long ago, and is not in the
+      // CURRENT hostname set the caller passes -- e.g. a vhost that was
+      // removed from the reverse-proxy config. The row is not deleted (no
+      // retention is built by this task), but a caller that bounds its
+      // query by the current hostname set never sees it again.
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_RETIRED, outcome: 'answering', status: 200, observedAt: new Date('2026-01-01T00:00:00Z') },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOST_X, outcome: 'answering', status: 200 },
+      })
+
+      // The caller only names the currently-served hostname.
+      const result = await latestExternalResultsByHostname([HOST_X])
+
+      expect(result.has(HOST_RETIRED)).toBe(false)
+      expect(result.has(HOST_X)).toBe(true)
+
+      // Proof the retired row genuinely still exists on disk (nothing was
+      // deleted) -- it is excluded by the query's WHERE clause, not by
+      // retention.
+      const stillOnDisk = await prisma.externalProbeResult.findFirst({ where: { hostname: HOST_RETIRED } })
+      expect(stillOnDisk).not.toBeNull()
+    })
+
+    it('returns an empty map for an empty hostname list without querying the database', async () => {
+      const result = await latestExternalResultsByHostname([])
+      expect(result.size).toBe(0)
     })
   })
 })
