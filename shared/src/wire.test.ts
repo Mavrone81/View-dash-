@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { FleetSnapshotSchema } from './wire.js'
+import { FleetSnapshotSchema, classifyHttpStatus, classifyProbeFailure, probeOutcomeToHealth } from './wire.js'
 
 const system = {
   key: 'proj-a',
@@ -85,5 +85,57 @@ describe('FleetSnapshotSchema', () => {
     const r = FleetSnapshotSchema.safeParse({ collectedAt: '2026-08-01T10:00:00.000Z',
       systems: [{ ...system, deployedSha: 'a'.repeat(41) }] })
     expect(r.success).toBe(false)
+  })
+})
+
+describe('probe classification', () => {
+  it('treats 2xx and 3xx as answering', () => {
+    for (const s of [200, 201, 204, 301, 302, 307, 308]) {
+      expect(classifyHttpStatus(s)).toBe('answering')
+    }
+  })
+
+  // A login wall is an application doing its job. Measured against the live
+  // host, a "200 is healthy" rule would have marked 19 of 42 hostnames
+  // broken while they worked correctly.
+  it('treats 401 and 403 as answering, NOT as a fault', () => {
+    expect(classifyHttpStatus(401)).toBe('answering')
+    expect(classifyHttpStatus(403)).toBe('answering')
+  })
+
+  it('treats other 4xx as answering oddly', () => {
+    expect(classifyHttpStatus(404)).toBe('answering-oddly')
+    expect(classifyHttpStatus(418)).toBe('answering-oddly')
+  })
+
+  // 502 and 504 come from the PROXY, not the application: they are exactly
+  // what is served when the proxy is healthy and the container behind it is
+  // not. That is the fault this slice exists to catch, so it gets its own
+  // outcome rather than being folded into a generic 5xx.
+  it('names 502 and 504 as the proxy having no upstream', () => {
+    expect(classifyHttpStatus(502)).toBe('proxy-no-upstream')
+    expect(classifyHttpStatus(504)).toBe('proxy-no-upstream')
+  })
+
+  it('treats other 5xx as not answering', () => {
+    expect(classifyHttpStatus(500)).toBe('not-answering')
+    expect(classifyHttpStatus(503)).toBe('not-answering')
+  })
+
+  it('keeps a TLS failure distinct from an application being down', () => {
+    expect(classifyProbeFailure('tls')).toBe('tls-failed')
+    expect(classifyProbeFailure('network')).toBe('not-answering')
+    expect(classifyProbeFailure('timeout')).toBe('not-answering')
+  })
+
+  it('maps outcomes onto health, with not-probed expressing NO opinion', () => {
+    expect(probeOutcomeToHealth('answering')).toBe('healthy')
+    expect(probeOutcomeToHealth('answering-oddly')).toBe('degraded')
+    expect(probeOutcomeToHealth('not-answering')).toBe('down')
+    expect(probeOutcomeToHealth('proxy-no-upstream')).toBe('down')
+    expect(probeOutcomeToHealth('tls-failed')).toBe('down')
+    // null, never 'healthy': "we did not look" must not read as "we looked
+    // and it was fine".
+    expect(probeOutcomeToHealth('not-probed')).toBeNull()
   })
 })

@@ -44,3 +44,67 @@ export const AgentHelloSchema = z.object({
   hostName: z.string().min(1),
 })
 export type AgentHello = z.infer<typeof AgentHelloSchema>
+
+/**
+ * What a single probe of a single hostname found.
+ *
+ * `proxy-no-upstream` is deliberately its own value rather than a flavour
+ * of `not-answering`: a 502/504 is the reverse proxy telling us it is
+ * healthy and the thing behind it is not. That sentence is the entire
+ * reason this slice exists, and collapsing it into a generic failure
+ * throws away the only outcome that names its own cause.
+ *
+ * `not-probed` means no probe ran. It is NOT a pass.
+ */
+export const ProbeOutcomeSchema = z.enum([
+  'answering',
+  'answering-oddly',
+  'not-answering',
+  'proxy-no-upstream',
+  'tls-failed',
+  'not-probed',
+])
+export type ProbeOutcome = z.infer<typeof ProbeOutcomeSchema>
+
+/**
+ * Maps an HTTP status onto an outcome.
+ *
+ * 401 and 403 count as ANSWERING. A login wall is an application working.
+ * Measured across every hostname on the monitored host, a "200 is healthy"
+ * rule would have marked 19 of 42 as broken while they were fine, and a
+ * column that cries wolf is a column nobody reads.
+ */
+export function classifyHttpStatus(status: number): ProbeOutcome {
+  if (status === 502 || status === 504) return 'proxy-no-upstream'
+  if (status >= 500) return 'not-answering'
+  if (status === 401 || status === 403) return 'answering'
+  if (status >= 400) return 'answering-oddly'
+  return 'answering'
+}
+
+/** A probe that produced no HTTP status at all. TLS is kept separate: a
+ * certificate problem is a different repair from a dead application. */
+export function classifyProbeFailure(kind: 'tls' | 'network' | 'timeout'): ProbeOutcome {
+  return kind === 'tls' ? 'tls-failed' : 'not-answering'
+}
+
+/**
+ * Folds an outcome onto the health scale the container side already uses.
+ * `not-probed` yields null — no opinion — so a system nobody could probe is
+ * reported exactly as its containers describe it and is never downgraded
+ * for the absence of a probe, nor upgraded by one that never ran.
+ */
+export function probeOutcomeToHealth(o: ProbeOutcome): HealthState | null {
+  switch (o) {
+    case 'answering':
+      return 'healthy'
+    case 'answering-oddly':
+      return 'degraded'
+    case 'not-answering':
+    case 'proxy-no-upstream':
+    case 'tls-failed':
+      return 'down'
+    case 'not-probed':
+      return null
+  }
+}
