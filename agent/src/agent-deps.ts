@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises'
 import type { AgentConfig } from './config.js'
 import type { CollectDeps } from './collect.js'
 import { toSummary } from './docker.js'
-import { probeHostnameOnBox, probeUrl, type FetchLike } from './probe.js'
+import { httpOnBoxRequest, probeHostnameOnBox, probeUrl, type FetchLike, type OnBoxRequestLike } from './probe.js'
 import { resolveDeployLogPath, resolveRepoDir } from './paths.js'
 import { discoverHostnamesFromDir, nodeVhostFs } from './vhosts.js'
 
@@ -63,20 +63,32 @@ export function buildHostnamesByPort(
  * inline version untestable: `main.ts` runs `loadConfig()`, connects to
  * Docker, and starts the tick interval the moment it is imported, so
  * nothing could import it to check the wiring without also running the
- * whole agent. That made two of `CollectDeps`' keys -- `hostnamesByPort`
- * and `probeOnBoxHostname` -- both optional AND untested at the one place
- * they were actually wired: deleting either line in `main.ts` typechecked,
- * passed every existing test, and silently reverted on-box probing to
- * inert. See `agent-deps.test.ts`'s "wires both on-box probing keys" test,
- * which exists to catch exactly that regression.
+ * whole agent. Fix round 1 closed that; fix round 2 closed a second seam
+ * the reviewer named "narrowed, not eliminated": `hostnamesByPort` and
+ * `probeOnBoxHostname` were still two independent OPTIONAL keys, so
+ * deleting either one from the object below still typechecked and passed
+ * every test while silently reverting on-box probing to inert. They are
+ * now bundled into `CollectDeps.onBoxProbing`, a single REQUIRED (if
+ * nullable) field -- see its docstring on `CollectDeps` for why that
+ * specific shape (required-but-nullable, not optional) is what actually
+ * closes the gap: TypeScript forbids `delete`ing a required property, even
+ * one whose value type includes `null`.
  *
- * `fetchImpl` defaults to the global `fetch` (what `main.ts` actually
- * wants) but is an explicit parameter so a test can inject a fake and
+ * `fetchImpl` defaults to the global `fetch` and is used ONLY for the
+ * external probe (`probe`) -- `fetch` is structurally incapable of sending
+ * a `Host` header (see `OnBoxRequestLike` in `agent/src/probe.ts` for why),
+ * so it must never be handed to the on-box axis. `onBoxRequestImpl`
+ * defaults to `httpOnBoxRequest`, the `node:http`-based transport that CAN
+ * send one. Both are explicit parameters so a test can inject a fake and
  * assert on what this function actually dials -- see
- * `agent-deps.test.ts`'s "genuinely calls through" test, which is the
- * second half of what that same review asked for.
+ * `agent-deps.test.ts`'s "genuinely calls through" tests.
  */
-export function buildCollectDeps(cfg: AgentConfig, docker: DockerLike, fetchImpl: FetchLike = fetch): CollectDeps {
+export function buildCollectDeps(
+  cfg: AgentConfig,
+  docker: DockerLike,
+  fetchImpl: FetchLike = fetch,
+  onBoxRequestImpl: OnBoxRequestLike = httpOnBoxRequest,
+): CollectDeps {
   return {
     // `key` originates from a Docker compose-project label on the monitored
     // host, not from this agent's own config -- resolveDeployLogPath and
@@ -98,7 +110,12 @@ export function buildCollectDeps(cfg: AgentConfig, docker: DockerLike, fetchImpl
     // The on-box probe: no operator configuration required at all, unlike
     // urlFor/probe above -- every hostname comes from the host's own proxy
     // config, and every system's published ports come from Docker itself.
-    hostnamesByPort: buildHostnamesByPort(cfg.vhostDir),
-    probeOnBoxHostname: (hostname, port) => probeHostnameOnBox(hostname, port, fetchImpl, cfg.probeTimeoutMs),
+    // Always a real object here, never `null` -- `null` exists on
+    // `CollectDeps.onBoxProbing`'s type only for a test that wants this
+    // axis off; production always wants it on.
+    onBoxProbing: {
+      hostnamesByPort: buildHostnamesByPort(cfg.vhostDir),
+      probeOnBoxHostname: (hostname, port) => probeHostnameOnBox(hostname, port, onBoxRequestImpl, cfg.probeTimeoutMs),
+    },
   }
 }

@@ -1,5 +1,15 @@
 import { describe, it, expect, vi } from 'vitest'
-import { worstOf, probeUrl, hostnamesForSystem, probeHostnameOnBox, type FetchLike } from './probe.js'
+import { createServer } from 'node:http'
+import { createServer as createNetServer } from 'node:net'
+import {
+  worstOf,
+  probeUrl,
+  hostnamesForSystem,
+  probeHostnameOnBox,
+  httpOnBoxRequest,
+  type FetchLike,
+  type OnBoxRequestLike,
+} from './probe.js'
 
 /** A fetch stand-in that answers with a fixed status and records what it was called with. */
 function respondWith(status: number): FetchLike & { calls: string[] } {
@@ -171,30 +181,19 @@ describe('mapping ports to hostnames', () => {
 })
 
 describe('on-box probing', () => {
-  it('addresses the published container port directly, on loopback, with the hostname carried ONLY as a Host header', async () => {
-    let seenUrl: string | undefined
-    let seenHeaders: Record<string, string> | undefined
-    const r = await probeHostnameOnBox('alpha.example.invalid', 8081, async (url, init) => {
-      seenUrl = url
-      seenHeaders = init.headers
+  it('wires the port and hostname through to the transport, in (port, hostname, signal) order', async () => {
+    let seenPort: number | undefined
+    let seenHostname: string | null | undefined
+    const fake: OnBoxRequestLike = async (port, hostname, signal) => {
+      seenPort = port
+      seenHostname = hostname
+      expect(signal).toBeInstanceOf(AbortSignal)
       return { status: 301 }
-    })
-    expect(seenUrl).toBe('http://127.0.0.1:8081/')
-    expect(seenHeaders).toEqual({ Host: 'alpha.example.invalid' })
+    }
+    const r = await probeHostnameOnBox('alpha.example.invalid', 8081, fake)
+    expect(seenPort).toBe(8081)
+    expect(seenHostname).toBe('alpha.example.invalid')
     expect(r).toEqual({ hostname: 'alpha.example.invalid', outcome: 'answering', status: 301 })
-  })
-
-  it('sends no Host header at all for a null hostname, rather than a literal "null"', async () => {
-    let seenHeaders: Record<string, string> | undefined
-    let sawHeadersKey = false
-    const r = await probeHostnameOnBox(null, 8081, async (_url, init) => {
-      seenHeaders = init.headers
-      sawHeadersKey = 'headers' in init
-      return { status: 200 }
-    })
-    expect(sawHeadersKey).toBe(false)
-    expect(seenHeaders).toBeUndefined()
-    expect(r).toEqual({ hostname: null, outcome: 'answering', status: 200 })
   })
 
   it('names a 502 as the proxy having no upstream (classifyHttpStatus is one shared rule, even though this axis has no proxy in its own path)', async () => {
@@ -202,7 +201,7 @@ describe('on-box probing', () => {
     expect(r.outcome).toBe('proxy-no-upstream')
   })
 
-  it('never throws, whatever the fetch does', async () => {
+  it('never throws, whatever the transport does, and a failure for a KNOWN hostname is not-answering', async () => {
     const r = await probeHostnameOnBox('alpha.example.invalid', 8081, async () => {
       throw new Error('boom')
     })
@@ -210,14 +209,112 @@ describe('on-box probing', () => {
     expect(r.status).toBeNull()
   })
 
+  // Fix round 2's second Critical: an UNMAPPED port (hostname === null) has
+  // no vhost vouching that it is loopback-bound or HTTP-shaped at all --
+  // unlike a mapped one, whose port came from a vhost's own proxy_pass.
+  // A failure there is therefore not-probed (no opinion), never down,
+  // because we had no standing to expect an HTTP answer in the first
+  // place. A success still counts as real evidence.
+  it('reports not-probed, never down, when a transport failure hits an UNMAPPED (null-hostname) port', async () => {
+    const r = await probeHostnameOnBox(null, 8081, async () => {
+      throw new Error('ECONNREFUSED')
+    })
+    expect(r.outcome).toBe('not-probed')
+    expect(r.status).toBeNull()
+  })
+
+  it('still counts a SUCCESS on an unmapped port as real evidence, classified the ordinary way', async () => {
+    const r = await probeHostnameOnBox(null, 8081, async () => ({ status: 200 }))
+    expect(r.outcome).toBe('answering')
+  })
+
   it('is bounded in time, does not hang the collection loop', async () => {
-    const neverReplies: FetchLike = (_url, init) =>
+    const neverReplies: OnBoxRequestLike = (_port, _hostname, signal) =>
       new Promise((_resolve, reject) => {
-        init.signal.addEventListener('abort', () => reject(new Error('aborted')))
+        signal.addEventListener('abort', () => reject(new Error('aborted')))
       })
     const startedAt = Date.now()
     const r = await probeHostnameOnBox('alpha.example.invalid', 8081, neverReplies, 50)
     expect(r.outcome).toBe('not-answering')
     expect(Date.now() - startedAt).toBeLessThan(2_000)
+  })
+})
+
+// Fix round 2's Critical, demonstrated: `Host` is a "forbidden header name"
+// under the WHATWG fetch spec, and undici (Node's `fetch`) silently DROPS
+// it rather than erroring. A test that only records the `init` object
+// handed to a fake `fetch` -- exactly what this suite used to do -- proves
+// the ARGUMENT was right and says nothing about the WIRE. Every test below
+// runs the real `httpOnBoxRequest` against a real listener and reads what
+// that listener actually received.
+describe('the real on-box transport (httpOnBoxRequest), against real listeners', () => {
+  it('genuinely delivers an explicit Host header over the wire', async () => {
+    const seenHosts: Array<string | undefined> = []
+    const server = createServer((req, res) => {
+      seenHosts.push(req.headers.host)
+      res.writeHead(200)
+      res.end()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    try {
+      const address = server.address()
+      if (address === null || typeof address === 'string') throw new Error('expected a real TCP address')
+      const r = await probeHostnameOnBox('alpha.example.invalid', address.port, httpOnBoxRequest)
+      expect(seenHosts).toEqual(['alpha.example.invalid'])
+      expect(r).toEqual({ hostname: 'alpha.example.invalid', outcome: 'answering', status: 200 })
+    } finally {
+      server.close()
+    }
+  })
+
+  it('sends no Host override for a null hostname -- the listener never sees a literal "null"', async () => {
+    const seenHosts: Array<string | undefined> = []
+    const server = createServer((req, res) => {
+      seenHosts.push(req.headers.host)
+      res.writeHead(204)
+      res.end()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    try {
+      const address = server.address()
+      if (address === null || typeof address === 'string') throw new Error('expected a real TCP address')
+      await probeHostnameOnBox(null, address.port, httpOnBoxRequest)
+      expect(seenHosts).toHaveLength(1)
+      expect(seenHosts[0]).not.toContain('null')
+    } finally {
+      server.close()
+    }
+  })
+
+  it('reports not-answering for a real connection refusal on a KNOWN hostname', async () => {
+    // Port 1 is a real, always-unused TCP port on any normal machine
+    // (privileged, nothing binds it in a test sandbox) -- a genuine
+    // connection refusal, not a simulated one.
+    const r = await probeHostnameOnBox('alpha.example.invalid', 1, httpOnBoxRequest, 500)
+    expect(r.outcome).toBe('not-answering')
+  })
+
+  it('reports not-probed, never down, for the same real connection refusal on an UNMAPPED (null-hostname) port', async () => {
+    const r = await probeHostnameOnBox(null, 1, httpOnBoxRequest, 500)
+    expect(r.outcome).toBe('not-probed')
+  })
+
+  // The exact scenario the seam review measured against a real listener: a
+  // port that accepts a TCP connection but never speaks HTTP at all (a
+  // line-protocol service, a database, anything non-HTTP) makes Node's
+  // http client throw a protocol parse error, not a connection error.
+  it('fails safe (not-probed) against a real listener that accepts the connection but never speaks HTTP, for an unmapped port', async () => {
+    const server = createNetServer((socket) => {
+      socket.write('NOT HTTP AT ALL\r\n')
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    try {
+      const address = server.address()
+      if (address === null || typeof address === 'string') throw new Error('expected a real TCP address')
+      const r = await probeHostnameOnBox(null, address.port, httpOnBoxRequest, 1_000)
+      expect(r.outcome).toBe('not-probed')
+    } finally {
+      server.close()
+    }
   })
 })

@@ -6,15 +6,16 @@ export type ContainerSummary = {
   state: string
   health: string | null
   /**
-   * The container's HOST-reachable ports only -- i.e. every entry Docker's
-   * own `Ports` array reported that carries a `PublicPort`. An entry with no
-   * `PublicPort` is a container-internal port nothing outside the daemon can
-   * reach; treating it as published would let a vhost's proxy_pass target
-   * attach a hostname to a port no probe can actually hit from the host,
-   * which is worse than reporting no hostname at all -- it is the same
-   * false-attribution shape this slice's vhost parser was fixed three times
-   * over. Deduplicated: the same PublicPort is reported twice when a
-   * container binds both an IPv4 and an IPv6 host address to it.
+   * The container's HOST-reachable, TCP, loopback-bound ports only -- see
+   * `toPublishedPorts` for exactly what that excludes and why. An entry
+   * with no `PublicPort` is a container-internal port nothing outside the
+   * daemon can reach; treating it as published would let a vhost's
+   * proxy_pass target attach a hostname to a port no probe can actually hit
+   * from the host, which is worse than reporting no hostname at all -- it
+   * is the same false-attribution shape this slice's vhost parser was
+   * fixed three times over. Deduplicated: the same PublicPort is reported
+   * twice when a container binds both an IPv4 and an IPv6 host address to
+   * it.
    */
   publishedPorts: number[]
 }
@@ -105,10 +106,49 @@ function parseHealth(status: string | undefined): string | null {
  */
 type RawPort = { PrivatePort: number; PublicPort?: number; Type: string; IP?: string }
 
+// A published port with no matching vhost is still probed on-box (see
+// agent/src/probe.ts's hostnamesForSystem) -- but ONLY if it is plausibly
+// reachable at 127.0.0.1 and plausibly speaks HTTP at all, unlike a MAPPED
+// port, which is safe by construction: its port number came from a vhost's
+// own proxy_pass, and nginx (also running on this host) is itself the
+// evidence that the port is loopback-bound and HTTP-shaped. An unmapped
+// port has no such witness, so this module supplies the next best thing.
+const LOOPBACK_REACHABLE_IPS = new Set(['0.0.0.0', '::', '127.0.0.1'])
+
+/**
+ * Filters and extracts published ports from Docker's raw `Ports` array.
+ *
+ * Two filters, both load-bearing for the unmapped on-box probe (see
+ * `hostnamesForSystem`), not merely tidying:
+ *
+ *  - `Type === 'tcp'` only. Docker also reports `udp` port bindings on this
+ *    same array; an HTTP probe of a UDP-only service cannot even open a
+ *    TCP connection, and measured against a real listener this reliably
+ *    burns the full probe timeout every tick before failing.
+ *  - The bind IP must be loopback-reachable (`0.0.0.0`, `::`, `127.0.0.1`,
+ *    or absent, which dockerode reports for the same meaning as `0.0.0.0`).
+ *    A port published to a specific NON-loopback address (e.g. a host's
+ *    own public IP) is not actually listening on `127.0.0.1` at all --
+ *    Docker's userland proxy / iptables rule only forwards traffic that
+ *    arrives at the bound address -- so this on-box probe, which always
+ *    dials `127.0.0.1`, would get a plain connection refusal there
+ *    regardless of whether the application is healthy.
+ *
+ * Neither filter can make a MAPPED port (one a vhost's `proxy_pass` already
+ * named) newly unreachable: nginx runs on this same host and could only
+ * have proxied to a port that was already loopback-bound and TCP, so this
+ * is strictly a safety net for the unmapped case, not a new restriction on
+ * the case that was already safe.
+ */
 function toPublishedPorts(ports: RawPort[] | undefined): number[] {
   if (!ports) return []
   return dedupeSortedPorts(
-    ports.flatMap((p) => (p.PublicPort === undefined ? [] : [p.PublicPort])),
+    ports.flatMap((p) => {
+      if (p.Type !== 'tcp') return []
+      if (p.PublicPort === undefined) return []
+      if (p.IP !== undefined && !LOOPBACK_REACHABLE_IPS.has(p.IP)) return []
+      return [p.PublicPort]
+    }),
   )
 }
 

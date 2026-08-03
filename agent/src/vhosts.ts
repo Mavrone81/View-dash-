@@ -18,6 +18,22 @@ import { readdir as fsReaddir, readFile as fsReadFile } from 'node:fs/promises'
 export type VhostEntry = {
   hostnames: string[]
   upstreamPort: number | null
+  /**
+   * Whether this server block listens for TLS (`listen 443` or `listen
+   * ... ssl`). Currently produced here and consumed by NOTHING in this
+   * tree -- fix round 2 removed its only prospective consumer (the on-box
+   * probe no longer touches TLS or a scheme at all, see
+   * `agent/src/probe.ts`'s `probeHostnameOnBox`), and no task in the
+   * current plan reads it yet.
+   *
+   * This is a real, load-bearing gap, not dead weight to delete: spec §8
+   * requires "No certificate where TLS is configured without one", and
+   * §7's finding of three TLS vhosts with no certificate depends on
+   * exactly this bit existing somewhere the external probe (Task 6) and
+   * the board (Task 8) can read. Task 5 (wire schema) must carry
+   * `listensTls` on the wire, or this gets rediscovered in Task 8 after a
+   * migration has already shipped without it.
+   */
   listensTls: boolean
 }
 

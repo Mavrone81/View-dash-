@@ -1,9 +1,10 @@
 import { describe, it, expect } from 'vitest'
 import { buildCollectDeps, buildHostnamesByPort, type DockerLike } from './agent-deps.js'
 import type { AgentConfig } from './config.js'
-import type { FetchLike } from './probe.js'
+import type { FetchLike, OnBoxRequestLike } from './probe.js'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
+import { createServer } from 'node:http'
 import { join } from 'node:path'
 
 function makeConfig(over: Partial<AgentConfig> = {}): AgentConfig {
@@ -30,21 +31,22 @@ const noContainers: DockerLike = { listContainers: async () => [] }
 // buildCollectDeps/buildHostnamesByPort into their own side-effect-free
 // module is what makes these assertions possible at all.
 describe('buildCollectDeps', () => {
-  it('wires both on-box probing keys -- deleting either in main.ts used to typecheck, pass every test, and silently revert on-box probing to inert', () => {
+  it('wires onBoxProbing as a real object with both functions -- fix round 2: this used to be two separate OPTIONAL keys, either deletable without a type error', () => {
     const deps = buildCollectDeps(makeConfig(), noContainers)
-    expect(deps.hostnamesByPort).toBeTypeOf('function')
-    expect(deps.probeOnBoxHostname).toBeTypeOf('function')
+    expect(deps.onBoxProbing).not.toBeNull()
+    expect(deps.onBoxProbing!.hostnamesByPort).toBeTypeOf('function')
+    expect(deps.onBoxProbing!.probeOnBoxHostname).toBeTypeOf('function')
   })
 
-  it('probeOnBoxHostname genuinely calls through to a real on-box probe: loopback port, not the hostname, with an explicit Host header', async () => {
-    const calls: Array<{ url: string; headers: Record<string, string> | undefined }> = []
-    const fakeFetch: FetchLike = async (url, init) => {
-      calls.push({ url, headers: init.headers })
+  it('probeOnBoxHostname wires hostname and port through to the on-box transport unmodified (argument shape, not wire delivery -- see the real-transport suite below for that)', async () => {
+    const calls: Array<{ port: number; hostname: string | null }> = []
+    const fakeRequest: OnBoxRequestLike = async (port, hostname) => {
+      calls.push({ port, hostname })
       return { status: 200 }
     }
-    const deps = buildCollectDeps(makeConfig(), noContainers, fakeFetch)
-    const result = await deps.probeOnBoxHostname!('alpha.example.invalid', 8081)
-    expect(calls).toEqual([{ url: 'http://127.0.0.1:8081/', headers: { Host: 'alpha.example.invalid' } }])
+    const deps = buildCollectDeps(makeConfig(), noContainers, fetch, fakeRequest)
+    const result = await deps.onBoxProbing!.probeOnBoxHostname('alpha.example.invalid', 8081)
+    expect(calls).toEqual([{ port: 8081, hostname: 'alpha.example.invalid' }])
     expect(result.outcome).toBe('answering')
   })
 
@@ -71,6 +73,59 @@ describe('buildCollectDeps', () => {
     const out = await deps.listContainers()
     expect(seen).toEqual([{ all: true }])
     expect(out).toEqual([{ names: ['/a'], project: null, state: 'running', health: null, publishedPorts: [] }])
+  })
+})
+
+// Fix round 2's Critical: a fetch-based on-box probe silently dropped the
+// Host header entirely (undici enforces WHATWG's "forbidden header name"
+// list by dropping it, not erroring) -- reproduced against a real
+// node:http server on Node v22.23.1. `agent-deps.test.ts`'s and
+// `probe.test.ts`'s previous tests both pinned the ARGUMENT handed to a
+// fake transport, never what actually reached a server -- the same seam
+// fix round 1 closed one layer up, reopened one layer down. This suite
+// runs `buildCollectDeps`'s REAL, UN-FAKED transport (no `onBoxRequestImpl`
+// override) against a real listener and reads the header the listener
+// actually received.
+describe('the real on-box transport, exercised end to end (not a recorded argument)', () => {
+  it('genuinely delivers the Host header over the wire to a real listener', async () => {
+    const seenHosts: Array<string | undefined> = []
+    const server = createServer((req, res) => {
+      seenHosts.push(req.headers.host)
+      res.writeHead(200)
+      res.end()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    try {
+      const address = server.address()
+      if (address === null || typeof address === 'string') throw new Error('expected a real TCP address')
+      const deps = buildCollectDeps(makeConfig(), noContainers)
+      const result = await deps.onBoxProbing!.probeOnBoxHostname('alpha.example.invalid', address.port)
+      expect(seenHosts).toEqual(['alpha.example.invalid'])
+      expect(result.outcome).toBe('answering')
+      expect(result.status).toBe(200)
+    } finally {
+      server.close()
+    }
+  })
+
+  it('sends no claimed Host at all for a null hostname -- the listener sees its own address, never a literal "null"', async () => {
+    const seenHosts: Array<string | undefined> = []
+    const server = createServer((req, res) => {
+      seenHosts.push(req.headers.host)
+      res.writeHead(200)
+      res.end()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    try {
+      const address = server.address()
+      if (address === null || typeof address === 'string') throw new Error('expected a real TCP address')
+      const deps = buildCollectDeps(makeConfig(), noContainers)
+      await deps.onBoxProbing!.probeOnBoxHostname(null, address.port)
+      expect(seenHosts).toHaveLength(1)
+      expect(seenHosts[0]).not.toContain('null')
+    } finally {
+      server.close()
+    }
   })
 })
 

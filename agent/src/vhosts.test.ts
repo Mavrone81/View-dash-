@@ -380,8 +380,9 @@ describe('discoverHostnamesFromDir', () => {
 })
 
 describe('the production VhostFs', () => {
-  // This runs the EXACT object main.ts hands to readVhostDir on a real
-  // host -- not a lookalike lambda written inline in a test. The earlier
+  // This runs the EXACT object agent-deps.ts hands to readVhostDir on a
+  // real host (via buildHostnamesByPort -> discoverHostnamesFromDir) --
+  // not a lookalike lambda written inline in a test. The earlier
   // "follows symlinks" suite above proves node:fs/promises' readFile
   // follows a symlink (an OS guarantee, not something this module decides);
   // this suite proves the shipped nodeVhostFs object itself doesn't

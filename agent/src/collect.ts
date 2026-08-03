@@ -27,36 +27,48 @@ export type CollectDeps = {
    */
   probe?: (url: string) => Promise<HealthState>
   /**
-   * Every hostname the host's reverse-proxy config maps to each published
-   * container port, read ONCE per tick (not once per system) -- resolving a
-   * named `upstream` block may require every vhost file to have been seen
-   * first, see `discoverHostnamesByPort` in `agent/src/vhosts.ts`.
+   * The on-box probing pair, bundled into ONE required (not optional --
+   * see the paragraph below) field rather than two separate optional ones.
    *
-   * Returns `null` when the vhost directory could not be read this tick
-   * (missing path, permission denied, whatever) -- see
-   * `agent/src/vhosts.ts`'s `readVhostDir` docstring for why an empty
-   * result and an unreadable directory must never be reported as the same
-   * fact. `null` here is deliberately NOT the same as an empty `Map`: an
-   * empty map means "read the config, found no vhosts for any port",
-   * whereas `null` means "did not read the config at all", and only the
-   * former is a real fact about the host worth acting on. Both result in no
-   * on-box probing this tick, which is the safe behaviour either way, but
-   * only `null` is worth a caller logging as a diagnostic failure -- see
-   * `agent/src/agent-deps.ts`'s `buildHostnamesByPort`.
+   * `null` means "not configured", the same thing the two former optional
+   * fields meant by being absent -- but a caller must now say so
+   * EXPLICITLY. This is fix round 2's response to a seam review finding
+   * (Important 1) that survived fix round 1's `agent-deps.ts` extraction:
+   * with `hostnamesByPort?` and `probeOnBoxHostname?` as two independent
+   * optional keys, deleting either one out of the object `buildCollectDeps`
+   * returns still typechecked and passed every test, silently reverting
+   * on-box probing to inert. Optional properties are legal targets of the
+   * `delete` operator in TypeScript; REQUIRED ones (even when their value
+   * type includes `null`, as this one does) are not -- `delete
+   * deps.onBoxProbing` is a compile error, not a silent no-op. See
+   * `agent-deps.test.ts` for the reproduction of both the old failure mode
+   * and this compile-time guard against it.
    *
-   * Optional, and absent in every deployment until a monitored host has a
-   * vhost path configured to read -- see `agent/src/config.ts`.
-   */
-  hostnamesByPort?: () => Promise<Map<number, string[]> | null>
-  /**
-   * Probes one hostname FROM the monitored host itself, by addressing its
-   * resolved loopback PORT directly with an explicit `Host` header (see
+   * `hostnamesByPort` is read ONCE per tick (not once per system) --
+   * resolving a named `upstream` block may require every vhost file to
+   * have been seen first, see `discoverHostnamesByPort` in
+   * `agent/src/vhosts.ts`. It returns `null` when the vhost directory
+   * could not be read this tick (missing path, permission denied,
+   * whatever) -- see `agent/src/vhosts.ts`'s `readVhostDir` docstring for
+   * why an empty result and an unreadable directory must never be reported
+   * as the same fact. `null` here is deliberately NOT the same as an empty
+   * `Map`: an empty map means "read the config, found no vhosts for any
+   * port", whereas `null` means "did not read the config at all", and only
+   * the former is a real fact about the host worth acting on. Both result
+   * in no on-box probing this tick, which is the safe behaviour either
+   * way, but only `null` is worth a caller logging as a diagnostic failure
+   * -- see `agent/src/agent-deps.ts`'s `buildHostnamesByPort`.
+   *
+   * `probeOnBoxHostname` probes one hostname FROM the monitored host
+   * itself, by addressing its resolved loopback PORT directly with an
+   * explicit `Host` header when a hostname is known (see
    * `agent/src/probe.ts`'s `probeHostnameOnBox` and the spec's §3.1
-   * correction) -- NOT by resolving the hostname over DNS. Optional for the
-   * same reason as `probe` above -- with no hostnames discovered for a
-   * system, it is never called for that system.
+   * correction) -- NOT by resolving the hostname over DNS.
    */
-  probeOnBoxHostname?: (hostname: string | null, port: number) => Promise<{ outcome: ProbeOutcome; status: number | null }>
+  onBoxProbing: {
+    hostnamesByPort: () => Promise<Map<number, string[]> | null>
+    probeOnBoxHostname: (hostname: string | null, port: number) => Promise<{ outcome: ProbeOutcome; status: number | null }>
+  } | null
 }
 
 export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot> {
@@ -76,10 +88,11 @@ export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot>
   // collection loop" is stated as an absolute in this project, not a
   // best-effort; a failure here degrades to "skip on-box probing this
   // tick", the same outcome as the directory being unreachable.
+  const onBoxProbing = deps.onBoxProbing // captured once: see the per-system use below for why
   let byPort: Map<number, string[]> | null = null
-  if (deps.hostnamesByPort) {
+  if (onBoxProbing) {
     try {
-      byPort = await deps.hostnamesByPort()
+      byPort = await onBoxProbing.hostnamesByPort()
     } catch {
       byPort = null
     }
@@ -161,12 +174,12 @@ export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot>
       // system's on-box probing. Total collection time stays the slowest
       // single probe, never the sum of them all.
       let onBoxHealth: HealthState | null = null
-      if (byPort && deps.probeOnBoxHostname) {
+      if (byPort && onBoxProbing) {
         try {
           const targets = hostnamesForSystem(d.publishedPorts, byPort)
           const results = await Promise.all(
             targets.map((t) =>
-              deps.probeOnBoxHostname!(t.hostname, t.port).catch(
+              onBoxProbing.probeOnBoxHostname(t.hostname, t.port).catch(
                 // A configured probe function that REJECTS (rather than
                 // resolving with a failure outcome, which
                 // probeHostnameOnBox always does on its own) is a REAL probe

@@ -11,6 +11,12 @@ const deps = (over: Partial<Parameters<typeof collectSnapshot>[0]> = {}) => ({
   readDeployLog: async () => '2026-08-01T10:00:00Z  === Deploy OK: abc1234 ===',
   repoDirFor: () => '/nonexistent',
   now: () => new Date('2026-08-01T12:00:00Z'),
+  // `onBoxProbing` is REQUIRED (not optional) on CollectDeps -- fix round
+  // 2's response to the on-box pair being deletable one key at a time, see
+  // its docstring -- so every fixture needs an explicit value. `null` is
+  // the honest default here: it means "not configured", the same thing
+  // omitting the two former separate optional keys used to mean.
+  onBoxProbing: null as Parameters<typeof collectSnapshot>[0]['onBoxProbing'],
   ...over,
 })
 
@@ -192,10 +198,10 @@ describe('collectSnapshot', () => {
   // This is the seam this task exists to close: a system's published
   // container ports resolved to hostnames via the host's OWN reverse-proxy
   // config (agent/src/vhosts.ts), and each of those hostnames probed
-  // on-box, through loopback (agent/src/probe.ts) -- with NO operator
-  // configuration, unlike the urlFor/probe block above. `hostnamesByPort`
-  // and `probeOnBoxHostname` are the two seams; see their docstrings on
-  // CollectDeps.
+  // on-box (agent/src/probe.ts) -- with NO operator configuration, unlike
+  // the urlFor/probe block above. `onBoxProbing` (a bundled
+  // hostnamesByPort/probeOnBoxHostname pair, fix round 2) is the seam; see
+  // its docstring on CollectDeps.
   describe('on-box probing of derived hostnames folded into health', () => {
     it('does not render green when every container is up but the on-box probe finds the proxy has no upstream', async () => {
       const snap = await collectSnapshot(
@@ -203,8 +209,10 @@ describe('collectSnapshot', () => {
           listContainers: async () => [
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
-          hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
-          probeOnBoxHostname: async () => ({ outcome: 'proxy-no-upstream' as const, status: 502 }),
+          onBoxProbing: {
+            hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+            probeOnBoxHostname: async () => ({ outcome: 'proxy-no-upstream' as const, status: 502 }),
+          },
         }),
       )
       const alpha = snap.systems.find((s) => s.key === 'alpha')!
@@ -225,8 +233,10 @@ describe('collectSnapshot', () => {
           listContainers: async () => [
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [] },
           ],
-          hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
-          probeOnBoxHostname,
+          onBoxProbing: {
+            hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
+            probeOnBoxHostname,
+          },
         }),
       )
       expect(snap.systems[0]!.health).toBe('healthy')
@@ -245,14 +255,35 @@ describe('collectSnapshot', () => {
           listContainers: async () => [
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [9999] },
           ],
-          hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
-          probeOnBoxHostname: async (hostname, port) => {
-            calls.push({ hostname, port })
-            return { outcome: 'answering' as const, status: 200 }
+          onBoxProbing: {
+            hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
+            probeOnBoxHostname: async (hostname, port) => {
+              calls.push({ hostname, port })
+              return { outcome: 'answering' as const, status: 200 }
+            },
           },
         }),
       )
       expect(calls).toEqual([{ hostname: null, port: 9999 }])
+      expect(snap.systems[0]!.health).toBe('healthy')
+    })
+
+    it('reports not-probed (never down) for a failed probe of an unmapped port, so it cannot redden a row on its own', async () => {
+      // Fix round 2's second Critical: an unmapped port has no vhost
+      // vouching it is HTTP-shaped at all, so a failed probe of it is not
+      // evidence of anything -- probeOutcomeToHealth('not-probed') is
+      // null, which worstOf treats as "no opinion".
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [9999] },
+          ],
+          onBoxProbing: {
+            hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
+            probeOnBoxHostname: async () => ({ outcome: 'not-probed' as const, status: null }),
+          },
+        }),
+      )
       expect(snap.systems[0]!.health).toBe('healthy')
     })
 
@@ -280,8 +311,10 @@ describe('collectSnapshot', () => {
           listContainers: async () => [
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
-          hostnamesByPort: async () => null,
-          probeOnBoxHostname,
+          onBoxProbing: {
+            hostnamesByPort: async () => null,
+            probeOnBoxHostname,
+          },
         }),
       )
       expect(snap.systems[0]!.health).toBe('healthy')
@@ -299,8 +332,11 @@ describe('collectSnapshot', () => {
           listContainers: async () => [
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
-          hostnamesByPort: async () => {
-            throw new Error('vhost read exploded')
+          onBoxProbing: {
+            hostnamesByPort: async () => {
+              throw new Error('vhost read exploded')
+            },
+            probeOnBoxHostname: vi.fn(),
           },
         }),
       )
@@ -320,10 +356,12 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
             { names: ['/b'], project: 'beta', state: 'running', health: null, publishedPorts: [9001] },
           ],
-          hostnamesByPort: async () => byPort,
-          probeOnBoxHostname: async (hostname) => {
-            probed.push(hostname ?? '')
-            return { outcome: 'answering' as const, status: 200 }
+          onBoxProbing: {
+            hostnamesByPort: async () => byPort,
+            probeOnBoxHostname: async (hostname) => {
+              probed.push(hostname ?? '')
+              return { outcome: 'answering' as const, status: 200 }
+            },
           },
         }),
       )
@@ -341,13 +379,15 @@ describe('collectSnapshot', () => {
           listContainers: async () => [
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081, 9001] },
           ],
-          hostnamesByPort: async () => byPort,
-          probeOnBoxHostname: async (hostname) => {
-            const h = hostname ?? ''
-            events.push(`start:${h}`)
-            await new Promise((r) => setTimeout(r, h.startsWith('slow') ? 80 : 5))
-            events.push(`end:${h}`)
-            return { outcome: 'answering' as const, status: 200 }
+          onBoxProbing: {
+            hostnamesByPort: async () => byPort,
+            probeOnBoxHostname: async (hostname) => {
+              const h = hostname ?? ''
+              events.push(`start:${h}`)
+              await new Promise((r) => setTimeout(r, h.startsWith('slow') ? 80 : 5))
+              events.push(`end:${h}`)
+              return { outcome: 'answering' as const, status: 200 }
+            },
           },
         }),
       )
@@ -361,9 +401,11 @@ describe('collectSnapshot', () => {
           listContainers: async () => [
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
-          hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
-          probeOnBoxHostname: async () => {
-            throw new Error('boom')
+          onBoxProbing: {
+            hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+            probeOnBoxHostname: async () => {
+              throw new Error('boom')
+            },
           },
         }),
       )
@@ -386,8 +428,10 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
             { names: ['/b'], project: 'beta', state: 'running', health: null, publishedPorts: [] },
           ],
-          hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
-          probeOnBoxHostname: syncThrow,
+          onBoxProbing: {
+            hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+            probeOnBoxHostname: syncThrow,
+          },
         }),
       )
       expect(snap.systems).toHaveLength(2)
@@ -407,19 +451,22 @@ describe('collectSnapshot', () => {
           listContainers: async () => [
             { names: ['/a'], project: 'alpha', state: 'exited', health: null, publishedPorts: [8081] },
           ],
-          hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
-          probeOnBoxHostname: async () => ({ outcome: 'answering' as const, status: 200 }),
+          onBoxProbing: {
+            hostnamesByPort: async () => new Map([[8081, ['alpha.example.invalid']]]),
+            probeOnBoxHostname: async () => ({ outcome: 'answering' as const, status: 200 }),
+          },
         }),
       )
       expect(snap.systems[0]!.health).toBe('down')
     })
 
-    it('is inert with no hostnamesByPort/probeOnBoxHostname configured, matching every deployment today', async () => {
+    it('is inert when onBoxProbing is explicitly null -- no longer "every deployment today" (agent-deps.ts always wires a real object now), but still the honest state for a caller that wants this axis off', async () => {
       const snap = await collectSnapshot(
         deps({
           listContainers: async () => [
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
           ],
+          onBoxProbing: null,
         }),
       )
       expect(snap.systems[0]!.health).toBe('healthy')

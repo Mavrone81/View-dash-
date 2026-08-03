@@ -143,4 +143,48 @@ describe('toSummary', () => {
     })
     expect(out.publishedPorts).toEqual([8088])
   })
+
+  // Fix round 2, C2: an unmapped published port is now probed on-box with
+  // no evidence from nginx that it is loopback-bound TCP HTTP -- these two
+  // filters are what makes that safe. Measured against real listeners: a
+  // line-protocol service on a UDP-shaped port threw HPE_INVALID_CONSTANT,
+  // and a silent TCP one burned the full probe timeout every tick before
+  // ECONNREFUSED/AbortError -- both would render a perfectly healthy
+  // database/cache/mail-relay/UDP stack permanently down.
+  it('drops a udp port entirely -- an HTTP probe cannot even open a TCP connection to one', () => {
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [{ IP: '0.0.0.0', PrivatePort: 53, PublicPort: 8053, Type: 'udp' }],
+    })
+    expect(out.publishedPorts).toEqual([])
+  })
+
+  it('drops a port bound to a specific non-loopback address -- 127.0.0.1 on THIS host cannot reach it', () => {
+    // Docker's userland proxy / iptables rule for a port bound to one
+    // specific address only forwards traffic that arrives at THAT address;
+    // dialing 127.0.0.1 for a port published at, say, a droplet's own
+    // public IP gets a plain connection refusal regardless of the
+    // container's health.
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [{ IP: '203.0.113.5', PrivatePort: 80, PublicPort: 8080, Type: 'tcp' }],
+    })
+    expect(out.publishedPorts).toEqual([])
+  })
+
+  it('keeps a port explicitly bound to 127.0.0.1', () => {
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [{ IP: '127.0.0.1', PrivatePort: 80, PublicPort: 8080, Type: 'tcp' }],
+    })
+    expect(out.publishedPorts).toEqual([8080])
+  })
+
+  it('keeps a tcp port with no IP reported at all, the same as 0.0.0.0', () => {
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [{ PrivatePort: 80, PublicPort: 8080, Type: 'tcp' }],
+    })
+    expect(out.publishedPorts).toEqual([8080])
+  })
 })
