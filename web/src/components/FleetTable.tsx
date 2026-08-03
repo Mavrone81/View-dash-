@@ -367,29 +367,62 @@ function certSeverity(h: CertEvidence | null): CertSeverity {
 }
 
 /**
- * Fix round 2 (Task 8 review), C1 -- THE fix: the Cert column's `<td>`
- * used to carry only the PRIMARY hostname's own severity, computed by
- * `primaryHostname()` (Task 7), which chooses by which hostname ANSWERS --
- * a criterion with no relationship whatsoever to certificate health. A
- * sibling hostname two days from expiry could sit behind a closed
- * `<details>` while the cell itself rendered `ok`/green, because nothing
- * folded the per-hostname severities the way `fleet-query.ts`'s
- * `worstVerdict` already folds Answers. This is spec §8's no-averaging
- * rule, unapplied to the one column whose entire purpose is warning about
- * an expiring certificate -- and it failed SILENTLY, toward reassurance,
- * which is the most dangerous direction a defect on this board can point.
+ * Fix round 2 (Task 8 review), C1: the Cert column's `<td>` used to carry
+ * only the PRIMARY hostname's own severity, computed by `primaryHostname()`
+ * (Task 7), which chooses by which hostname ANSWERS -- a criterion with no
+ * relationship whatsoever to certificate health. A sibling hostname two
+ * days from expiry could sit behind a closed `<details>` while the cell
+ * itself rendered `ok`/green, because nothing folded the per-hostname
+ * severities the way `fleet-query.ts`'s `worstVerdict` already folds
+ * Answers. This is spec §8's no-averaging rule, unapplied to the one column
+ * whose entire purpose is warning about an expiring certificate -- and it
+ * failed SILENTLY, toward reassurance, the most dangerous direction a
+ * defect on this board can point.
  *
- * The row's TEXT still shows the primary hostname's own days-remaining
- * figure (a real number is more informative than a generic severity word,
- * and it is still genuinely true of the primary) -- only the colour is
- * now worst-of. A row whose cell reads red with a primary hostname that
- * says "60d remaining" is not a contradiction: it is exactly the signal
- * that something else on this row needs the expansion opened.
+ * Fix round 3 (Task 8 review) OVERRULED round 2's own choice of pairing
+ * this severity with the PRIMARY's text ("a red cell reading '60d
+ * remaining'"): a red cell whose visible number is a healthy 60 invites
+ * exactly one conclusion -- the colour is noise -- and an operator who
+ * clicks through to a closed `<details>` and finds nothing alarming stops
+ * clicking. That is how a column dies, not by being wrong but by being
+ * tiresome. See `worstCertAnswer`/`CertCell` below for the fix actually
+ * shipped: the visible text now names the ACTIONABLE figure and, only when
+ * it differs from the primary's, whose it is.
  */
 function worstCertSeverity(answers: readonly HostnameAnswer[]): CertSeverity {
   const severities = answers.map((h) => certSeverity(h))
   if (severities.length === 0) return 'unknown'
   return severities.reduce((worst, s) => (CERT_SEVERITY_RANK[s] > CERT_SEVERITY_RANK[worst] ? s : worst))
+}
+
+/**
+ * Fix round 3 (Task 8 review): which `HostnameAnswer` the Cert cell's TEXT
+ * should actually describe -- the one that produced `worstCertSeverity`,
+ * never simply the primary's. Round 2 coloured the cell by the worst
+ * severity but kept the PRIMARY's own days-remaining as the text, reasoning
+ * that a real number should stay visible and a surprising colour would
+ * prompt the operator to open the expansion. Overruled: a red cell reading
+ * "60d remaining" reads as the colour being wrong, not as an invitation --
+ * the one thing worse than a column that lies is one that trains an
+ * operator to stop trusting what it says, and this cell said opposite
+ * things in the same breath (spec §8's own no-averaging rule, applied to
+ * Answers' WORD as well as its colour, never extended to Cert's).
+ *
+ * Ties at the worst severity are broken by the SMALLEST `certDaysRemaining`
+ * (nulls -- `unknown`/`none`, which carry no number -- excluded from that
+ * comparison) so that among two hostnames both past the amber threshold,
+ * say, the more urgent one is the one named, not merely the first in
+ * hostname order.
+ */
+function worstCertAnswer(answers: readonly HostnameAnswer[]): HostnameAnswer | null {
+  if (answers.length === 0) return null
+  const worst = worstCertSeverity(answers)
+  const atWorst = answers.filter((h) => certSeverity(h) === worst)
+  return atWorst.reduce((worstSoFar, h) => {
+    if (h.certDaysRemaining === null) return worstSoFar
+    if (worstSoFar.certDaysRemaining === null) return h
+    return h.certDaysRemaining < worstSoFar.certDaysRemaining ? h : worstSoFar
+  }, atWorst[0]!)
 }
 
 /**
@@ -694,10 +727,31 @@ function CertCell({ r }: { r: FleetRow }) {
   }
   const primary = r.hostnameAnswers.find((h) => h.hostname === r.primaryHostname) ?? null
   const others = r.hostnameAnswers.filter((h) => h.hostname !== r.primaryHostname)
+  const worstAnswer = worstCertAnswer(r.hostnameAnswers)
+  // The ordinary case -- the worst hostname IS the primary, or there is
+  // only one hostname at all -- renders EXACTLY as before: just its own
+  // label, no qualifier. Only when the worst hostname is a DIFFERENT one
+  // from the primary does the text name whose figure it is, so the URL
+  // column's primary hostname is never contradicted by a number that is
+  // not actually its own.
+  const text =
+    worstAnswer && worstAnswer.hostname !== r.primaryHostname
+      ? `${certLabel(worstAnswer)} (${worstAnswer.hostname})`
+      : certLabel(primary)
   return (
     <td className="col-cert" data-severity={worstCertSeverity(r.hostnameAnswers)} data-testid="cert-cell">
-      {certLabel(primary)}
+      {text}
       {others.length > 0 && (
+        // RECORDED, NOT FIXED (fix round 3, Task 8 review): each expansion
+        // row already names its own hostname next to its own figure, so it
+        // cannot individually contradict itself the way the collapsed cell
+        // could -- but the same "which number is this system's actionable
+        // one" question this round settled for the collapsed text has not
+        // been asked of a THREE-OR-MORE-hostname system's expansion as a
+        // whole (e.g. whether the worst-of sibling should be pinned first,
+        // or the list should read differently once it is doing double duty
+        // with the collapsed text's own qualifier). Left as a follow-up,
+        // not this round's scope.
         <details className="cert-expand">
           <summary>{others.length} more</summary>
           <ul>

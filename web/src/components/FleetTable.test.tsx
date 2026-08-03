@@ -865,7 +865,15 @@ describe('FleetTable', () => {
     // CSS fix, not even coloured once opened -- see the CSS-coverage test
     // below). The fix takes the WORST severity across every hostname while
     // keeping the primary's own number as the visible text.
-    it('colours the cell red when a SIBLING hostname is near expiry, even though the primary is healthy and fresh', () => {
+    // THE DENIAL TEST for fix round 3: the reviewer's exact scenario --
+    // primary 60d, sibling 2d. Round 2 coloured this cell red while its
+    // TEXT still said "60d remaining", which the reviewer overruled: a red
+    // cell reading a healthy number reads as the colour being noise, and it
+    // disagrees with the URL column's own primary hostname (whose
+    // certificate genuinely has 60 days). The fix: the visible text now
+    // names the ACTIONABLE (worst) figure, qualified with whose it is,
+    // since it is not the primary's.
+    it('names the ACTIONABLE figure and whose it is, when the worst hostname is a sibling, not the primary', () => {
       render(
         <FleetTable
           rows={[
@@ -885,9 +893,63 @@ describe('FleetTable', () => {
       )
       const cell = screen.getByTestId('cert-cell')
       expect(cell.getAttribute('data-severity')).toBe('red')
-      // The primary's OWN number is still the visible text -- a real,
-      // true number, not replaced by a generic severity word.
-      expect(cell.textContent).toMatch(/60d remaining/)
+      // The collapsed text carries the WORST (2d), not the primary's
+      // reassuring 60d -- and names whose figure it is, so the row never
+      // says something false about `alpha.example.invalid`.
+      const collapsedText = cell.childNodes[0]?.textContent
+      expect(collapsedText).toMatch(/2d remaining/)
+      expect(collapsedText).toMatch(/beta\.example\.invalid/)
+      expect(collapsedText).not.toMatch(/60d remaining/)
+    })
+
+    // The ordinary case must not regress: when the worst hostname IS the
+    // primary (or there is only one hostname at all), the text is
+    // unchanged from before this round -- no qualifier, no parenthetical,
+    // nothing added that the common case does not need.
+    it('does not add a qualifier when the worst hostname is already the primary', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: oneHostname,
+              primaryHostname: 'alpha.example.invalid',
+              hostnameAnswers: [healthyHostnameAnswer({ certDaysRemaining: 3 })],
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('cert-cell')
+      expect(cell.getAttribute('data-severity')).toBe('red')
+      expect(cell.childNodes[0]?.textContent).toBe('3d remaining')
+    })
+
+    // `worstCertAnswer`'s own tie-break: when TWO siblings are both at the
+    // worst severity (both red here), the MORE urgent one (fewer days) is
+    // the one named, not merely whichever sits first in hostname order.
+    it('names the MORE urgent sibling when two are tied at the same severity', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [
+                { hostname: 'alpha.example.invalid', listensTls: true },
+                { hostname: 'beta.example.invalid', listensTls: true },
+                { hostname: 'gamma.example.invalid', listensTls: true },
+              ],
+              primaryHostname: 'alpha.example.invalid',
+              hostnameAnswers: [
+                healthyHostnameAnswer({ certDaysRemaining: 60 }),
+                healthyHostnameAnswer({ hostname: 'beta.example.invalid', certDaysRemaining: 5 }),
+                healthyHostnameAnswer({ hostname: 'gamma.example.invalid', certDaysRemaining: 2 }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const collapsedText = screen.getByTestId('cert-cell').childNodes[0]?.textContent
+      expect(collapsedText).toMatch(/2d remaining/)
+      expect(collapsedText).toMatch(/gamma\.example\.invalid/)
+      expect(collapsedText).not.toMatch(/5d remaining/)
     })
 
     it('still reads ok when every hostname is healthy and fresh -- the worst-of fold does not invent a problem', () => {
