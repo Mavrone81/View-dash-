@@ -181,7 +181,19 @@ export type FleetRow = {
    * means a published port with no vhost mapping, probed anyway with no
    * `Host` header -- a positive fact ("a port with no name answered"), not
    * an unknown. `unnamedOnBoxProbes` below pulls those out for display;
-   * this field keeps the raw, complete list.
+   * this field carries the same list.
+   *
+   * Fix round 2 (final whole-branch review), Important 7 -- STALENESS-GATED,
+   * not the raw stored value. `fleet-query.ts`'s `systemRow` reads this
+   * from `SystemObservation`, but treats the WHOLE snapshot as `null` once
+   * its observation is older than `ON_BOX_STALE_AFTER_MS` (three missed
+   * agent ticks) -- see that file's own comment for why an agent silent for
+   * 24 hours must not let a stale "answering" reading combine with a fresh
+   * external result into a false `healthy` or a misnamed `route-broken`.
+   * Round 1 of this fix left this ONE field carrying the raw, ungated value
+   * (reasoning that nothing rendered it directly), which made it a landmine
+   * for any future renderer that reached for it. There is now no ungated
+   * variant anywhere on `FleetRow` for anything to reach for by mistake.
    */
   onBoxProbes: OnBoxProbeResult[] | null
   /**

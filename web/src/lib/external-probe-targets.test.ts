@@ -1,8 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { Prisma } from '@prisma/client'
 import { prisma } from './db.js'
-import { currentExternalProbeTargets } from './external-probe-targets.js'
-import { ON_BOX_STALE_AFTER_MS } from './fleet-query.js'
+import { currentExternalProbeTargets, PROBE_TARGET_RETENTION_MS } from './external-probe-targets.js'
 
 // This file touches Host/System/SystemObservation, the same shared tables
 // fleet-query.test.ts wipes -- run serially (vitest.config.ts's
@@ -79,10 +78,12 @@ describe('currentExternalProbeTargets', () => {
       },
     })
 
-    // Explicit `now`, kept within M2's age bound of BOTH rows above, so this
-    // test's own discriminating claim (reading only the latest row) is not
-    // conflated with M2's separate age bound -- see the "does not include a
-    // hostname..." test below for what happens when `now` is left to drift.
+    // Explicit `now`, kept within the retention bound of BOTH rows above
+    // (fix round 2 widened it to seven days -- see
+    // `PROBE_TARGET_RETENTION_MS`'s own docstring -- so an explicit `now`
+    // close to the fixtures is no longer strictly required for THIS test,
+    // but is kept anyway so it never depends on the real clock at all,
+    // rather than depending on it for a few more years).
     const targets = await currentExternalProbeTargets(prisma, now)
 
     expect(targets.find((t) => t.hostname === 'stale.example.invalid')).toBeUndefined()
@@ -136,10 +137,8 @@ describe('currentExternalProbeTargets', () => {
       },
     })
 
-    // Explicit `now`, not the real clock (final whole-branch review, M2
-    // added an age bound to this query) -- see this file's other fixed-date
-    // tests just below for the same adjustment, and their own comment for
-    // why.
+    // Explicit `now`, not the real clock, for the same reason as the test
+    // above -- see its comment.
     const targets = await currentExternalProbeTargets(prisma, now)
 
     expect(targets.map((t) => t.hostname)).toEqual(['current.example.invalid'])
@@ -201,11 +200,11 @@ describe('currentExternalProbeTargets', () => {
   // hostnames to the external prober long after anyone stopped monitoring
   // it: real internet requests against applications nobody watches any
   // more, three of which belong to another business.
-  describe('the observation-age bound (final whole-branch review, M2)', () => {
-    it('excludes a system whose latest observation is older than ON_BOX_STALE_AFTER_MS -- a decommissioned host stops being probed on its own', async () => {
+  describe('the retention bound (final whole-branch review, M2, revised in fix round 2)', () => {
+    it('excludes a system whose latest observation is older than PROBE_TARGET_RETENTION_MS -- a decommissioned host stops being probed on its own', async () => {
       const system = await makeSystem('host-decommissioned', 'sys-decommissioned')
       const now = new Date('2026-08-01T12:00:00Z')
-      const longAfter = new Date(now.getTime() - (ON_BOX_STALE_AFTER_MS + 1_000))
+      const longAfter = new Date(now.getTime() - (PROBE_TARGET_RETENTION_MS + 60_000))
       await prisma.systemObservation.create({
         data: {
           systemId: system.id,
@@ -225,7 +224,7 @@ describe('currentExternalProbeTargets', () => {
     it('still includes a system whose latest observation is just inside the bound', async () => {
       const system = await makeSystem('host-still-alive', 'sys-still-alive')
       const now = new Date('2026-08-01T12:00:00Z')
-      const justInside = new Date(now.getTime() - (ON_BOX_STALE_AFTER_MS - 1_000))
+      const justInside = new Date(now.getTime() - (PROBE_TARGET_RETENTION_MS - 60_000))
       await prisma.systemObservation.create({
         data: {
           systemId: system.id,
@@ -240,6 +239,35 @@ describe('currentExternalProbeTargets', () => {
       const targets = await currentExternalProbeTargets(prisma, now)
 
       expect(targets.map((t) => t.hostname)).toEqual(['still-alive.example.invalid'])
+    })
+
+    // THE DENIAL TEST for fix round 2, Important 1 -- the reviewer's own
+    // reproduction: an agent silent for a merely ORDINARY outage window
+    // (a systemd restart, a transient network blip -- minutes, not days)
+    // must NOT stop its hostnames from being probed externally. Fix
+    // round 1's version of this bound (90 seconds, borrowed from
+    // `ON_BOX_STALE_AFTER_MS`) failed this exact scenario: it inverted C1's
+    // own premise by removing the one independent instrument (the external
+    // probe) that can confirm or refute whether the host is actually down,
+    // precisely when an operator would most want it.
+    it('still includes a system whose agent has been silent for two minutes -- an ordinary outage, not a decommissioning', async () => {
+      const system = await makeSystem('host-briefly-silent', 'sys-briefly-silent')
+      const now = new Date('2026-08-01T12:00:00Z')
+      const twoMinutesAgo = new Date(now.getTime() - 2 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: twoMinutesAgo,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: 'briefly-silent.example.invalid', listensTls: true }],
+        },
+      })
+
+      const targets = await currentExternalProbeTargets(prisma, now)
+
+      expect(targets.map((t) => t.hostname)).toEqual(['briefly-silent.example.invalid'])
     })
   })
 })

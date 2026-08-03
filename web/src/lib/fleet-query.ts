@@ -629,12 +629,19 @@ function systemRow(
   // future receive time: a clock that could not honestly have produced this
   // reading yet is not grounds to trust it as live.
   //
-  // `FleetRow.onBoxProbes` itself (the return statement below) still gets
-  // `rawOnBoxProbes`, UNGATED -- its own docstring in FleetTable.tsx
-  // documents it as "the raw, complete list" for this tick, and that
-  // contract does not change here. `currentOnBoxProbes` is a SEPARATE,
-  // gated view used only to decide `verdict` and the unnamed-port list --
-  // the two places a stale reading could be misread as a live opinion.
+  // Fix round 2, Important 7 -- REVERSED a round-1 decision. Round 1 kept
+  // `FleetRow.onBoxProbes` itself (the return statement below) as
+  // `rawOnBoxProbes`, UNGATED, reasoning that its documented contract ("the
+  // raw, complete list") shouldn't change. Nothing reads that field directly
+  // today -- only `hostnameAnswers`/`unnamedOnBoxProbes`, both built from the
+  // GATED `currentOnBoxProbes` below, are ever rendered -- but that made it
+  // a landmine: a future renderer reading `FleetRow.onBoxProbes` directly
+  // would silently reintroduce this whole fix's Critical, with nothing in
+  // the type system or a test to catch it. `FleetRow.onBoxProbes` now
+  // carries `currentOnBoxProbes` too, so the SHAPE itself cannot express a
+  // stale on-box snapshot at all -- there is no ungated variant left for
+  // any future caller to reach for by mistake. See FleetTable.tsx's updated
+  // docstring on this field.
   const onBoxAgeMs = o ? now.getTime() - o.receivedAt.getTime() : null
   const onBoxIsCurrent = onBoxAgeMs !== null && onBoxAgeMs >= 0 && onBoxAgeMs <= ON_BOX_STALE_AFTER_MS
   const currentOnBoxProbes = onBoxIsCurrent ? rawOnBoxProbes : null
@@ -748,7 +755,7 @@ function systemRow(
     // here is reserved for the "no system exists" placeholder row.
     beats,
     hostnames,
-    onBoxProbes: rawOnBoxProbes,
+    onBoxProbes: currentOnBoxProbes,
     primaryHostname: primary,
     verdict,
     leadHostnameAnswer,

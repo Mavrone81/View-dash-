@@ -8,6 +8,7 @@ import {
   readVhostDir,
   nodeVhostFs,
   discoverVhostsFromDir,
+  discoverVhostsWithDiagnostics,
 } from './vhosts.js'
 import { mkdtemp, mkdir, writeFile, symlink, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -538,6 +539,72 @@ describe('discoverVhostsFromDir', () => {
       },
     })
     expect(discovery).toBeNull()
+  })
+
+  function errnoErr(code: string): NodeJS.ErrnoException {
+    const err = new Error(code) as NodeJS.ErrnoException
+    err.code = code
+    return err
+  }
+
+  // Final whole-branch review, fix round 2, Important 2 -- the review's
+  // OWN reproduction: round 1's fix ("any read failure means an
+  // incomplete, untrustworthy tick") treated a DANGLING SYMLINK the same
+  // as a genuine miss, so removing one file from `sites-available` while
+  // forgetting its `sites-enabled` symlink -- the routine nginx admin
+  // workflow, endemic to this directory -- permanently blinded the WHOLE
+  // host's on-box discovery. `ENOENT` (a real dangling symlink's actual
+  // errno on a real filesystem, see the `agent-deps.test.ts` suite that
+  // proves this against `nodeVhostFs`) must be treated as "this entry is
+  // simply gone", identical to never having been listed, NOT a miss.
+  it('does NOT return null for a dangling symlink (ENOENT) -- the entry is treated as simply gone, not a miss', async () => {
+    const discovery = await discoverVhostsFromDir('/enabled', {
+      readdir: async () => ['a-dangling.conf', 'b-real.conf'],
+      readFile: async (p) => {
+        if (p.endsWith('a-dangling.conf')) throw errnoErr('ENOENT')
+        return 'server { listen 443 ssl; server_name found.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }'
+      },
+    })
+    expect(discovery).not.toBeNull()
+    expect(discovery?.byPort.get(8081)).toEqual(['found.example.invalid'])
+  })
+
+  // The other half: an entry that IS there but cannot be read for any OTHER
+  // reason (a listed name that turns out to be a subdirectory -- real
+  // `readFile` throws `EISDIR`, never `ENOENT`) is a genuine miss, and must
+  // still degrade the whole tick to `null` -- ENOENT is the ONE carve-out,
+  // not read failures in general.
+  it('still returns null for a subdirectory entry (EISDIR) -- only ENOENT is exempted, not read failures in general', async () => {
+    const discovery = await discoverVhostsFromDir('/enabled', {
+      readdir: async () => ['a-subdir.conf', 'b-real.conf'],
+      readFile: async (p) => {
+        if (p.endsWith('a-subdir.conf')) throw errnoErr('EISDIR')
+        return 'server { listen 443 ssl; server_name found.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }'
+      },
+    })
+    expect(discovery).toBeNull()
+  })
+
+  it('reports how many of how many via discoverVhostsWithDiagnostics, for a caller that wants to log something actionable', async () => {
+    const outcome = await discoverVhostsWithDiagnostics('/enabled', {
+      readdir: async () => ['a-subdir.conf', 'b-unreadable.conf', 'c-real.conf'],
+      readFile: async (p) => {
+        if (p.endsWith('a-subdir.conf')) throw errnoErr('EISDIR')
+        if (p.endsWith('b-unreadable.conf')) throw errnoErr('EACCES')
+        return 'server { listen 443 ssl; server_name found.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }'
+      },
+    })
+    expect(outcome).toEqual({ kind: 'files-unreadable', genuineMisses: 2, totalNames: 3 })
+  })
+
+  it('discoverVhostsWithDiagnostics distinguishes a directory-read failure from a files-unreadable one', async () => {
+    const outcome = await discoverVhostsWithDiagnostics('/enabled', {
+      readdir: async () => {
+        throw new Error('EACCES')
+      },
+      readFile: async () => '',
+    })
+    expect(outcome).toEqual({ kind: 'directory-unreadable' })
   })
 })
 

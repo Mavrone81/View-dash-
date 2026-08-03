@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { buildCollectDeps, buildVhostDiscovery, type DockerLike } from './agent-deps.js'
 import type { AgentConfig } from './config.js'
 import type { FetchLike, OnBoxRequestLike } from './probe.js'
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
@@ -154,6 +154,56 @@ describe('buildVhostDiscovery', () => {
     expect(discovery).toBeNull()
     expect(warn).toHaveLength(1)
     expect(String(warn[0]![0])).toContain('vhost directory unreadable')
+  })
+
+  // Final whole-branch review, fix round 2, Important 2 -- against the REAL
+  // production adapter (nodeVhostFs), not an injected lambda: a dangling
+  // symlink (removed from sites-available, its sites-enabled symlink left
+  // behind -- the ordinary nginx admin workflow, endemic to this directory)
+  // must NOT degrade discovery for the whole host. `readFile` on a real
+  // dangling symlink throws ENOENT.
+  it('does not degrade or log when a listed entry is a dangling symlink -- ENOENT is an ordinary removal, not incompleteness', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agent-deps-dangling-'))
+    try {
+      await mkdir(join(root, 'enabled'))
+      await symlink(join(root, 'enabled', 'removed-target.conf'), join(root, 'enabled', 'dangling.conf'))
+      await writeFile(
+        join(root, 'enabled', 'b.conf'),
+        'server { listen 443 ssl; server_name found.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }',
+      )
+      const warn: unknown[][] = []
+      const discovery = await buildVhostDiscovery(join(root, 'enabled'), { warn: (...a) => warn.push(a) })()
+      expect(discovery?.byPort.get(8081)).toEqual(['found.example.invalid'])
+      expect(warn).toHaveLength(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // The other half: a listed entry that IS there but genuinely cannot be
+  // read (a subdirectory -- real `readFile` throws EISDIR, never ENOENT)
+  // must degrade the WHOLE tick to null, and the log must name the actual
+  // count -- "N of M vhost files unreadable" -- not the generic
+  // "vhost directory unreadable" message, which would wrongly suggest the
+  // directory itself, rather than one entry in it, was the problem.
+  it('logs "N of M vhost files unreadable" and returns null when a listed entry genuinely cannot be read (e.g. a subdirectory, EISDIR)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agent-deps-unreadable-'))
+    try {
+      await mkdir(join(root, 'enabled'))
+      await mkdir(join(root, 'enabled', 'a-subdir.conf'))
+      await writeFile(
+        join(root, 'enabled', 'b.conf'),
+        'server { listen 443 ssl; server_name found.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }',
+      )
+      const warn: unknown[][] = []
+      const discovery = await buildVhostDiscovery(join(root, 'enabled'), { warn: (...a) => warn.push(a) })()
+      expect(discovery).toBeNull()
+      expect(warn).toHaveLength(1)
+      expect(String(warn[0]![0])).toContain('1 of 2 vhost files unreadable')
+      expect(String(warn[0]![0])).not.toContain('vhost directory unreadable')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })
 

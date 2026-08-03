@@ -4,7 +4,7 @@ import type { CollectDeps } from './collect.js'
 import { toSummary } from './docker.js'
 import { httpOnBoxRequest, probeHostnameOnBox, probeUrl, type FetchLike, type OnBoxRequestLike } from './probe.js'
 import { resolveDeployLogPath, resolveRepoDir } from './paths.js'
-import { discoverVhostsFromDir, nodeVhostFs, type VhostDiscovery } from './vhosts.js'
+import { discoverVhostsWithDiagnostics, nodeVhostFs, type VhostDiscovery } from './vhosts.js'
 
 /**
  * The one method of dockerode's `Docker` this module actually calls,
@@ -44,13 +44,21 @@ export type Logger = { warn: (...args: unknown[]) => void }
  * function, a single read, makes that disagreement structurally impossible:
  * see `discoverVhostsFromDir`.
  *
- * Logs (never throws) when the vhost directory itself could not be read
- * this tick: that is a diagnostic failure worth an operator seeing, quite
- * different from "read it fine, this host has zero vhosts" -- collapsing
- * the two would render every system on the board as having no HTTP surface
- * AND no TLS configuration, which is the false claim `discoverVhostsFromDir`'s
- * `null` return exists to prevent. See its docstring and
- * `agent/src/collect.ts`'s `vhostDiscovery` for the contract this satisfies.
+ * Logs (never throws) when this tick produces no discovery at all, via
+ * `discoverVhostsWithDiagnostics` (`agent/src/vhosts.ts`) rather than the
+ * plain `discoverVhostsFromDir` -- so this is the one place that can tell
+ * an operator WHY: the directory itself was unreachable, or (final
+ * whole-branch review, fix round 2) some LISTED file was a genuine miss
+ * (not a benign, ordinary dangling symlink -- see `readNamedFiles`'s
+ * `ENOENT` handling), reported as "N of M vhost files unreadable" instead
+ * of a bare "vhost directory unreadable" that gave no hint anything could
+ * be done about it. Either way this is a diagnostic failure worth an
+ * operator seeing, quite different from "read it fine, this host has zero
+ * vhosts" -- collapsing the two would render every system on the board as
+ * having no HTTP surface AND no TLS configuration, which is the false claim
+ * `discoverVhostsFromDir`'s `null` return exists to prevent. See its
+ * docstring and `agent/src/collect.ts`'s `vhostDiscovery` for the contract
+ * this satisfies.
  *
  * Returns a closure (not the `VhostDiscovery | null` itself) because
  * `CollectDeps` wants this read to happen ONCE PER TICK, not once at
@@ -60,11 +68,18 @@ export type Logger = { warn: (...args: unknown[]) => void }
  */
 export function buildVhostDiscovery(vhostDir: string, log: Logger = console): () => Promise<VhostDiscovery | null> {
   return async () => {
-    const discovery = await discoverVhostsFromDir(vhostDir, nodeVhostFs)
-    if (discovery === null) {
+    const outcome = await discoverVhostsWithDiagnostics(vhostDir, nodeVhostFs)
+    if (outcome.kind === 'directory-unreadable') {
       log.warn(`[agent] vhost directory unreadable (${vhostDir}); on-box hostname/TLS discovery skipped this tick`)
+      return null
     }
-    return discovery
+    if (outcome.kind === 'files-unreadable') {
+      log.warn(
+        `[agent] ${outcome.genuineMisses} of ${outcome.totalNames} vhost files unreadable in ${vhostDir}; on-box hostname/TLS discovery skipped this tick`,
+      )
+      return null
+    }
+    return outcome.discovery
   }
 }
 

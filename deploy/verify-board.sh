@@ -121,7 +121,7 @@ RUN_COUNT="$(docker compose exec -T "$DB_SERVICE" \
 check "the external probe scheduler has run recently, within the last 15 minutes (found: ${RUN_COUNT:-<unreadable>} sweep(s))" \
   '[ -n "$RUN_COUNT" ] && [ "$RUN_COUNT" -gt 0 ]'
 
-# --- Did those recent sweeps actually attempt to probe anything? ---
+# --- Did the MOST RECENT sweep actually attempt to probe anything? ---
 #
 # Final whole-branch review, I2 -- THE FOURTH VERIFICATION SCRIPT IN THIS
 # PROJECT THAT COULD NOT FAIL, and the data to catch it was added LAST ROUND
@@ -134,39 +134,76 @@ check "the external probe scheduler has run recently, within the last 15 minutes
 # deployment where every vhost file fails to parse still prints
 # `PASS ... found: 3 sweep(s)) / All 3 checks passed. EXIT=0` forever.
 #
-# `targetCount` (summed over the SAME 15-minute window as the check above, so
-# the two agree about what "recent" means) is exactly the column that
-# distinguishes the two. Read alone it cannot fail on a genuinely healthy but
-# brand-new deployment either -- see schema.prisma's own note that a
-# zero-target sweep is "a legitimate, common state, not a failing scheduler"
-# for a SINGLE fresh cycle -- but that read only applies before ANY sweep has
-# run; the check below only fires once a sweep is already known to have run
-# recently (the PASS above), which is why the header comment's usual "wait
-# five minutes and re-run" grace period is the same one that applies here too.
-TARGET_SUM="$(docker compose exec -T "$DB_SERVICE" \
+# Fix round 2, Important 5: this used to be `SUM("targetCount")` over the
+# 15-minute window, which a SINGLE non-zero sweep anywhere in that window
+# satisfies -- so a board that has genuinely stopped sweeping anything for
+# the last two consecutive cycles (a regression that started 10 minutes ago,
+# say) still reads `PASS` off the memory of one healthy sweep 14 minutes ago,
+# and the INFO branch below then misdirects to egress. Reading the LATEST
+# sweep's OWN `targetCount` (not an aggregate over several) answers "is
+# discovery working RIGHT NOW", which is what this check claims to verify.
+LATEST_TARGET_COUNT="$(docker compose exec -T "$DB_SERVICE" \
   psql -U "$DB_USER" -d "$DB_NAME" -tAc \
-  "SELECT COALESCE(SUM(\"targetCount\"), 0) FROM \"ExternalProbeRun\" WHERE \"ranAt\" > now() - interval '15 minutes'" \
+  "SELECT \"targetCount\" FROM \"ExternalProbeRun\" WHERE \"ranAt\" > now() - interval '15 minutes' ORDER BY \"ranAt\" DESC LIMIT 1" \
   2>/dev/null | tr -d '[:space:]')"
 
-check "recent sweeps actually attempted to probe something, not just ran (found: ${TARGET_SUM:-<unreadable>} target(s) across the same window)" \
-  '[ -n "$TARGET_SUM" ] && [ "$TARGET_SUM" -gt 0 ]'
+# Fix round 2, Important 4: THE PATHOLOGY THAT SANK THE PREVIOUS THREE
+# SCRIPTS, ARRIVING FROM THE OTHER DIRECTION. A `targetCount` check with no
+# further qualifier fails on the FIRST RUN of a genuinely healthy deploy:
+# schema present, board answering, scheduler alive, but no agent has
+# reported yet (`deploy/README.md` runs this script immediately after
+# `compose up`, with the agent rollout a SEPARATE step) -- `FAIL ... (found:
+# 0 target(s))`, exit 1, on a deployment that is not broken. Worse, the
+# header comment's usual "wait five minutes and re-run" advice never helps
+# here, because `startExternalProbeScheduler` ticks IMMEDIATELY: the
+# run-count check above passes in seconds while this one fails until an
+# agent actually reports, however long that takes.
+#
+# The discriminator was already sitting in the database, unread: has ANY
+# system EVER reported hostnames, at any point in this deployment's whole
+# history (not just the 15-minute window)? If none has, hostname discovery
+# has never had a chance to prove itself one way or the other -- this is a
+# fresh deploy (or one where agents simply are not rolled out yet), and a
+# zero target count is the EXPECTED state, not a fault: say so and pass. If
+# some system HAS reported hostnames before, discovery has already proven
+# it CAN work, so a zero count now (on top of a recent, live sweep) is a
+# genuine regression: fail.
+EVER_REPORTED_HOSTNAMES="$(docker compose exec -T "$DB_SERVICE" \
+  psql -U "$DB_USER" -d "$DB_NAME" -tAc \
+  'SELECT EXISTS (SELECT 1 FROM "SystemObservation" WHERE "hostnames" IS NOT NULL)' \
+  2>/dev/null | tr -d '[:space:]')"
+
+check "the most recent sweep attempted to probe something, once any system has ever reported hostnames (latest targetCount: ${LATEST_TARGET_COUNT:-<none this window>}; any system ever reported hostnames: ${EVER_REPORTED_HOSTNAMES:-<unreadable>})" \
+  '[ "$EVER_REPORTED_HOSTNAMES" = "f" ] || [ -z "$LATEST_TARGET_COUNT" ] || [ "$LATEST_TARGET_COUNT" -gt 0 ]'
 
 RESULT_COUNT="$(docker compose exec -T "$DB_SERVICE" \
   psql -U "$DB_USER" -d "$DB_NAME" -tAc \
   'SELECT count(*) FROM "ExternalProbeResult"' \
   2>/dev/null | tr -d '[:space:]')"
-if [ -n "$TARGET_SUM" ] && [ "$TARGET_SUM" -eq 0 ]; then
-  # Branched on targetCount = 0 (final whole-branch review, I2): the OLD,
-  # single-branch version of this INFO text always blamed "this host's own
-  # egress" for a zero `ExternalProbeResult` count -- which is actively
-  # WRONG here, because zero targets means no outbound request was ever
-  # attempted at all. There is no egress to have failed; the fault is
-  # upstream, in hostname discovery/config, not in reachability.
+if [ "$EVER_REPORTED_HOSTNAMES" = "f" ]; then
+  # Fix round 2, Important 4's branch: no system has EVER reported
+  # hostnames, so this is (most likely) a fresh deploy still waiting on its
+  # first agent, not a broken one -- do not blame egress OR discovery for a
+  # capability that has simply never been exercised yet.
+  echo "INFO  ExternalProbeResult currently holds ${RESULT_COUNT:-<unreadable>} row(s) -- no system in this"
+  echo "      deployment's whole history has ever reported hostnames yet, so this looks like a fresh deploy"
+  echo "      (or agents simply not rolled out yet), not a fault. Re-run this script once at least one agent"
+  echo "      has connected and reported."
+elif [ -n "$LATEST_TARGET_COUNT" ] && [ "$LATEST_TARGET_COUNT" -eq 0 ]; then
+  # Branched on the latest targetCount = 0, with at least one system having
+  # proven hostname discovery CAN work at some point (final whole-branch
+  # review, I2): the OLD, single-branch version of this INFO text always
+  # blamed "this host's own egress" for a zero `ExternalProbeResult` count --
+  # which is actively WRONG here, because zero targets means no outbound
+  # request was ever attempted at all. There is no egress to have failed;
+  # the fault is upstream, in hostname discovery/config, not in
+  # reachability.
   echo "INFO  ExternalProbeResult currently holds ${RESULT_COUNT:-<unreadable>} row(s) -- and the check just"
-  echo "      above already failed for the same reason: recent sweeps found ZERO targets to probe. Do NOT"
-  echo "      look at this host's egress -- nothing left it. Check hostname discovery instead: is the"
-  echo "      reverse-proxy config directory reachable, and does every enrolled system's latest observation"
-  echo "      genuinely carry hostnames: null or []?"
+  echo "      above already failed for the same reason: the most recent sweep found ZERO targets to probe,"
+  echo "      even though this deployment HAS reported real hostnames before. Do NOT look at this host's"
+  echo "      egress -- nothing left it. Check hostname discovery instead: is the reverse-proxy config"
+  echo "      directory reachable, and does every enrolled system's latest observation genuinely carry"
+  echo "      hostnames: null or []?"
 else
   echo "INFO  ExternalProbeResult currently holds ${RESULT_COUNT:-<unreadable>} row(s) -- not asserted on: a"
   echo "      persistent fleet-wide network fault correctly leaves this at 0 forever (Task 7a's guard), so a"

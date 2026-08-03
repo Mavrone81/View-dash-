@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { PrismaClient, type Prisma } from '@prisma/client'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { prisma } from './db.js'
 import {
   latestPerSystem,
@@ -10,6 +12,7 @@ import {
   EXTERNAL_RESULT_STALE_AFTER_MS,
   ON_BOX_STALE_AFTER_MS,
 } from './fleet-query.js'
+import { DEFAULT_STALE_AFTER_MS } from './staleness.js'
 import { BEAT_COUNT, BEAT_INTERVAL_MS } from './beats.js'
 
 beforeEach(async () => {
@@ -19,6 +22,27 @@ beforeEach(async () => {
   await prisma.host.deleteMany()
   await prisma.externalProbeResult.deleteMany()
   await prisma.externalProbeRun.deleteMany()
+})
+
+// Final whole-branch review, fix round 2, Important 6 -- GOVERNANCE, not
+// behavioural, same reasoning as `probe-scheduler.test.ts`'s sibling test
+// and `staleness.test.ts`'s new one for `DEFAULT_STALE_AFTER_MS` itself:
+// value equality alone would still pass if this file redefined its own
+// `90_000`. The source check confirms `ON_BOX_STALE_AFTER_MS` is an IMPORT
+// of `staleness.ts`'s constant, not an independent literal that merely
+// agrees with it today.
+describe('ON_BOX_STALE_AFTER_MS is imported from staleness.ts, not redefined', () => {
+  it('is numerically identical to staleness.ts\'s DEFAULT_STALE_AFTER_MS', () => {
+    expect(ON_BOX_STALE_AFTER_MS).toBe(DEFAULT_STALE_AFTER_MS)
+  })
+
+  it('is an import from staleness.ts in the source, and defines no numeric literal of its own', () => {
+    const path = fileURLToPath(new URL('./fleet-query.ts', import.meta.url))
+    const source = readFileSync(path, 'utf8')
+    expect(source).toMatch(/DEFAULT_STALE_AFTER_MS \} from '\.\/staleness\.js'/)
+    expect(source).toMatch(/export const ON_BOX_STALE_AFTER_MS = DEFAULT_STALE_AFTER_MS/)
+    expect(source).not.toMatch(/ON_BOX_STALE_AFTER_MS\s*=\s*90[_,]?000\b/)
+  })
 })
 
 describe('latestPerSystem', () => {
@@ -1319,6 +1343,40 @@ describe('the Answers/Cert join (Task 8)', () => {
       expect(rows[0]!.verdict).toBe('healthy')
     })
 
+    // THE DENIAL TEST for fix round 2, Important 6 -- a `receivedAt` from
+    // the FUTURE (a clock fault somewhere upstream: a bad migration, a
+    // skewed database host clock) must not read as maximally fresh.
+    // Removing the `onBoxAgeMs >= 0` guard would let a future `receivedAt`
+    // produce a NEGATIVE age, which is always `<= ON_BOX_STALE_AFTER_MS`,
+    // so the on-box axis would read as a CURRENT opinion FOREVER -- the
+    // exact "forever fresh" failure `staleness.ts`'s own future-clock
+    // handling exists to prevent for the State column (see its docstring),
+    // reopened one column over in the Answers column.
+    it('does not treat a future receivedAt as a current on-box opinion', async () => {
+      const { system } = await makeSystem('sys-future-onbox', 'host-future-onbox')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const future = new Date(now.getTime() + 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: future,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.hostnameAnswers[0]!.onBoxOutcome).toBeNull()
+      expect(rows[0]!.verdict).not.toBe('healthy')
+    })
+
     // M2 companion, at the same layer this fix lives at: a stale
     // observation's ANSWERING unnamed (no-vhost) port must not still render
     // as "a port with no name answered on-box" -- the same positive claim
@@ -1343,6 +1401,35 @@ describe('the Answers/Cert join (Task 8)', () => {
       const { rows } = await latestPerSystem(now)
 
       expect(rows[0]!.unnamedOnBoxProbes).toEqual([])
+    })
+
+    // THE DENIAL TEST for fix round 2, Important 7 -- `FleetRow.onBoxProbes`
+    // ITSELF must be gated, not merely the two things derived from it
+    // (`hostnameAnswers`/`unnamedOnBoxProbes`). Round 1 left this ONE field
+    // carrying the raw, ungated `SystemObservation.onBoxProbes` value,
+    // reasoning that nothing rendered it directly today -- which made it a
+    // landmine for any future renderer reaching for it and silently
+    // reintroducing this whole fix's Critical. There is now no ungated
+    // variant anywhere on `FleetRow` to reach for by mistake.
+    it('gates FleetRow.onBoxProbes itself, not only the derived hostnameAnswers/unnamedOnBoxProbes fields', async () => {
+      const { system } = await makeSystem('sys-stale-raw-field', 'host-stale-raw-field')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: oneDayAgo,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      expect(rows[0]!.onBoxProbes).toBeNull()
     })
   })
 

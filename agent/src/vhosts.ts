@@ -402,17 +402,46 @@ export const nodeVhostFs: VhostFs = {
  * that one resulting array, never from two independent calls to this
  * function, which is what makes "a file is either seen by both derivations
  * or by neither" a structural guarantee rather than a hope.
+ *
+ * Final whole-branch review, fix round 2 (I2 there, "one dangling symlink
+ * causes permanent, total blindness"): `genuineMisses` distinguishes WHY a
+ * name failed to read, because the two reasons are not the same fact.
+ *
+ * `ENOENT` means the entry no longer exists BY THE TIME this ran -- the
+ * ordinary nginx admin workflow of removing a file from `sites-available`
+ * and forgetting to also remove its `sites-enabled` symlink, or a symlink
+ * deleted in the gap between `readdir` and this read. That is not a
+ * failure to see something that IS there; it is confirmation that the
+ * entry is gone, exactly as if `readdir` had never listed it. Skipped
+ * silently, and NOT counted toward `genuineMisses` -- a directory holding
+ * nothing but one dangling symlink must read as "found nothing", not "could
+ * not read", and dangling symlinks are ENDEMIC to `sites-enabled` (nginx
+ * keeps serving with one present until its next reload), so treating this
+ * as incompleteness would permanently blind on-box discovery for the whole
+ * host over a routine, benign cleanup gap.
+ *
+ * Any OTHER error (`EACCES`, `EISDIR` -- a listed entry that turned out to
+ * be a subdirectory -- or anything else) means something IS there and this
+ * read could not see it: a genuine miss, counted so the caller
+ * (`discoverVhostsFromDir`) can refuse to treat the resulting partial file
+ * set as complete.
  */
-async function readNamedFiles(dir: string, names: string[], fs: VhostFs): Promise<Array<{ text: string }>> {
-  const out: Array<{ text: string }> = []
+async function readNamedFiles(
+  dir: string,
+  names: string[],
+  fs: VhostFs,
+): Promise<{ files: Array<{ text: string }>; genuineMisses: number }> {
+  const files: Array<{ text: string }> = []
+  let genuineMisses = 0
   for (const n of names) {
     try {
-      out.push({ text: await fs.readFile(join(dir, n)) })
-    } catch {
-      // One unreadable file must not blind the scan to the rest.
+      files.push({ text: await fs.readFile(join(dir, n)) })
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') continue // gone, not a miss -- see doc above
+      genuineMisses++
     }
   }
-  return out
+  return { files, genuineMisses }
 }
 
 /**
@@ -447,7 +476,12 @@ export async function readVhostDir(dir: string, fs: VhostFs): Promise<Array<{ te
   } catch {
     return []
   }
-  return readNamedFiles(dir, names, fs)
+  // This caller only ever wants the files themselves -- it makes no
+  // "complete vs. partial" distinction of its own (see this function's own
+  // docstring above: it already cannot tell "empty" from "unreadable"
+  // directory), so `genuineMisses` is discarded here. `discoverVhostsFromDir`
+  // below is the one caller that acts on it.
+  return (await readNamedFiles(dir, names, fs)).files
 }
 
 export function discoverHostnamesByPort(files: Array<{ text: string }>): Map<number, string[]> {
@@ -604,50 +638,79 @@ export type VhostDiscovery = {
  * branching on whether THAT read succeeded removes the window entirely,
  * rather than narrowing it.
  *
- * FINAL WHOLE-BRANCH REVIEW, I3: also returns `null` when the directory
- * listed MORE names than `readNamedFiles` actually managed to read --
- * i.e. at least one file that was LISTED could not be read. Before this
- * fix, that case fell through to the normal path below and derived both
- * maps from whatever subset of files WAS readable, which is honest for
- * `readNamedFiles`'s own stated contract ("read what you can, drop what
- * you can't") but dishonest one layer up: a system whose ONLY vhost file
- * happened to be the unreadable one then has ZERO entries in `byPort`,
- * which `collect.ts` cannot tell apart from "this host was scanned in
- * full and genuinely has no vhost for this system" -- and the wire
- * carries that forward as `hostnames: []`, the CONFIRMED-empty claim
- * (`OnBoxProbeResultSchema`'s own docstring: "a newer agent looked and
- * confirmed there are none"), when the truth is a miss, not a
- * confirmation. Same shape as Task 5's Critical for `discoverTlsByHostname`:
- * a miss must degrade to absence, never to a wrong positive.
+ * FINAL WHOLE-BRANCH REVIEW, I3 (fix round 1) then fix round 2's Important
+ * 2: also returns `null` when at least one LISTED file was a GENUINE miss
+ * (see `readNamedFiles`'s own docstring for the `ENOENT`-vs-everything-else
+ * distinction this depends on). Before fix round 1, a partial read fell
+ * through to the normal path and derived both maps from whatever subset of
+ * files WAS readable -- honest for `readNamedFiles`'s own "read what you
+ * can" contract, but dishonest one layer up: a system whose ONLY vhost file
+ * happened to be the unreadable one had ZERO entries in `byPort`,
+ * indistinguishable from "scanned in full, genuinely no vhost" -- and the
+ * wire carries that forward as `hostnames: []`, a CONFIRMED-empty claim
+ * when the truth is a miss. Same shape as Task 5's Critical for
+ * `discoverTlsByHostname`: a miss must degrade to absence, never a wrong
+ * positive.
  *
- * The trigger is not hypothetical: `readNamedFiles`'s own docstring
- * (fix round 2's "document, not detect" note, later reopened) already
- * names a real caller today -- a vhost file mid-save by a human editor,
- * or mid-write by a deploy step, sitting on disk transiently unreadable
- * or unbalanced at exactly the instant this collector's poll cycle scans
- * it. `readNamedFiles` and `balancedBody` both correctly degrade THEIR
- * OWN read of that one file; what was missing is this function refusing
- * to present the resulting INCOMPLETE file set as if it were complete.
+ * Fix round 1's OWN version of this fix was too coarse, and round 2's
+ * review reproduced it live: it treated EVERY read failure identically,
+ * including `ENOENT` -- so one dangling symlink (a file removed from
+ * `sites-available` with its `sites-enabled` symlink left behind, the
+ * ORDINARY nginx admin workflow, and endemic to that directory) made this
+ * function return `null` PERMANENTLY, for the WHOLE host, until an operator
+ * noticed and cleaned it up. Downstream, `collect.ts` gates its entire
+ * probing block on this being non-null, so one stale symlink reverted
+ * EVERY system on the host to slice 1 (containers-only health), silently --
+ * the exact false-negative shape this whole fix exists to prevent, just
+ * relocated from "confident empty" to "confident absent". `readNamedFiles`
+ * now only counts a NON-`ENOENT` failure as a genuine miss; `ENOENT` is
+ * treated identically to the name never having been listed at all.
  *
  * Coarser than only affecting the one system whose file failed -- a
- * partial read fails the WHOLE tick's discovery, not just the affected
+ * genuine miss fails the WHOLE tick's discovery, not just the affected
  * system's entry -- but it is the same choice `readVhostDir`'s own
  * docstring already made for "directory missing" vs. "directory read
  * clean": a read this function cannot vouch for in full contributes
  * nothing, rather than a mix of confirmed and merely-not-yet-disproved
- * facts that nothing downstream can tell apart.
+ * facts that nothing downstream can tell apart. Genuine misses (as opposed
+ * to routine dangling-symlink cleanup) are rarer, so this coarseness is
+ * exercised far less often than round 1's version was.
  */
 export async function discoverVhostsFromDir(dir: string, fs: VhostFs): Promise<VhostDiscovery | null> {
+  const outcome = await discoverVhostsWithDiagnostics(dir, fs)
+  return outcome.kind === 'ok' ? outcome.discovery : null
+}
+
+/**
+ * Every outcome `discoverVhostsFromDir` collapses to `VhostDiscovery |
+ * null` -- exported separately (fix round 2) so a caller that wants to
+ * LOG something actionable can tell WHY a tick produced no discovery,
+ * without a second, independent directory read of its own (which would
+ * reopen the exact TOCTOU window `discoverVhostsFromDir` closes). See
+ * `agent/src/agent-deps.ts`'s `buildVhostDiscovery`, the one production
+ * caller that reads `genuineMisses`/`totalNames` to log "N of M vhost files
+ * unreadable" instead of the generic, unhelpful "vhost directory
+ * unreadable" message that used to fire for this case too.
+ */
+export type VhostDiscoveryOutcome =
+  | { kind: 'ok'; discovery: VhostDiscovery }
+  | { kind: 'directory-unreadable' }
+  | { kind: 'files-unreadable'; genuineMisses: number; totalNames: number }
+
+export async function discoverVhostsWithDiagnostics(dir: string, fs: VhostFs): Promise<VhostDiscoveryOutcome> {
   let names: string[]
   try {
     names = await fs.readdir(dir)
   } catch {
-    return null
+    return { kind: 'directory-unreadable' }
   }
-  const files = await readNamedFiles(dir, names, fs)
-  if (files.length < names.length) return null
+  const { files, genuineMisses } = await readNamedFiles(dir, names, fs)
+  if (genuineMisses > 0) return { kind: 'files-unreadable', genuineMisses, totalNames: names.length }
   return {
-    byPort: discoverHostnamesByPort(files),
-    tlsByHostname: discoverTlsByHostname(files),
+    kind: 'ok',
+    discovery: {
+      byPort: discoverHostnamesByPort(files),
+      tlsByHostname: discoverTlsByHostname(files),
+    },
   }
 }
