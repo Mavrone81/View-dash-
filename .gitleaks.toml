@@ -1,0 +1,42 @@
+# gitleaks configuration.
+#
+# The default ruleset is kept in full — this file only adds one narrowly
+# scoped exemption, and it is deliberately scoped to a single path rather
+# than a rule or a directory, so a real key committed anywhere else still
+# fails the build.
+
+[extend]
+useDefault = true
+
+# `web/src/lib/external-probe.test.ts` embeds three self-signed certificates
+# and their private keys. They exist so the external-probe tests can stand up
+# a REAL `node:tls` listener and assert on what a real handshake returns —
+# certificate expiry, an untrusted issuer, a hostname mismatch. That matters
+# more than it sounds: earlier in this project a set of tests injected a fake
+# transport and asserted on the arguments passed to it. They passed, while the
+# actual requests went out with the wrong `Host` header, because Node's
+# `fetch` silently discards it. The rule that came out of that is written into
+# the design spec — a test asserting anything about the wire must exercise the
+# real transport against a real listener — and these fixtures are what let
+# these tests do it.
+#
+# Why exempting them is safe, verified rather than assumed:
+#
+#   * All three are SELF-SIGNED — subject equals issuer, confirmed with
+#     `openssl x509`. No certificate authority anywhere trusts them.
+#   * Their subjects are `CN=127.0.0.1` and `CN=not-this-host.example.invalid`
+#     — loopback and a name reserved by RFC 2606 that cannot resolve. They
+#     cannot authenticate anything reachable.
+#   * They are handed to a listener bound on an ephemeral loopback port inside
+#     the test process, and the tests pass them explicitly via `ca` because
+#     nothing else would accept them.
+#
+# So the keys are real keys, and gitleaks is right to see them; they simply
+# protect nothing. The exemption is by exact path so that this stays true: a
+# key committed to any other file, including any other test, still fails.
+#
+# If these fixtures are ever regenerated, re-check the subjects before
+# assuming this note still holds.
+[[allowlists]]
+description = "Self-signed loopback/.invalid TLS fixtures for the external-probe tests"
+paths = ['''^web/src/lib/external-probe\.test\.ts$''']
