@@ -507,19 +507,26 @@ describe('discoverVhostsFromDir', () => {
   // WAS wire-visible, because `byPort` having the hostname is what makes it
   // become a real probe target and enter a system's `hostnames` list.
   //
-  // With a single combined read, the file that fails is absent from the ONE
-  // `files` array BOTH derivations are built from: the block that would
-  // have resolved this hostname's upstream never runs through
-  // `discoverHostnamesByPort` OR `discoverTlsByHostname`, so the hostname
-  // is absent from `byPort` too -- it can never become a probe target or a
-  // wire-visible `hostnames` entry for any system THIS TICK, regardless of
-  // what `tlsByHostname` happens to say about it from whatever OTHER,
-  // successfully-read blocks still declare the same name. That `false`
-  // below is an honest reflection of the ONE block this read actually saw
-  // (a plain redirect, genuinely not listening for TLS) -- not a wrong
-  // claim, because it is inert: with the hostname absent from `byPort`,
-  // nothing in `collect.ts` ever looks this entry up.
-  it('when the block that would resolve a hostname\'s upstream fails to read, the hostname is absent from byPort -- so it can never surface a wrong TLS claim on the wire, whatever tlsByHostname says about it from other blocks', async () => {
+  // REVISED, final whole-branch review, I3 -- this test used to assert that
+  // a partial read (one of two listed files unreadable) still produced a
+  // non-null discovery, with `byPort.size === 0` and a `false` TLS entry,
+  // reasoned as "inert" because nothing downstream looks the entry up once
+  // the hostname is absent from `byPort`. That reasoning held ONE layer
+  // down (`discoverVhostsFromDir`'s own two maps genuinely cannot
+  // disagree), but not the layer above it: a system whose ONLY vhost file
+  // happens to be the one that failed to read here ends up with a
+  // genuinely EMPTY `byPort`, which `agent/src/collect.ts` cannot tell
+  // apart from "this host was scanned in full and genuinely has no vhost
+  // for this system" -- and that ships to the wire as `hostnames: []`, the
+  // CONFIRMED-empty claim, when the truth is a miss. Same shape as Task 5's
+  // Critical: a miss must degrade to absence, never to a wrong positive.
+  //
+  // `discoverVhostsFromDir` now refuses to distinguish "genuinely no
+  // upstream" from "the file that would have had one failed to read" by
+  // returning `null` for the WHOLE tick's discovery the moment ANY listed
+  // file could not be read -- so this scenario (2 names listed, 1 file
+  // read) now returns `null`, not a partial discovery.
+  it('returns null (no opinion this tick), not a partial discovery, when one of several LISTED files fails to read', async () => {
     const discovery = await discoverVhostsFromDir('/enabled', {
       readdir: async () => ['a-redirect.conf', 'b-tls-block.conf'],
       readFile: async (p) => {
@@ -530,15 +537,7 @@ describe('discoverVhostsFromDir', () => {
         return 'server { listen 80; server_name racy.example.invalid; return 301 https://$host$request_uri; }'
       },
     })
-    // The redirect file alone resolves to no upstream port -- if the
-    // hostname appeared here at all with the TLS block unread, THAT would
-    // be the bug (a dial target with no real evidence backing its port).
-    expect(discovery?.byPort.size).toBe(0)
-    // tlsByHostname DOES have an entry (from the redirect block it actually
-    // read), and `false` is the truthful answer for that one block -- this
-    // is fine precisely because the hostname's absence from byPort above
-    // means nothing ever reads this entry for this hostname this tick.
-    expect(discovery?.tlsByHostname.get('racy.example.invalid')).toBe(false)
+    expect(discovery).toBeNull()
   })
 })
 

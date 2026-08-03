@@ -603,6 +603,39 @@ export type VhostDiscovery = {
  * predecessor functions already documented: reading the names once and
  * branching on whether THAT read succeeded removes the window entirely,
  * rather than narrowing it.
+ *
+ * FINAL WHOLE-BRANCH REVIEW, I3: also returns `null` when the directory
+ * listed MORE names than `readNamedFiles` actually managed to read --
+ * i.e. at least one file that was LISTED could not be read. Before this
+ * fix, that case fell through to the normal path below and derived both
+ * maps from whatever subset of files WAS readable, which is honest for
+ * `readNamedFiles`'s own stated contract ("read what you can, drop what
+ * you can't") but dishonest one layer up: a system whose ONLY vhost file
+ * happened to be the unreadable one then has ZERO entries in `byPort`,
+ * which `collect.ts` cannot tell apart from "this host was scanned in
+ * full and genuinely has no vhost for this system" -- and the wire
+ * carries that forward as `hostnames: []`, the CONFIRMED-empty claim
+ * (`OnBoxProbeResultSchema`'s own docstring: "a newer agent looked and
+ * confirmed there are none"), when the truth is a miss, not a
+ * confirmation. Same shape as Task 5's Critical for `discoverTlsByHostname`:
+ * a miss must degrade to absence, never to a wrong positive.
+ *
+ * The trigger is not hypothetical: `readNamedFiles`'s own docstring
+ * (fix round 2's "document, not detect" note, later reopened) already
+ * names a real caller today -- a vhost file mid-save by a human editor,
+ * or mid-write by a deploy step, sitting on disk transiently unreadable
+ * or unbalanced at exactly the instant this collector's poll cycle scans
+ * it. `readNamedFiles` and `balancedBody` both correctly degrade THEIR
+ * OWN read of that one file; what was missing is this function refusing
+ * to present the resulting INCOMPLETE file set as if it were complete.
+ *
+ * Coarser than only affecting the one system whose file failed -- a
+ * partial read fails the WHOLE tick's discovery, not just the affected
+ * system's entry -- but it is the same choice `readVhostDir`'s own
+ * docstring already made for "directory missing" vs. "directory read
+ * clean": a read this function cannot vouch for in full contributes
+ * nothing, rather than a mix of confirmed and merely-not-yet-disproved
+ * facts that nothing downstream can tell apart.
  */
 export async function discoverVhostsFromDir(dir: string, fs: VhostFs): Promise<VhostDiscovery | null> {
   let names: string[]
@@ -612,6 +645,7 @@ export async function discoverVhostsFromDir(dir: string, fs: VhostFs): Promise<V
     return null
   }
   const files = await readNamedFiles(dir, names, fs)
+  if (files.length < names.length) return null
   return {
     byPort: discoverHostnamesByPort(files),
     tlsByHostname: discoverTlsByHostname(files),
