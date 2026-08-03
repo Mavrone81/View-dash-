@@ -396,11 +396,14 @@ describe('discoverTlsByHostname', () => {
   })
 
   // Deliberately unlike discoverHostnamesByPort: a vhost that listens for
-  // TLS but proxies nowhere still belongs in this map -- spec §7's finding
-  // (three TLS vhosts with no certificate) says nothing about whether they
-  // also proxy anywhere, and discoverHostnamesByPort would drop this vhost
-  // entirely for having no resolvable upstream.
-  it('includes a hostname that listens for TLS but resolves to no upstream at all', () => {
+  // TLS but proxies nowhere still belongs in THIS MAP -- discoverHostnamesByPort
+  // would drop it entirely for having no resolvable upstream. This only
+  // pins that the map CONTAINS the entry; it does not claim anything reaches
+  // the wire from it -- see discoverTlsByHostname's docstring ("ORPHAN TLS
+  // VHOSTS") for why nothing downstream currently enumerates this map's own
+  // keys, so an orphan hostname (one with no upstream, hence never a
+  // collect.ts target) is collected here but reaches nobody today.
+  it('includes a hostname that listens for TLS but resolves to no upstream at all, even though nothing downstream looks it up today', () => {
     const tls = discoverTlsByHostname([{ text: 'server { listen 443 ssl; server_name beta.example.invalid; }' }])
     expect(tls.get('beta.example.invalid')).toBe(true)
     expect(discoverHostnamesByPort([{ text: 'server { listen 443 ssl; server_name beta.example.invalid; }' }]).size).toBe(0)
@@ -409,6 +412,55 @@ describe('discoverTlsByHostname', () => {
   it('has no entry at all for a hostname never declared anywhere', () => {
     const tls = discoverTlsByHostname([{ text: VHOST }])
     expect(tls.has('nowhere.example.invalid')).toBe(false)
+  })
+
+  // Fix round 1's Critical: 26 of 28 files on the live host declare the SAME
+  // server_name in more than one block -- the dominant layout, not an edge
+  // case -- typically a bare port-80 redirect block paired with the real TLS
+  // block. Last-write-wins (plain Map.set, the ORIGINAL implementation) makes
+  // the answer depend on file/block PROCESSING ORDER: whichever block is
+  // seen last decides the hostname's TLS bit, and a naive readdir with no
+  // sort guarantee makes that order effectively arbitrary. The question this
+  // map answers is "does ANY server block for this name listen for TLS",
+  // which is OR-accumulation, not last-write-wins -- and `false` from the
+  // wrong order is strictly worse than a miss: the hostname IS present in
+  // byPort (the TLS block still has the real proxy_pass), so collect.ts's
+  // `?? null` fallback never fires, and `false` ships as a POSITIVE claim
+  // that a TLS-configured hostname is plain HTTP by design.
+  it('reports true (OR-accumulated), never false, when a duplicate server_name has ONE TLS block and one plain block, TLS block FIRST', () => {
+    const tls = discoverTlsByHostname([
+      { text: 'server { listen 443 ssl; server_name dup.example.invalid; location / { proxy_pass http://127.0.0.1:8200; } }' },
+      { text: 'server { listen 80; server_name dup.example.invalid; }' },
+    ])
+    expect(tls.get('dup.example.invalid')).toBe(true)
+  })
+
+  it('reports true (OR-accumulated) when the SAME duplicate pair is processed in the OPPOSITE order, plain block first', () => {
+    const tls = discoverTlsByHostname([
+      { text: 'server { listen 80; server_name dup.example.invalid; }' },
+      { text: 'server { listen 443 ssl; server_name dup.example.invalid; location / { proxy_pass http://127.0.0.1:8200; } }' },
+    ])
+    expect(tls.get('dup.example.invalid')).toBe(true)
+  })
+
+  it('reports true (OR-accumulated) when both duplicate blocks are in the SAME file, TLS block first', () => {
+    const tls = discoverTlsByHostname([
+      {
+        text: `
+server { listen 443 ssl; server_name samefile.example.invalid; location / { proxy_pass http://127.0.0.1:8300; } }
+server { listen 80; server_name samefile.example.invalid; }
+`,
+      },
+    ])
+    expect(tls.get('samefile.example.invalid')).toBe(true)
+  })
+
+  it('still reports false when EVERY block for a hostname is plain HTTP -- OR-accumulation does not manufacture a true from nothing', () => {
+    const tls = discoverTlsByHostname([
+      { text: 'server { listen 80; server_name allplain.example.invalid; }' },
+      { text: 'server { listen 80; server_name allplain.example.invalid; }' },
+    ])
+    expect(tls.get('allplain.example.invalid')).toBe(false)
   })
 })
 

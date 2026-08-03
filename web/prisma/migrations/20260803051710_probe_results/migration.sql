@@ -27,5 +27,18 @@
 -- shared/src/wire.ts's SystemStateSchema.hostnames/onBoxProbes docstrings
 -- and web/src/server/ingest.ts for the code that preserves this distinction
 -- end to end.
+--
+-- A REAL SQL NULL, specifically -- NOT the JSON scalar `null` stored inside
+-- a JSONB value. `hostnames::text = 'null'` (a JSON scalar, satisfying
+-- neither of the two facts above) and `hostnames IS NULL` (a genuine
+-- absence, "no opinion") are different states this column can hold, and
+-- Prisma's client returns JS `null` for BOTH, which hides the difference
+-- from every ordinary read. ingest.ts writes `Prisma.DbNull` (a true SQL
+-- NULL) specifically because `Prisma.JsonNull` (the JSON scalar) would put
+-- this exact conflation back, one layer below the wire-level fix above --
+-- fix round 1's review caught this live against the test database
+-- (`hostnames IS NULL` reading FALSE under `Prisma.JsonNull`) after the
+-- unit tests, which only see the client's already-collapsed JS `null`,
+-- passed either way.
 ALTER TABLE "SystemObservation" ADD COLUMN     "hostnames" JSONB,
 ADD COLUMN     "onBoxProbes" JSONB;

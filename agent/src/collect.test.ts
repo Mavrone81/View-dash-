@@ -301,6 +301,13 @@ describe('collectSnapshot', () => {
         }),
       )
       expect(snap.systems[0]!.health).toBe('healthy')
+      // Fix round 1's 🟡: `health` alone doesn't prove `not-probed` survives
+      // onto the wire unmapped -- it is the one outcome value this whole
+      // slice hinges on (§4's "no opinion" discipline), and this is the
+      // seam where it could quietly become `not-answering`, `down`, or
+      // vanish while `health` still reads correctly (since `worstOf`
+      // already treats both as "no opinion" for the health fold).
+      expect(snap.systems[0]!.onBoxProbes).toEqual([{ hostname: null, outcome: 'not-probed', status: null }])
     })
 
     it('does not downgrade anything when the vhost directory could not be read this tick', async () => {
@@ -459,6 +466,9 @@ describe('collectSnapshot', () => {
         }),
       )
       expect(snap.systems[0]!.health).toBe('healthy')
+      // Same 🟡 as the other not-probed test above: prove the outcome
+      // reaches onBoxProbes unmapped, not just that health stays untouched.
+      expect(snap.systems[0]!.onBoxProbes).toEqual([{ hostname: null, outcome: 'not-probed', status: null }])
     })
 
     it('never lets the whole snapshot fail when a probe function throws synchronously instead of rejecting, and never takes down another system with it', async () => {
@@ -528,6 +538,43 @@ describe('collectSnapshot', () => {
   // onto SystemState.hostnames/onBoxProbes instead of being discarded once
   // folded into a single HealthState.
   describe('carrying hostnames and onBoxProbes onto the wire (Task 5)', () => {
+    // Fix round 1's 🟡: the actual wire is JSON, not a JS object handed
+    // straight from collectSnapshot to FleetSnapshotSchema.parse in these
+    // other tests. `collect.ts` returns `hostnames: undefined` as an
+    // EXPLICIT key on the object (not an omitted one); `JSON.stringify`
+    // drops an explicit `undefined` value entirely (per the JSON spec, no
+    // key survives), and `JSON.parse` therefore never reconstructs the key
+    // at all -- so Zod's `.optional()` sees an absent key and parses it back
+    // to `undefined`, which is correct, but was never actually asserted
+    // through a real serialize/deserialize round-trip anywhere in this
+    // suite. The failure mode this would catch is sharp, not cosmetic:
+    // `.optional()` REJECTS an explicit `null` (it is not `.nullable()`),
+    // so if a future serializer ever normalised `undefined` to `null`
+    // instead of dropping the key (some do, e.g. certain RPC/websocket
+    // frameworks' default JSON replacers), the entire snapshot -- every
+    // system in it -- would fail FleetSnapshotSchema.parse on the
+    // DASHBOARD side, not fail loudly in the agent that produced it.
+    it('survives a real JSON.stringify/JSON.parse round-trip through FleetSnapshotSchema, with a failed vhost read (undefined fields)', async () => {
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
+          ],
+          onBoxProbing: {
+            hostnamesByPort: async () => null, // the vhost read failed this tick
+            tlsByHostname: async () => new Map(),
+            probeOnBoxHostname: vi.fn(),
+          },
+        }),
+      )
+      expect(snap.systems[0]!.hostnames).toBeUndefined()
+      expect(snap.systems[0]!.onBoxProbes).toBeUndefined()
+      const overWire = JSON.parse(JSON.stringify(snap)) as unknown
+      const parsed = FleetSnapshotSchema.parse(overWire)
+      expect(parsed.systems[0]!.hostnames).toBeUndefined()
+      expect(parsed.systems[0]!.onBoxProbes).toBeUndefined()
+    })
+
     it('reports one hostnames entry (with its listensTls bit) and one onBoxProbes entry for a named vhost', async () => {
       const snap = await collectSnapshot(
         deps({

@@ -57,18 +57,32 @@ export async function ingestSnapshot(hostId: string, raw: unknown): Promise<{ ac
           // no such field at all -- an older agent, or a newer one whose
           // vhost read failed this tick (see shared/src/wire.ts's
           // SystemStateSchema docstrings and agent/src/collect.ts). That
-          // must reach the database as SQL NULL, never as `[]`: `Prisma.JsonNull`
-          // is Prisma's explicit spelling for "store a JSON null", since a
-          // bare `undefined` value on a `create()` field means "omit this
-          // key, let the column default apply" -- and there IS no @default
-          // here (see the migration), so omitting would ALSO end up NULL
-          // today, but relying on that would silently break the instant
-          // anyone ever adds one. Writing `Prisma.JsonNull` explicitly says
-          // what is meant regardless of the column's default, now or later.
+          // must reach the database as a real SQL NULL, never as the JSON
+          // value `null`, and never as `[]`.
+          //
+          // FIX ROUND 1's Important: this used to write `Prisma.JsonNull`,
+          // which is Prisma's spelling for "store the JSON SCALAR `null`"
+          // (`hostnames::text` becomes the three characters `null`, and
+          // `hostnames IS NULL` is FALSE) -- verified live against the test
+          // database, not assumed. `Prisma.DbNull` is the one that produces
+          // an actual SQL NULL column value. The two are indistinguishable
+          // from the Prisma CLIENT (both read back as JS `null`), which is
+          // why the tests passed under the wrong one -- but they are NOT
+          // indistinguishable in the database, and this task's OWN
+          // no-opinion guarantee depends on which one is there: every
+          // pre-migration row and every row written by code that predates
+          // this column is a real SQL NULL, so a query like `WHERE
+          // hostnames IS NOT NULL` (or Prisma's `{ not: Prisma.DbNull }`)
+          // would have silently EXCLUDED every no-opinion row written by
+          // THIS code (JSON `null`) while including the pre-migration ones
+          // (SQL NULL) -- the identical wire-level conflation this task
+          // exists to prevent, reintroduced one layer down, in the one
+          // column meant to prevent it.
+          //
           // When the agent DID send an array (even an empty one, a real
           // "confirmed nothing" fact), it is passed through unchanged.
-          hostnames: s.hostnames ?? Prisma.JsonNull,
-          onBoxProbes: s.onBoxProbes ?? Prisma.JsonNull,
+          hostnames: s.hostnames ?? Prisma.DbNull,
+          onBoxProbes: s.onBoxProbes ?? Prisma.DbNull,
         },
       })
     }

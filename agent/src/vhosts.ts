@@ -498,34 +498,67 @@ export function discoverHostnamesByPort(files: Array<{ text: string }>): Map<num
 }
 
 /**
- * Maps each hostname declared anywhere in the vhost config to whether ITS
- * server block listens for TLS.
+ * Maps each hostname declared anywhere in the vhost config to whether ANY
+ * of its server blocks listens for TLS.
  *
  * Deliberately does NOT filter on `upstreamPort` the way `discoverHostnamesByPort`
  * does: `listensTls` is a fact about the vhost DECLARATION, not about
- * whether it proxies anywhere. Spec §7's live finding -- three hostnames
- * listen for TLS with no certificate -- says nothing about whether those
- * vhosts also proxy to a live backend; filtering them out here the way the
- * port map does would silently drop exactly the entries this function
- * exists to surface. A vhost with NO `server_name` at all contributes
- * nothing (there is no hostname to key the map on), which is the same
- * "real and worth noting elsewhere, but not this map's problem" shape
- * `discoverHostnamesByPort` already applies to an unresolved upstream.
+ * whether it proxies anywhere. A vhost with NO `server_name` at all
+ * contributes nothing (there is no hostname to key the map on), which is
+ * the same "real and worth noting elsewhere, but not this map's problem"
+ * shape `discoverHostnamesByPort` already applies to an unresolved
+ * upstream.
  *
- * If the same hostname is declared in more than one server block -- the
- * live host's common shape is a bare port-80 redirect block paired with the
- * real TLS block, both naming the same `server_name` -- the LAST block
- * processed wins (plain `Map.set` semantics). This is the identical,
- * documented-not-enforced tie-break `parseUpstreams` already uses for a
- * duplicate upstream name: arbitrary, but deterministic rather than
- * order-dependent-by-accident.
+ * FIX ROUND 1's CRITICAL: this used to be last-write-wins (plain
+ * `Map.set(h, v.listensTls)`), on the reasoning that it mirrored
+ * `parseUpstreams`' own documented, arbitrary-but-deterministic tie-break
+ * for a duplicate name. That reasoning does not transfer here.
+ * `parseUpstreams` picks between two candidate PORTS, where only one can be
+ * right and neither answer is worse than the other. This map answers "does
+ * ANY server block for this name listen for TLS" -- a yes/no question where
+ * the two inputs are not peers to arbitrate between, they are evidence to
+ * combine. The live host's dominant layout (measured: 26 of 28 files, not
+ * an edge case) is a bare port-80 redirect block paired with the real TLS
+ * block, BOTH declaring the same `server_name` -- and last-write-wins made
+ * the answer depend on file/block PROCESSING ORDER (position within a file,
+ * and an unsorted `readdir` across files), which is not something this
+ * function's caller controls or can rely on. A `false` produced by
+ * unlucky ordering is not a harmless coin-flip: the hostname is present in
+ * `byPort` via the TLS block's own `proxy_pass`, so `collect.ts`'s `?? null`
+ * miss-fallback never fires -- `false` ships as a POSITIVE claim that a
+ * TLS-configured hostname is plain HTTP by design, which is strictly worse
+ * than a `null` gap. The same wrong answer is also reachable via a race,
+ * not just static ordering: `readNamedFiles` silently skips a file it
+ * cannot read, so if the TLS block's own file is mid-write while the
+ * redirect file reads fine, the hostname is PRESENT with `false` for a
+ * completely different reason.
+ *
+ * Fixed by OR-accumulating across every block that declares the hostname,
+ * which is the actual semantics the question asks and is order-independent
+ * by construction: once any block for a hostname sets it to `true`, no
+ * later (or earlier) plain block can un-set it.
+ *
+ * ORPHAN TLS VHOSTS -- RECORDED HONESTLY, NOT FIXED HERE: this map is
+ * deliberately unfiltered by upstream resolution (see above), so it DOES
+ * collect a hostname that listens for TLS but resolves to no live backend
+ * (spec §7's exact finding: on the live host, measured, 2 of the 3
+ * TLS-without-certificate hostnames have no upstream at all). But nothing
+ * downstream currently ENUMERATES this map's own keys -- `collect.ts` only
+ * looks up a TLS bit for hostnames it already reached via `targets`
+ * (derived from `discoverHostnamesByPort`'s PORT-filtered map), so an
+ * orphan hostname that exists only here is looked up by nobody and never
+ * reaches the wire. Collecting it here is necessary but not sufficient;
+ * fix round 1's review is explicit that surfacing an orphan vhost needs a
+ * HOST-LEVEL channel on the wire (it attaches to no system, so no
+ * per-system field can carry it), and that this is separate, scoped-out
+ * work, not something to build as part of this fix.
  */
 export function discoverTlsByHostname(files: Array<{ text: string }>): Map<string, boolean> {
   const upstreams = parseUpstreams(files)
   const tlsByHostname = new Map<string, boolean>()
   for (const f of files) {
     for (const v of parseServerBlocks(f.text, upstreams)) {
-      for (const h of v.hostnames) tlsByHostname.set(h, v.listensTls)
+      for (const h of v.hostnames) tlsByHostname.set(h, (tlsByHostname.get(h) ?? false) || v.listensTls)
     }
   }
   return tlsByHostname
