@@ -3,6 +3,83 @@ import { z } from 'zod'
 export const HealthStateSchema = z.enum(['healthy', 'degraded', 'down', 'unknown'])
 export type HealthState = z.infer<typeof HealthStateSchema>
 
+/**
+ * What a single probe of a single hostname found.
+ *
+ * `proxy-no-upstream` is deliberately its own value rather than a flavour
+ * of `not-answering`: a 502/504 is the reverse proxy telling us it is
+ * healthy and the thing behind it is not. That sentence is the entire
+ * reason this slice exists, and collapsing it into a generic failure
+ * throws away the only outcome that names its own cause.
+ *
+ * `not-probed` means no probe ran. It is NOT a pass.
+ */
+export const ProbeOutcomeSchema = z.enum([
+  'answering',
+  'answering-oddly',
+  'not-answering',
+  'proxy-no-upstream',
+  'tls-failed',
+  'not-probed',
+])
+export type ProbeOutcome = z.infer<typeof ProbeOutcomeSchema>
+
+/**
+ * One hostname the host's own reverse-proxy config maps to this system,
+ * paired with whether the server block that declares it listens for TLS.
+ *
+ * `listensTls` is a config FACT, independent of whether anything answered a
+ * probe on this hostname -- a vhost that listens for TLS with no working
+ * certificate is exactly spec §8's "No certificate where TLS is configured
+ * without one", and §7's live finding of three such hostnames. It travels
+ * here, on the config-derived hostname list, rather than on `OnBoxProbeResultSchema`
+ * below, because it describes the vhost declaration, not a probe outcome --
+ * the on-box axis never touches TLS at all (see `agent/src/probe.ts`'s
+ * `probeHostnameOnBox`), and attaching it to a probe result would either
+ * have to repeat it once per probed hostname or leave it undefined on the
+ * (very real) `hostname: null` probe results that have no declaring vhost
+ * to read it from.
+ *
+ * `null`, not just `true`/`false`: the hostname list and the TLS map are
+ * two INDEPENDENT per-tick reads of the same vhost directory (see
+ * `agent/src/vhosts.ts`'s `discoverHostnamesFromDir`/`discoverTlsFromDir`
+ * and `agent/src/collect.ts`), so a hostname can be known (the first read
+ * succeeded) while its TLS bit is not (the second read failed this tick, or
+ * -- should the two ever disagree -- simply has no entry for it). Reporting
+ * `false` in that case would silently misrepresent a TLS-configured
+ * hostname as plain HTTP, hiding the exact finding spec §8 exists to
+ * surface; `null` says plainly "not determined this tick".
+ */
+export const HostnameConfigSchema = z.object({
+  hostname: z.string().min(1),
+  listensTls: z.boolean().nullable(),
+})
+export type HostnameConfig = z.infer<typeof HostnameConfigSchema>
+
+/**
+ * What one on-box probe target found. Mirrors the shape
+ * `agent/src/probe.ts`'s `probeHostnameOnBox` already returns, so the agent
+ * passes its result straight through with no reshaping.
+ *
+ * `hostname: null` means a published port with no vhost mapping at all --
+ * probed anyway, addressed by port only, with no `Host` header (see
+ * `agent/src/probe.ts`'s `hostnamesForSystem`/`probeHostnameOnBox`
+ * docstrings for why this is still worth probing). This is a DEFINITE,
+ * POSITIVE fact about the target -- "no name was claimed for this port" --
+ * and it is NOT the same thing as "we don't know the hostname". Every
+ * unmapped-port probe produces exactly this shape, deterministically; there
+ * is no code path that produces a `hostname: null` result meaning "unknown"
+ * rather than "none". A renderer must not fold this into a blank cell or a
+ * dash indistinguishable from missing data -- it is evidence ("the app on
+ * this port answered/didn't"), just evidence with no name attached to it.
+ */
+export const OnBoxProbeResultSchema = z.object({
+  hostname: z.string().min(1).nullable(),
+  outcome: ProbeOutcomeSchema,
+  status: z.number().int().nullable(),
+})
+export type OnBoxProbeResult = z.infer<typeof OnBoxProbeResultSchema>
+
 export const SystemStateSchema = z.object({
   key: z.string().min(1),
   displayName: z.string().min(1),
@@ -13,6 +90,29 @@ export const SystemStateSchema = z.object({
   deployedSubject: z.string().nullable(),
   deployedAt: z.string().datetime().nullable(),
   driftCommits: z.number().int().min(0).nullable(),
+  /**
+   * The hostnames this system's published ports resolve to, per the host's
+   * own reverse-proxy config -- see `agent/src/vhosts.ts`.
+   *
+   * DELIBERATELY `.optional()`, NOT `.default([])`: an older agent (from
+   * before this field existed, or a newer agent whose vhost-directory read
+   * failed this tick -- see `agent/src/collect.ts`) sends no key at all, and
+   * that must parse to `undefined`, never to `[]`. Defaulting it to `[]`
+   * would make "we do not know this tick" indistinguishable from "we looked
+   * and this system genuinely has no HTTP surface" -- a real positive fact a
+   * NEW agent reports by sending an actual empty array. Both shapes are
+   * legal on the wire; only the caller (a NEW agent) can produce the
+   * confident empty-array claim, and only by actually having read the vhost
+   * config and found nothing there.
+   */
+  hostnames: z.array(HostnameConfigSchema).optional(),
+  /**
+   * One entry per on-box probe target for this system. Same
+   * `undefined`-vs-`[]` discipline as `hostnames` above, for the same
+   * reason and from the same source (both are populated together, or not at
+   * all, by `agent/src/collect.ts`).
+   */
+  onBoxProbes: z.array(OnBoxProbeResultSchema).optional(),
 })
 export type SystemState = z.infer<typeof SystemStateSchema>
 
@@ -44,27 +144,6 @@ export const AgentHelloSchema = z.object({
   hostName: z.string().min(1),
 })
 export type AgentHello = z.infer<typeof AgentHelloSchema>
-
-/**
- * What a single probe of a single hostname found.
- *
- * `proxy-no-upstream` is deliberately its own value rather than a flavour
- * of `not-answering`: a 502/504 is the reverse proxy telling us it is
- * healthy and the thing behind it is not. That sentence is the entire
- * reason this slice exists, and collapsing it into a generic failure
- * throws away the only outcome that names its own cause.
- *
- * `not-probed` means no probe ran. It is NOT a pass.
- */
-export const ProbeOutcomeSchema = z.enum([
-  'answering',
-  'answering-oddly',
-  'not-answering',
-  'proxy-no-upstream',
-  'tls-failed',
-  'not-probed',
-])
-export type ProbeOutcome = z.infer<typeof ProbeOutcomeSchema>
 
 /**
  * Maps an HTTP status onto an outcome.

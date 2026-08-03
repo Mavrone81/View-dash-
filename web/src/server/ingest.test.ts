@@ -129,4 +129,71 @@ describe('ingestSnapshot', () => {
       expect(receivedAtMs).toBeLessThanOrEqual(after + 5000)
     })
   })
+
+  // Task 5: carrying per-hostname on-box probe detail from the agent onto
+  // the stored row, without letting `not-probed`/"we don't know" collapse
+  // into a claim the agent never made.
+  describe('hostnames / onBoxProbes (Task 5)', () => {
+    it('stores the hostnames and per-hostname probe results the agent reported', async () => {
+      await ingestSnapshot(
+        hostId,
+        snap([
+          sys('alpha', {
+            health: 'degraded',
+            hostnames: [{ hostname: 'alpha.example.invalid', listensTls: true }],
+            onBoxProbes: [{ hostname: 'alpha.example.invalid', outcome: 'proxy-no-upstream', status: 502 }],
+          }),
+        ]),
+      )
+      const obs = await prisma.systemObservation.findFirstOrThrow({ orderBy: { receivedAt: 'desc' } })
+      expect(obs.hostnames).toEqual([{ hostname: 'alpha.example.invalid', listensTls: true }])
+      expect(obs.onBoxProbes).toEqual([{ hostname: 'alpha.example.invalid', outcome: 'proxy-no-upstream', status: 502 }])
+    })
+
+    it('stores a null-hostname probe result (an unmapped port) unchanged, not folded into some other shape', async () => {
+      await ingestSnapshot(
+        hostId,
+        snap([sys('alpha', { hostnames: [], onBoxProbes: [{ hostname: null, outcome: 'not-probed', status: null }] })]),
+      )
+      const obs = await prisma.systemObservation.findFirstOrThrow({ orderBy: { receivedAt: 'desc' } })
+      expect(obs.onBoxProbes).toEqual([{ hostname: null, outcome: 'not-probed', status: null }])
+    })
+
+    it('stores listensTls: null unchanged -- "not determined this tick" must not become true, false, or vanish', async () => {
+      await ingestSnapshot(
+        hostId,
+        snap([sys('alpha', { hostnames: [{ hostname: 'alpha.example.invalid', listensTls: null }] })]),
+      )
+      const obs = await prisma.systemObservation.findFirstOrThrow({ orderBy: { receivedAt: 'desc' } })
+      expect(obs.hostnames).toEqual([{ hostname: 'alpha.example.invalid', listensTls: null }])
+    })
+
+    // The discriminating case this task's brief calls out by name: an
+    // OLDER agent's snapshot must not merely be ACCEPTED (the brief's own
+    // test only checks that much) -- what gets STORED must read as "no
+    // opinion", never as "this system has no HTTP surface". A stored `[]`
+    // and a stored `null` are visually similar but mean opposite things to
+    // a board that has to decide whether to render a warning.
+    it('stores NULL (never []) for hostnames/onBoxProbes when an OLDER agent sends neither field', async () => {
+      await ingestSnapshot(hostId, snap([sys('beta')])) // sys() never sets hostnames/onBoxProbes
+      const obs = await prisma.systemObservation.findFirstOrThrow({ orderBy: { receivedAt: 'desc' } })
+      expect(obs.hostnames).toBeNull()
+      expect(obs.onBoxProbes).toBeNull()
+    })
+
+    it('stores an empty array (never NULL) when a NEWER agent confirms zero hostnames/probes for a system', async () => {
+      await ingestSnapshot(hostId, snap([sys('alpha', { hostnames: [], onBoxProbes: [] })]))
+      const obs = await prisma.systemObservation.findFirstOrThrow({ orderBy: { receivedAt: 'desc' } })
+      expect(obs.hostnames).toEqual([])
+      expect(obs.onBoxProbes).toEqual([])
+    })
+
+    it('accepts a snapshot from an OLDER agent that sends neither field, without throwing', async () => {
+      // A rolling deploy means the agent and dashboard are briefly different
+      // versions. An older agent must not be rejected.
+      await expect(
+        ingestSnapshot(hostId, snap([sys('beta')])),
+      ).resolves.toEqual({ accepted: 1 })
+    })
+  })
 })

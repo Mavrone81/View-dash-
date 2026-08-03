@@ -53,6 +53,34 @@ model SystemObservation {
   deployedAt        DateTime?
   driftCommits      Int?
 
+  // Per-hostname facts derived from the host's own reverse-proxy config --
+  // see agent/src/vhosts.ts and shared/src/wire.ts's HostnameConfigSchema.
+  // `Json?`, not `String[]`: each entry carries `listensTls` alongside the
+  // name (`[{ hostname, listensTls }, ...]`), and a plain string array has
+  // nowhere to put that bit.
+  //
+  // NULL means this observation carries NO OPINION about this system's
+  // hostnames -- either it predates this column (an OLDER agent, or any
+  // row written before this migration ran), or the reporting agent's vhost
+  // read failed on the tick that produced it (see agent/src/collect.ts).
+  // An EMPTY ARRAY `[]` is a different, positive fact: a NEWER agent
+  // actually read the vhost config this tick and found no hostnames for
+  // this system's published ports. Defaulting this column to `'[]'` would
+  // make those two cases indistinguishable and render an old row (or a
+  // gap tick) as "confirmed no HTTP surface" -- a false claim about a
+  // system this observation says nothing about. See ingest.ts for how an
+  // absent wire field maps to NULL, never to `[]`.
+  hostnames         Json?
+  // One entry per on-box probe target this system had this tick:
+  // `[{ hostname, outcome, status }, ...]` -- see
+  // shared/src/wire.ts's OnBoxProbeResultSchema. `hostname: null` inside an
+  // entry means a published port with no vhost mapping (a real, positive
+  // fact -- "no name was claimed for this port"), which is a different
+  // thing from this WHOLE COLUMN being NULL, which carries the identical
+  // "no opinion this observation" meaning as `hostnames` above, for the
+  // identical reason.
+  onBoxProbes       Json?
+
   // Rows are selected as "latest observation per system" ordered by
   // receivedAt (the trusted, server-set clock), never observedAt (the
   // untrusted, agent-claimed clock) — see the comment above. The index must

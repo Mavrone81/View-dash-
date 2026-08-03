@@ -1,4 +1,5 @@
 import { FleetSnapshotSchema } from '@bevora-ops/shared'
+import { Prisma } from '@prisma/client'
 import { prisma } from '../lib/db.js'
 
 /**
@@ -52,6 +53,22 @@ export async function ingestSnapshot(hostId: string, raw: unknown): Promise<{ ac
           deployedSubject: s.deployedSubject,
           deployedAt: s.deployedAt ? new Date(s.deployedAt) : null,
           driftCommits: s.driftCommits,
+          // `s.hostnames`/`s.onBoxProbes` are `undefined` when the AGENT sent
+          // no such field at all -- an older agent, or a newer one whose
+          // vhost read failed this tick (see shared/src/wire.ts's
+          // SystemStateSchema docstrings and agent/src/collect.ts). That
+          // must reach the database as SQL NULL, never as `[]`: `Prisma.JsonNull`
+          // is Prisma's explicit spelling for "store a JSON null", since a
+          // bare `undefined` value on a `create()` field means "omit this
+          // key, let the column default apply" -- and there IS no @default
+          // here (see the migration), so omitting would ALSO end up NULL
+          // today, but relying on that would silently break the instant
+          // anyone ever adds one. Writing `Prisma.JsonNull` explicitly says
+          // what is meant regardless of the column's default, now or later.
+          // When the agent DID send an array (even an empty one, a real
+          // "confirmed nothing" fact), it is passed through unchanged.
+          hostnames: s.hostnames ?? Prisma.JsonNull,
+          onBoxProbes: s.onBoxProbes ?? Prisma.JsonNull,
         },
       })
     }

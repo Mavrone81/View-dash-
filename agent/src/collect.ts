@@ -1,4 +1,4 @@
-import type { FleetSnapshot, HealthState, ProbeOutcome, SystemState } from '@bevora-ops/shared'
+import type { FleetSnapshot, HealthState, HostnameConfig, OnBoxProbeResult, ProbeOutcome, SystemState } from '@bevora-ops/shared'
 import { probeOutcomeToHealth } from '@bevora-ops/shared'
 import { discoverSystems, type ContainerSummary } from './docker.js'
 import { parseDeployLog } from './deploy-log.js'
@@ -64,9 +64,22 @@ export type CollectDeps = {
    * explicit `Host` header when a hostname is known (see
    * `agent/src/probe.ts`'s `probeHostnameOnBox` and the spec's §3.1
    * correction) -- NOT by resolving the hostname over DNS.
+   *
+   * `tlsByHostname` is Task 5's addition: maps a hostname to whether its
+   * declaring vhost listens for TLS (see `agent/src/vhosts.ts`'s
+   * `discoverTlsByHostname`/`discoverTlsFromDir`). Read ONCE per tick, same
+   * as `hostnamesByPort` and for the identical reason, but via its OWN
+   * independent read of the vhost directory rather than sharing
+   * `hostnamesByPort`'s -- see `discoverTlsFromDir`'s docstring for why
+   * that duplication is deliberate. `null` means the read failed this
+   * tick, exactly as for `hostnamesByPort`, and must not be treated as
+   * "read successfully, no hostname listens for TLS" -- that would render
+   * spec §8's "no certificate where TLS is configured without one" finding
+   * as plain, unremarkable HTTP.
    */
   onBoxProbing: {
     hostnamesByPort: () => Promise<Map<number, string[]> | null>
+    tlsByHostname: () => Promise<Map<string, boolean> | null>
     probeOnBoxHostname: (hostname: string | null, port: number) => Promise<{ outcome: ProbeOutcome; status: number | null }>
   } | null
 }
@@ -95,6 +108,21 @@ export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot>
       byPort = await onBoxProbing.hostnamesByPort()
     } catch {
       byPort = null
+    }
+  }
+
+  // TLS is a separate per-tick read from `byPort` above -- see
+  // `tlsByHostname`'s docstring on `CollectDeps` for why the two are not
+  // shared. Guarded and defaulted to `null` for the identical reason as
+  // `byPort`: this call sits outside the per-system `Promise.all`, so an
+  // uncaught throw here would fail the entire snapshot for what is, at
+  // worst, one unreadable directory.
+  let tlsByHostname: Map<string, boolean> | null = null
+  if (onBoxProbing) {
+    try {
+      tlsByHostname = await onBoxProbing.tlsByHostname()
+    } catch {
+      tlsByHostname = null
     }
   }
 
@@ -174,12 +202,22 @@ export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot>
       // system's on-box probing. Total collection time stays the slowest
       // single probe, never the sum of them all.
       let onBoxHealth: HealthState | null = null
+      // Task 5's addition: the raw per-hostname detail behind `onBoxHealth`
+      // above, carried onto the wire instead of being discarded once folded.
+      // Both stay `undefined` (never `[]`) unless this block actually runs --
+      // see `SystemStateSchema.hostnames`/`onBoxProbes` in shared/src/wire.ts
+      // for why `undefined` (not attempted) and `[]` (attempted, found
+      // nothing) must never be conflated: an older agent, or a byPort read
+      // that failed this tick (see the `byPort && onBoxProbing` guard right
+      // below), must report "we do not know", never "no HTTP surface".
+      let hostnameConfigs: HostnameConfig[] | undefined
+      let onBoxProbeResults: OnBoxProbeResult[] | undefined
       if (byPort && onBoxProbing) {
         try {
           const targets = hostnamesForSystem(d.publishedPorts, byPort)
           const results = await Promise.all(
-            targets.map((t) =>
-              onBoxProbing.probeOnBoxHostname(t.hostname, t.port).catch(
+            targets.map(async (t): Promise<OnBoxProbeResult> => {
+              const r = await onBoxProbing.probeOnBoxHostname(t.hostname, t.port).catch(
                 // A configured probe function that REJECTS (rather than
                 // resolving with a failure outcome, which
                 // probeHostnameOnBox always does on its own) is a REAL probe
@@ -204,13 +242,43 @@ export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot>
                   outcome: t.hostname === null ? 'not-probed' : 'not-answering',
                   status: null,
                 }),
-              ),
-            ),
+              )
+              // `t.hostname`, not any `hostname` the injected transport
+              // might return: `CollectDeps.probeOnBoxHostname`'s declared
+              // return type carries no `hostname` field at all (unlike
+              // `agent/src/probe.ts`'s real `probeHostnameOnBox`), so the
+              // target we dialled is the only hostname this function can
+              // truthfully attribute the result to.
+              return { hostname: t.hostname, outcome: r.outcome, status: r.status }
+            }),
           )
           for (const r of results) {
             const h = probeOutcomeToHealth(r.outcome)
             if (h !== null) onBoxHealth = onBoxHealth === null ? h : worstOf(onBoxHealth, h)
           }
+          onBoxProbeResults = results
+
+          // The named subset of `targets` (a `hostname: null` entry names no
+          // system and belongs on `onBoxProbes` only, never on this
+          // config-facing list), deduplicated by name: `targets` itself is
+          // deduplicated on the (port, hostname) PAIR (see
+          // `hostnamesForSystem`), so the same hostname legitimately
+          // reachable via two ports still appears twice here without a
+          // second pass. First occurrence wins; a hostname's TLS bit does
+          // not depend on which port dialled it.
+          const seen = new Map<string, boolean | null>()
+          for (const t of targets) {
+            if (t.hostname === null || seen.has(t.hostname)) continue
+            // `?? null`, not `?? false`: a miss here means either the TLS
+            // read failed this tick (`tlsByHostname === null`) or -- should
+            // the two independent reads ever disagree -- this exact
+            // hostname was absent from it. Neither is "confirmed plain
+            // HTTP"; both are "we don't know this tick", and guessing
+            // `false` would silently hide spec §8's "TLS configured with no
+            // certificate" finding behind a false "not TLS" claim.
+            seen.set(t.hostname, tlsByHostname?.get(t.hostname) ?? null)
+          }
+          hostnameConfigs = [...seen].map(([hostname, listensTls]) => ({ hostname, listensTls }))
         } catch {
           // The `.catch()` above only guards a REJECTED promise. A
           // `probeOnBoxHostname` that misbehaves badly enough to throw
@@ -229,6 +297,11 @@ export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot>
           // `down`-shaped. `unknown` is the truthful state for "we cannot
           // vouch for this", and `RANK` in this file already places it
           // below `down` for exactly this reason.
+          //
+          // `hostnameConfigs`/`onBoxProbeResults` are deliberately left
+          // `undefined` here (not reset to `[]`): our own machinery faulted
+          // before producing any of this tick's detail, which is the exact
+          // same "no opinion" fact as never having attempted at all.
           onBoxHealth = 'unknown'
         }
       }
@@ -238,6 +311,8 @@ export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot>
         displayName: d.displayName,
         health: worstOf(worstOf(d.health, probed), onBoxHealth),
         containers: d.containers,
+        hostnames: hostnameConfigs,
+        onBoxProbes: onBoxProbeResults,
         // A short sha from a log is not a valid 40-char wire sha; only the
         // git-resolved full sha is reported.
         deployedSha: git.deployedSha && /^[0-9a-f]{40}$/.test(git.deployedSha) ? git.deployedSha : null,

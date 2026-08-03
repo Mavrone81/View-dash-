@@ -4,7 +4,7 @@ import type { CollectDeps } from './collect.js'
 import { toSummary } from './docker.js'
 import { httpOnBoxRequest, probeHostnameOnBox, probeUrl, type FetchLike, type OnBoxRequestLike } from './probe.js'
 import { resolveDeployLogPath, resolveRepoDir } from './paths.js'
-import { discoverHostnamesFromDir, nodeVhostFs } from './vhosts.js'
+import { discoverHostnamesFromDir, discoverTlsFromDir, nodeVhostFs } from './vhosts.js'
 
 /**
  * The one method of dockerode's `Docker` this module actually calls,
@@ -54,6 +54,25 @@ export function buildHostnamesByPort(
     }
     return byPort
   }
+}
+
+/**
+ * The TLS-axis sibling of `buildHostnamesByPort` immediately above: reads
+ * the SAME vhost directory, on its own independent per-tick read, and
+ * derives which hostnames listen for TLS (see `agent/src/vhosts.ts`'s
+ * `discoverTlsFromDir`).
+ *
+ * Deliberately does NOT log on a `null` read the way `buildHostnamesByPort`
+ * does: the two closures read the same directory, so a failure here fires
+ * in the same tick as `buildHostnamesByPort`'s own failure and its warning
+ * already tells the operator the vhost directory is unreadable this tick --
+ * a second, differently-worded warning for the identical root cause would
+ * be noise, not a second diagnostic. `collect.ts` still treats this
+ * closure's `null` on its own terms (skips populating `hostnames`/
+ * `onBoxProbes` for this tick), it just doesn't ALSO log about it.
+ */
+export function buildTlsByHostname(vhostDir: string): () => Promise<Map<string, boolean> | null> {
+  return () => discoverTlsFromDir(vhostDir, nodeVhostFs)
 }
 
 /**
@@ -115,6 +134,10 @@ export function buildCollectDeps(
     // axis off; production always wants it on.
     onBoxProbing: {
       hostnamesByPort: buildHostnamesByPort(cfg.vhostDir),
+      // TLS is a config fact, not a probe result -- see
+      // `shared/src/wire.ts`'s `HostnameConfigSchema` docstring for why it
+      // travels on the hostname list rather than on a probe result.
+      tlsByHostname: buildTlsByHostname(cfg.vhostDir),
       probeOnBoxHostname: (hostname, port) => probeHostnameOnBox(hostname, port, onBoxRequestImpl, cfg.probeTimeoutMs),
     },
   }

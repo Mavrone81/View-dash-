@@ -20,19 +20,20 @@ export type VhostEntry = {
   upstreamPort: number | null
   /**
    * Whether this server block listens for TLS (`listen 443` or `listen
-   * ... ssl`). Currently produced here and consumed by NOTHING in this
-   * tree -- fix round 2 removed its only prospective consumer (the on-box
-   * probe no longer touches TLS or a scheme at all, see
-   * `agent/src/probe.ts`'s `probeHostnameOnBox`), and no task in the
-   * current plan reads it yet.
+   * ... ssl`).
    *
-   * This is a real, load-bearing gap, not dead weight to delete: spec §8
-   * requires "No certificate where TLS is configured without one", and
-   * §7's finding of three TLS vhosts with no certificate depends on
-   * exactly this bit existing somewhere the external probe (Task 6) and
-   * the board (Task 8) can read. Task 5 (wire schema) must carry
-   * `listensTls` on the wire, or this gets rediscovered in Task 8 after a
-   * migration has already shipped without it.
+   * Was produced here and consumed by nothing through fix round 2 -- the
+   * on-box probe never touches TLS or a scheme at all (see
+   * `agent/src/probe.ts`'s `probeHostnameOnBox`), so nothing in this tree
+   * read it. Task 5 closed that: `discoverTlsByHostname` (below) reads it
+   * off every parsed block and carries it onto `SystemState.hostnames` in
+   * `shared/src/wire.ts` (`HostnameConfigSchema.listensTls`), because spec
+   * §8 requires "No certificate where TLS is configured without one" and
+   * §7's finding of three such hostnames depends on exactly this bit
+   * reaching the board (Task 8) somehow. This field itself still has no
+   * DIRECT consumer -- `discoverTlsByHostname` reads it while iterating
+   * `parseServerBlocks`' output, not by name from outside this module --
+   * but the fact it carries is no longer orphaned.
    */
   listensTls: boolean
 }
@@ -494,4 +495,68 @@ export function discoverHostnamesByPort(files: Array<{ text: string }>): Map<num
     }
   }
   return byPort
+}
+
+/**
+ * Maps each hostname declared anywhere in the vhost config to whether ITS
+ * server block listens for TLS.
+ *
+ * Deliberately does NOT filter on `upstreamPort` the way `discoverHostnamesByPort`
+ * does: `listensTls` is a fact about the vhost DECLARATION, not about
+ * whether it proxies anywhere. Spec §7's live finding -- three hostnames
+ * listen for TLS with no certificate -- says nothing about whether those
+ * vhosts also proxy to a live backend; filtering them out here the way the
+ * port map does would silently drop exactly the entries this function
+ * exists to surface. A vhost with NO `server_name` at all contributes
+ * nothing (there is no hostname to key the map on), which is the same
+ * "real and worth noting elsewhere, but not this map's problem" shape
+ * `discoverHostnamesByPort` already applies to an unresolved upstream.
+ *
+ * If the same hostname is declared in more than one server block -- the
+ * live host's common shape is a bare port-80 redirect block paired with the
+ * real TLS block, both naming the same `server_name` -- the LAST block
+ * processed wins (plain `Map.set` semantics). This is the identical,
+ * documented-not-enforced tie-break `parseUpstreams` already uses for a
+ * duplicate upstream name: arbitrary, but deterministic rather than
+ * order-dependent-by-accident.
+ */
+export function discoverTlsByHostname(files: Array<{ text: string }>): Map<string, boolean> {
+  const upstreams = parseUpstreams(files)
+  const tlsByHostname = new Map<string, boolean>()
+  for (const f of files) {
+    for (const v of parseServerBlocks(f.text, upstreams)) {
+      for (const h of v.hostnames) tlsByHostname.set(h, v.listensTls)
+    }
+  }
+  return tlsByHostname
+}
+
+/**
+ * Composes a directory listing + file reads + `discoverTlsByHostname` into
+ * the single call `agent/src/collect.ts`'s `CollectDeps.onBoxProbing.tlsByHostname`
+ * needs -- the TLS-axis sibling of `discoverHostnamesFromDir` immediately
+ * above, same discipline for the same reason: ONE `readdir` (no separate
+ * reachability check, no TOCTOU window), `null` (never an empty `Map`) when
+ * the directory itself could not be listed, because collapsing "unreadable"
+ * into "found no TLS vhosts" would render every TLS-configured hostname on
+ * this host as plain HTTP -- the exact false claim spec §8 exists to catch,
+ * reappearing one axis over.
+ *
+ * A separate directory read from `discoverHostnamesFromDir`'s, not a shared
+ * one: the two axes are independent facts (hostname→port vs hostname→TLS)
+ * computed from the same on-disk files, and reading twice per tick trades a
+ * second small `readdir` + a handful of file reads (this project's own
+ * survey counted 28 files on the live host) for not perturbing
+ * `discoverHostnamesFromDir`'s already-hardened, already-reviewed contract.
+ * See task-5-report.md for the reasoning against consolidating them.
+ */
+export async function discoverTlsFromDir(dir: string, fs: VhostFs): Promise<Map<string, boolean> | null> {
+  let names: string[]
+  try {
+    names = await fs.readdir(dir)
+  } catch {
+    return null
+  }
+  const files = await readNamedFiles(dir, names, fs)
+  return discoverTlsByHostname(files)
 }

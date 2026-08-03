@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { FleetSnapshotSchema, classifyHttpStatus, classifyProbeFailure, probeOutcomeToHealth } from './wire.js'
+import {
+  FleetSnapshotSchema,
+  SystemStateSchema,
+  classifyHttpStatus,
+  classifyProbeFailure,
+  probeOutcomeToHealth,
+} from './wire.js'
 
 const system = {
   key: 'proj-a',
@@ -84,6 +90,78 @@ describe('FleetSnapshotSchema', () => {
   it('rejects over-long deployedSha', () => {
     const r = FleetSnapshotSchema.safeParse({ collectedAt: '2026-08-01T10:00:00.000Z',
       systems: [{ ...system, deployedSha: 'a'.repeat(41) }] })
+    expect(r.success).toBe(false)
+  })
+})
+
+describe('SystemStateSchema.hostnames / onBoxProbes (Task 5)', () => {
+  it('accepts a system with neither field -- an OLDER agent, from before these fields existed', () => {
+    // .optional(), not .default([]): an absent key must parse to `undefined`,
+    // never silently become `[]`, or "we do not know this tick" would read
+    // identically to "we looked and found nothing" downstream.
+    const r = SystemStateSchema.safeParse(system)
+    expect(r.success).toBe(true)
+    if (r.success) {
+      expect(r.data.hostnames).toBeUndefined()
+      expect(r.data.onBoxProbes).toBeUndefined()
+    }
+  })
+
+  it('accepts a system that genuinely has zero hostnames and zero probes, distinct from omitting the fields', () => {
+    const r = SystemStateSchema.safeParse({ ...system, hostnames: [], onBoxProbes: [] })
+    expect(r.success).toBe(true)
+    if (r.success) {
+      expect(r.data.hostnames).toEqual([])
+      expect(r.data.onBoxProbes).toEqual([])
+    }
+  })
+
+  it('accepts a named hostname with its listensTls bit, and a matching probe result', () => {
+    const r = SystemStateSchema.safeParse({
+      ...system,
+      hostnames: [{ hostname: 'alpha.example.invalid', listensTls: true }],
+      onBoxProbes: [{ hostname: 'alpha.example.invalid', outcome: 'proxy-no-upstream', status: 502 }],
+    })
+    expect(r.success).toBe(true)
+  })
+
+  it('accepts a null hostname on a probe result -- an unmapped port, a real fact, not an unknown', () => {
+    const r = SystemStateSchema.safeParse({
+      ...system,
+      onBoxProbes: [{ hostname: null, outcome: 'not-probed', status: null }],
+    })
+    expect(r.success).toBe(true)
+  })
+
+  it('rejects a null hostname in the CONFIG list -- unlike a probe result, an unnamed vhost entry is not a thing', () => {
+    const r = SystemStateSchema.safeParse({
+      ...system,
+      hostnames: [{ hostname: null, listensTls: false }],
+    })
+    expect(r.success).toBe(false)
+  })
+
+  it('rejects an unknown probe outcome value', () => {
+    const r = SystemStateSchema.safeParse({
+      ...system,
+      onBoxProbes: [{ hostname: 'alpha.example.invalid', outcome: 'flaky', status: 200 }],
+    })
+    expect(r.success).toBe(false)
+  })
+
+  it('accepts a null listensTls -- the hostname is known but its TLS bit was not determined this tick', () => {
+    const r = SystemStateSchema.safeParse({
+      ...system,
+      hostnames: [{ hostname: 'alpha.example.invalid', listensTls: null }],
+    })
+    expect(r.success).toBe(true)
+  })
+
+  it('rejects a non-boolean, non-null listensTls', () => {
+    const r = SystemStateSchema.safeParse({
+      ...system,
+      hostnames: [{ hostname: 'alpha.example.invalid', listensTls: 'yes' }],
+    })
     expect(r.success).toBe(false)
   })
 })

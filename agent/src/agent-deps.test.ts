@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { buildCollectDeps, buildHostnamesByPort, type DockerLike } from './agent-deps.js'
+import { buildCollectDeps, buildHostnamesByPort, buildTlsByHostname, type DockerLike } from './agent-deps.js'
 import type { AgentConfig } from './config.js'
 import type { FetchLike, OnBoxRequestLike } from './probe.js'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
@@ -31,10 +31,11 @@ const noContainers: DockerLike = { listContainers: async () => [] }
 // buildCollectDeps/buildHostnamesByPort into their own side-effect-free
 // module is what makes these assertions possible at all.
 describe('buildCollectDeps', () => {
-  it('wires onBoxProbing as a real object with both functions -- fix round 2: this used to be two separate OPTIONAL keys, either deletable without a type error', () => {
+  it('wires onBoxProbing as a real object with all three functions -- fix round 2: hostnamesByPort/probeOnBoxHostname used to be two separate OPTIONAL keys, either deletable without a type error; Task 5 adds tlsByHostname as a third REQUIRED member of the same object, not a fourth independently-optional field', () => {
     const deps = buildCollectDeps(makeConfig(), noContainers)
     expect(deps.onBoxProbing).not.toBeNull()
     expect(deps.onBoxProbing!.hostnamesByPort).toBeTypeOf('function')
+    expect(deps.onBoxProbing!.tlsByHostname).toBeTypeOf('function')
     expect(deps.onBoxProbing!.probeOnBoxHostname).toBeTypeOf('function')
   })
 
@@ -153,5 +154,43 @@ describe('buildHostnamesByPort', () => {
     expect(byPort).toBeNull()
     expect(warn).toHaveLength(1)
     expect(String(warn[0]![0])).toContain('vhost directory unreadable')
+  })
+})
+
+describe('buildTlsByHostname', () => {
+  it('discovers the TLS bit per hostname when the vhost directory is reachable', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agent-deps-tls-'))
+    try {
+      await mkdir(join(root, 'enabled'))
+      await writeFile(join(root, 'enabled', 'a.conf'), 'server { listen 443 ssl; server_name found.example.invalid; }')
+      const tls = await buildTlsByHostname(join(root, 'enabled'))()
+      expect(tls?.get('found.example.invalid')).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('returns null, never an empty map, when the vhost directory cannot be read', async () => {
+    const tls = await buildTlsByHostname('/definitely/does/not/exist/on/this/machine')()
+    expect(tls).toBeNull()
+  })
+})
+
+describe('buildCollectDeps wires tlsByHostname through to real vhost data', () => {
+  it('genuinely reads the same vhost directory buildHostnamesByPort does, not a stub', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agent-deps-wired-tls-'))
+    try {
+      await mkdir(join(root, 'enabled'))
+      await writeFile(
+        join(root, 'enabled', 'a.conf'),
+        'server { listen 443 ssl; server_name wired.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }',
+      )
+      const deps = buildCollectDeps(makeConfig({ vhostDir: join(root, 'enabled') }), noContainers)
+      const [byPort, tls] = await Promise.all([deps.onBoxProbing!.hostnamesByPort(), deps.onBoxProbing!.tlsByHostname()])
+      expect(byPort?.get(8081)).toEqual(['wired.example.invalid'])
+      expect(tls?.get('wired.example.invalid')).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

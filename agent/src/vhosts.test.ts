@@ -3,6 +3,8 @@ import {
   parseVhost,
   parseServerBlocks,
   discoverHostnamesByPort,
+  discoverTlsByHostname,
+  discoverTlsFromDir,
   parseUpstreams,
   readVhostDir,
   nodeVhostFs,
@@ -376,6 +378,78 @@ describe('discoverHostnamesFromDir', () => {
       readFile: async () => '',
     })
     expect(byPort).toBeNull()
+  })
+})
+
+describe('discoverTlsByHostname', () => {
+  it('maps a hostname to true when its server block listens for TLS', () => {
+    const tls = discoverTlsByHostname([{ text: VHOST }])
+    expect(tls.get('alpha.example.invalid')).toBe(true)
+    expect(tls.get('www.alpha.example.invalid')).toBe(true)
+  })
+
+  it('maps a hostname to false when its server block does not listen for TLS', () => {
+    const tls = discoverTlsByHostname([
+      { text: 'server { listen 80; server_name plain.example.invalid; location / { proxy_pass http://127.0.0.1:8090; } }' },
+    ])
+    expect(tls.get('plain.example.invalid')).toBe(false)
+  })
+
+  // Deliberately unlike discoverHostnamesByPort: a vhost that listens for
+  // TLS but proxies nowhere still belongs in this map -- spec §7's finding
+  // (three TLS vhosts with no certificate) says nothing about whether they
+  // also proxy anywhere, and discoverHostnamesByPort would drop this vhost
+  // entirely for having no resolvable upstream.
+  it('includes a hostname that listens for TLS but resolves to no upstream at all', () => {
+    const tls = discoverTlsByHostname([{ text: 'server { listen 443 ssl; server_name beta.example.invalid; }' }])
+    expect(tls.get('beta.example.invalid')).toBe(true)
+    expect(discoverHostnamesByPort([{ text: 'server { listen 443 ssl; server_name beta.example.invalid; }' }]).size).toBe(0)
+  })
+
+  it('has no entry at all for a hostname never declared anywhere', () => {
+    const tls = discoverTlsByHostname([{ text: VHOST }])
+    expect(tls.has('nowhere.example.invalid')).toBe(false)
+  })
+})
+
+describe('discoverTlsFromDir', () => {
+  it('discovers the TLS bit per hostname when the directory is reachable', async () => {
+    const tls = await discoverTlsFromDir('/enabled', {
+      readdir: async () => ['a.conf'],
+      readFile: async () => 'server { listen 443 ssl; server_name found.example.invalid; }',
+    })
+    expect(tls?.get('found.example.invalid')).toBe(true)
+  })
+
+  it('reports an empty map (not null) when the directory can be listed but genuinely holds no vhosts', async () => {
+    const tls = await discoverTlsFromDir('/enabled', { readdir: async () => [], readFile: async () => '' })
+    expect(tls).toEqual(new Map())
+  })
+
+  // The discriminating case: collapsing "unreadable" into "empty" here would
+  // render every TLS-configured hostname on the host as plain HTTP -- the
+  // same false claim discoverHostnamesFromDir's null return exists to
+  // prevent, one axis over.
+  it('returns null, not an empty map, when the directory cannot be read at all', async () => {
+    const tls = await discoverTlsFromDir('/enabled', {
+      readdir: async () => {
+        throw new Error('EACCES')
+      },
+      readFile: async () => '',
+    })
+    expect(tls).toBeNull()
+  })
+
+  it('reads the directory listing exactly ONCE -- no separate reachability check before it', async () => {
+    let readdirCalls = 0
+    await discoverTlsFromDir('/enabled', {
+      readdir: async () => {
+        readdirCalls++
+        return []
+      },
+      readFile: async () => '',
+    })
+    expect(readdirCalls).toBe(1)
   })
 })
 
