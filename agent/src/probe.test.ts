@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { createServer } from 'node:http'
-import { createServer as createNetServer } from 'node:net'
+import { createServer as createNetServer, Socket } from 'node:net'
 import {
   worstOf,
   probeUrl,
@@ -10,6 +10,16 @@ import {
   type FetchLike,
   type OnBoxRequestLike,
 } from './probe.js'
+
+// `_getActiveHandles` is a real, long-standing Node internal (not in
+// @types/node) used here for exactly what it's for: detecting handle
+// leaks in a test. Narrowly typed rather than cast through `any`.
+type ProcessWithActiveHandles = typeof process & { _getActiveHandles?: () => unknown[] }
+
+function countActiveSockets(): number {
+  const handles = (process as ProcessWithActiveHandles)._getActiveHandles?.() ?? []
+  return handles.filter((h) => h instanceof Socket).length
+}
 
 /** A fetch stand-in that answers with a fixed status and records what it was called with. */
 function respondWith(status: number): FetchLike & { calls: string[] } {
@@ -209,12 +219,14 @@ describe('on-box probing', () => {
     expect(r.status).toBeNull()
   })
 
-  // Fix round 2's second Critical: an UNMAPPED port (hostname === null) has
-  // no vhost vouching that it is loopback-bound or HTTP-shaped at all --
-  // unlike a mapped one, whose port came from a vhost's own proxy_pass.
-  // A failure there is therefore not-probed (no opinion), never down,
-  // because we had no standing to expect an HTTP answer in the first
-  // place. A success still counts as real evidence.
+  // Fix round 2's second Critical, settled by spec §3.1 (commit 875e78d,
+  // fix round 3): an UNMAPPED port (hostname === null) has no vhost
+  // vouching that it is loopback-bound, HTTP-shaped, or THIS SYSTEM'S
+  // user-facing surface at all -- unlike a mapped one, whose port came
+  // from a vhost's own proxy_pass. For an unmapped port, ONLY `answering`
+  // counts; every other outcome -- a transport failure, a 5xx, a redirect,
+  // anything short of a clean answer -- is `not-probed`, never anything
+  // that could redden a row.
   it('reports not-probed, never down, when a transport failure hits an UNMAPPED (null-hostname) port', async () => {
     const r = await probeHostnameOnBox(null, 8081, async () => {
       throw new Error('ECONNREFUSED')
@@ -223,8 +235,37 @@ describe('on-box probing', () => {
     expect(r.status).toBeNull()
   })
 
-  it('still counts a SUCCESS on an unmapped port as real evidence, classified the ordinary way', async () => {
+  it('still counts a clean SUCCESS on an unmapped port as real evidence, classified the ordinary way', async () => {
     const r = await probeHostnameOnBox(null, 8081, async () => ({ status: 200 }))
+    expect(r.outcome).toBe('answering')
+  })
+
+  // The earlier ("looser") draft of the spec would have let this redden a
+  // row: an unmapped port answering with a real 5xx still isn't evidence
+  // the SYSTEM is down, because nothing ever vouched that port was this
+  // system's user-facing surface in the first place -- a metrics exporter
+  // or internal API returning 500 there is ordinary, not an outage.
+  it('reports not-probed, NOT down, for a 5xx from an UNMAPPED port -- an unsuccessful answer counts the same as a failure here', async () => {
+    const r = await probeHostnameOnBox(null, 8081, async () => ({ status: 500 }))
+    expect(r.outcome).toBe('not-probed')
+    // The real status is still reported: we saw it, even though it does
+    // not count as evidence for THIS system's health.
+    expect(r.status).toBe(500)
+  })
+
+  it('reports not-probed for a 404 or a 502 from an UNMAPPED port too -- only answering counts, nothing else', async () => {
+    // 404 classifies as `answering-oddly`, not `answering` -- downgraded.
+    const notFound = await probeHostnameOnBox(null, 8081, async () => ({ status: 404 }))
+    expect(notFound.outcome).toBe('not-probed')
+    // 502 classifies as `proxy-no-upstream`, not `answering` -- downgraded
+    // too, even though there is no proxy on this axis to have emitted it
+    // (see probeHostnameOnBox's docstring on that permissible imprecision).
+    const badGateway = await probeHostnameOnBox(null, 8081, async () => ({ status: 502 }))
+    expect(badGateway.outcome).toBe('not-probed')
+  })
+
+  it('still counts a 3xx redirect from an UNMAPPED port as answering -- classifyHttpStatus already treats a redirect as the app working, and that rule does not change here', async () => {
+    const r = await probeHostnameOnBox(null, 8081, async () => ({ status: 302 }))
     expect(r.outcome).toBe('answering')
   })
 
@@ -237,6 +278,18 @@ describe('on-box probing', () => {
     const r = await probeHostnameOnBox('alpha.example.invalid', 8081, neverReplies, 50)
     expect(r.outcome).toBe('not-answering')
     expect(Date.now() - startedAt).toBeLessThan(2_000)
+  })
+
+  // probeUrl (above) has this same test; probeHostnameOnBox never did,
+  // despite being the same shape one function below it.
+  it('leaves no pending timer behind after a fast success', async () => {
+    const spy = vi.spyOn(globalThis, 'clearTimeout')
+    try {
+      await probeHostnameOnBox('alpha.example.invalid', 8081, async () => ({ status: 200 }), 30_000)
+      expect(spy).toHaveBeenCalled()
+    } finally {
+      spy.mockRestore()
+    }
   })
 })
 
@@ -313,6 +366,64 @@ describe('the real on-box transport (httpOnBoxRequest), against real listeners',
       if (address === null || typeof address === 'string') throw new Error('expected a real TCP address')
       const r = await probeHostnameOnBox(null, address.port, httpOnBoxRequest, 1_000)
       expect(r.outcome).toBe('not-probed')
+    } finally {
+      server.close()
+    }
+  })
+
+  // Fix round 3: spec §9 requires a distinct User-Agent so this traffic is
+  // recognisable in the access logs of applications belonging to OTHER
+  // businesses on this host -- unattributable `GET /` traffic every 30
+  // seconds must not read as suspicious.
+  it('identifies itself with a distinct User-Agent, on every request regardless of hostname', async () => {
+    const seenAgents: Array<string | undefined> = []
+    const server = createServer((req, res) => {
+      seenAgents.push(req.headers['user-agent'])
+      res.writeHead(200)
+      res.end()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    try {
+      const address = server.address()
+      if (address === null || typeof address === 'string') throw new Error('expected a real TCP address')
+      await probeHostnameOnBox('alpha.example.invalid', address.port, httpOnBoxRequest)
+      await probeHostnameOnBox(null, address.port, httpOnBoxRequest)
+      expect(seenAgents).toEqual(['bevora-ops-probe/1', 'bevora-ops-probe/1'])
+    } finally {
+      server.close()
+    }
+  })
+
+  // Fix round 3: a seam review deleted `res.resume()` and measured 120
+  // probes -> 240 active sockets against ~flat with it present. This test
+  // asserts that property directly rather than trusting the comment above
+  // `httpOnBoxRequest` -- see task-4-report.md for the exact mutation and
+  // observed numbers.
+  it('does not leak a socket per probe -- the response body is drained, not left unread', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200)
+      res.end('ok')
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    try {
+      const address = server.address()
+      if (address === null || typeof address === 'string') throw new Error('expected a real TCP address')
+      // One warm-up probe so the first connection's own setup (real, not a
+      // leak) doesn't pollute the baseline measurement below.
+      await probeHostnameOnBox('warmup.example.invalid', address.port, httpOnBoxRequest)
+      await new Promise((r) => setTimeout(r, 50))
+      const before = countActiveSockets()
+      const N = 20
+      for (let i = 0; i < N; i++) {
+        await probeHostnameOnBox('alpha.example.invalid', address.port, httpOnBoxRequest)
+      }
+      // Give sockets a moment to actually close after each response ends.
+      await new Promise((r) => setTimeout(r, 150))
+      const after = countActiveSockets()
+      // With the drain this stays flat (typically 0 growth); without it,
+      // one socket leaks per probe, so growth tracks N. A bound well below
+      // N discriminates cleanly either way.
+      expect(after - before).toBeLessThan(N / 2)
     } finally {
       server.close()
     }

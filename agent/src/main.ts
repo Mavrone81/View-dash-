@@ -16,9 +16,14 @@ import { buildCollectDeps } from './agent-deps.js'
 
 const cfg = loadConfig()
 const docker = new Docker()
-// The agent's only network connection: it DIALS OUT to the dashboard and
-// holds that connection open across ticks. Nothing in this file, or in
-// AgentTransport, ever binds a listening socket on this host.
+// This agent DIALS OUT only -- to the dashboard here (held open across
+// ticks), and, every tick, to `127.0.0.1:<published port>` for each
+// system's on-box probe (see agent/src/agent-deps.ts/probe.ts). Nothing in
+// this file, AgentTransport, or the on-box probe ever binds a LISTENING
+// socket on this host. (This comment used to say the dashboard connection
+// was the agent's ONLY network connection -- true before this task added
+// on-box probing, false now; corrected rather than left to mislead an
+// auditor reasoning about this host's egress.)
 const transport = new AgentTransport(cfg)
 
 async function tick(): Promise<void> {

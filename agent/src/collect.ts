@@ -185,10 +185,25 @@ export async function collectSnapshot(deps: CollectDeps): Promise<FleetSnapshot>
                 // probeHostnameOnBox always does on its own) is a REAL probe
                 // attempt that failed -- evidence about the customer's
                 // system, same as any other unreachable hostname -- so it
-                // stays `down`-shaped via the ordinary `not-answering`
-                // outcome, not the `unknown` used below for a fault in our
-                // own machinery.
-                (): { outcome: ProbeOutcome; status: number | null } => ({ outcome: 'not-answering', status: null }),
+                // is NOT the `unknown` used below for a fault in our own
+                // machinery.
+                //
+                // It must still respect the unvouched-port rule
+                // (agent/src/probe.ts's `probeHostnameOnBox`, spec §3.1):
+                // `t.hostname === null` means no vhost ever vouched this
+                // port speaks HTTP, so a failure there is `not-probed`,
+                // never `down`-shaped `not-answering`. `probeHostnameOnBox`
+                // itself never rejects (it always resolves with a failure
+                // outcome), so this branch is not reachable through
+                // today's wiring -- but the rule would otherwise live in
+                // two places with only one of them knowing it, and the
+                // next thing to wrap this transport (Task 5 or 6) is
+                // exactly the kind of change that wakes an inconsistency
+                // like this one.
+                (): { outcome: ProbeOutcome; status: number | null } => ({
+                  outcome: t.hostname === null ? 'not-probed' : 'not-answering',
+                  status: null,
+                }),
               ),
             ),
           )

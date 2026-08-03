@@ -180,6 +180,19 @@ describe('toSummary', () => {
     expect(out.publishedPorts).toEqual([8080])
   })
 
+  // Its own case, on its own port: the only other place '::' appeared
+  // (the IPv4/IPv6 dedup test above) always paired it with a '0.0.0.0' row
+  // for the SAME port, so removing '::' from LOOPBACK_REACHABLE_IPS entirely
+  // would still leave that other test green (0.0.0.0 alone already keeps
+  // the port). This is the case that actually needs '::' to be reachable.
+  it('keeps a port bound only to :: (all interfaces, IPv6), with no accompanying 0.0.0.0 row', () => {
+    const out = toSummary({
+      ...raw('Up 2 hours'),
+      Ports: [{ IP: '::', PrivatePort: 80, PublicPort: 8080, Type: 'tcp' }],
+    })
+    expect(out.publishedPorts).toEqual([8080])
+  })
+
   it('keeps a tcp port with no IP reported at all, the same as 0.0.0.0', () => {
     const out = toSummary({
       ...raw('Up 2 hours'),

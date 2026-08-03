@@ -273,6 +273,17 @@ describe('collectSnapshot', () => {
       // vouching it is HTTP-shaped at all, so a failed probe of it is not
       // evidence of anything -- probeOutcomeToHealth('not-probed') is
       // null, which worstOf treats as "no opinion".
+      //
+      // Corrected in fix round 3, IN MY FAVOUR, by the reviewer: I had
+      // labelled this a pinning test, not a discriminator. It is a real
+      // one. `const h = probeOutcomeToHealth(r.outcome) ?? 'down'` (the
+      // exact idiom `probeUrl` uses 80-odd lines away in probe.ts, for the
+      // exact same "probeOutcomeToHealth's null case is unreachable in
+      // practice" reasoning) is an entirely plausible mutation of the fold
+      // loop below, and THIS is the only test in this file that kills it
+      // -- verified: mutating the loop to that idiom turns this row `down`
+      // and fails only this assertion; every other test in the file stays
+      // green.
       const snap = await collectSnapshot(
         deps({
           listContainers: async () => [
@@ -410,6 +421,33 @@ describe('collectSnapshot', () => {
         }),
       )
       expect(snap.systems[0]!.health).toBe('down')
+    })
+
+    // Fix round 3, Important 3: the unvouched-port rule (a failure on a
+    // null-hostname/unmapped target is not-probed, never down -- spec
+    // §3.1) lives in `probeHostnameOnBox`, which never actually rejects
+    // its promise. But this `.catch()` fallback is a SECOND place the same
+    // rule could be stated, and it used to hardcode `not-answering`
+    // regardless of `t.hostname` -- contradicting probe.ts the moment
+    // anything ever wraps this transport in a way that rejects (a real
+    // possibility once Task 5/6 touches it). Not reachable through today's
+    // wiring, but worth pinning directly rather than leaving the rule
+    // right in one place and silently wrong in the other.
+    it('a rejected (not just resolved-failed) probe of an UNMAPPED port still respects the unvouched-port rule: not-probed, never down', async () => {
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [9999] },
+          ],
+          onBoxProbing: {
+            hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
+            probeOnBoxHostname: async () => {
+              throw new Error('boom')
+            },
+          },
+        }),
+      )
+      expect(snap.systems[0]!.health).toBe('healthy')
     })
 
     it('never lets the whole snapshot fail when a probe function throws synchronously instead of rejecting, and never takes down another system with it', async () => {

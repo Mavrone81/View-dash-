@@ -52,14 +52,14 @@ export function worstOf(containerHealth: HealthState, probed: HealthState | null
 
 /**
  * The subset of `fetch` this module uses, so a test needs no network and no
- * global patching. `headers` is optional because only the on-box probe
- * needs one (an explicit `Host`, required now that it addresses a container
- * port directly rather than a hostname -- see `probeHostnameOnBox`); the
- * external probe in `probeUrl` never sets it.
+ * global patching. Used only by `probeUrl` (the external axis) -- the
+ * on-box axis has its own transport contract, `OnBoxRequestLike`, because
+ * `fetch` cannot send the `Host` header that axis needs (see
+ * `OnBoxRequestLike`'s docstring).
  */
 export type FetchLike = (
   url: string,
-  init: { signal: AbortSignal; redirect: 'manual'; headers?: Record<string, string> },
+  init: { signal: AbortSignal; redirect: 'manual' },
 ) => Promise<{ status: number }>
 
 export const DEFAULT_PROBE_TIMEOUT_MS = 5_000
@@ -229,7 +229,25 @@ export type OnBoxRequestLike = (
  *
  * The response body is drained (`res.resume()`) and discarded: this probe
  * only ever needs the status code, and leaving a response unconsumed would
- * hold the underlying socket open.
+ * hold the underlying socket open -- measured, not assumed: a seam review
+ * deleted this one line and ran 120 probes against a real listener, and
+ * active sockets went from roughly flat to 240. On the monitored host that
+ * is ~42 targets x 2 sockets x 120 ticks/hour -- file-descriptor
+ * exhaustion in this agent, and accumulating half-read responses inside
+ * nine businesses' applications. See `probe.test.ts`'s "does not leak a
+ * socket per probe" test, which asserts this stays bounded across many
+ * requests rather than trusting the comment.
+ *
+ * Identifies itself with a distinct `User-Agent` (spec §9): this traffic
+ * lands in the access logs of applications belonging to OTHER businesses
+ * on this host -- three of the twenty stacks measured live belong to one
+ * that is not the operator running this agent -- and an unattributable
+ * `GET /` every 30 seconds must not read as unexplained or suspicious
+ * traffic. This got worse with fix round 2's unmapped-port probing: a
+ * database, cache or line-protocol service on an unmapped port now logs a
+ * protocol error from this agent roughly 2,900 times a day, and a
+ * recognisable source is the least this agent owes the applications it
+ * dials without their operator's direct involvement.
  *
  * Exported, and NOT defaulted as `probeHostnameOnBox`'s transport
  * parameter, on purpose: an omitted argument is invisible at the call
@@ -246,10 +264,14 @@ export function httpOnBoxRequest(port: number, hostname: string | null, signal: 
         port,
         path: '/',
         method: 'GET',
-        // Omitted entirely (not present-with-undefined) when there is no
-        // hostname to claim -- node:http would otherwise send a literal
-        // "Host: null" rather than falling back to its own default.
-        ...(hostname !== null ? { headers: { Host: hostname } } : {}),
+        headers: {
+          'User-Agent': 'bevora-ops-probe/1',
+          // Omitted entirely (not present-with-undefined) when there is
+          // no hostname to claim -- node:http would otherwise send a
+          // literal "Host: null" rather than falling back to its own
+          // default.
+          ...(hostname !== null ? { Host: hostname } : {}),
+        },
         signal,
       },
       (res) => {
@@ -284,21 +306,35 @@ export function httpOnBoxRequest(port: number, hostname: string | null, signal: 
  *
  * `hostname` is `null` for a published port with no vhost mapping at all
  * (see `hostnamesForSystem`) -- fix round 1's explicit call: still probe
- * it, just with no `Host` header, since there is no name to claim. Fix
- * round 2's second Critical narrows what that means on FAILURE: an
- * unmapped port has no evidence (unlike a mapped one, which a vhost's own
- * `proxy_pass` already vouches for) that it is loopback-bound or
- * HTTP-shaped at all -- `agent/src/docker.ts`'s `toPublishedPorts` filters
- * what it can (TCP, loopback-reachable), but cannot know whether the
- * *protocol* on that port is HTTP. A FAILURE there is therefore reported
- * as `not-probed`, never `down`: we had no standing to expect an HTTP
- * answer, so silence is not evidence of anything. A SUCCESS still counts
- * (`classifyHttpStatus` as normal) -- "the app answered" is real evidence,
- * and because `worstOf` can only ever take the WORSE of two states, a
- * healthy outcome here can never wrongly upgrade a row; nothing is lost by
- * still trying. For a KNOWN hostname, a failure stays `not-answering`
- * (`classifyProbeFailure('network')`) exactly as before: a mapped port's
- * vhost is the standing evidence an unmapped one lacks.
+ * it, just with no `Host` header, since there is no name to claim.
+ *
+ * WHAT AN UNMAPPED PORT'S RESULT MEANS, settled by the spec's §3.1 (commit
+ * `875e78d`, fix round 3) after an earlier draft contradicted itself
+ * ("evidence that can only be positive" in the same sentence as "a failure
+ * is not-probed", which are different rules -- the first version of this
+ * function reasonably implemented the looser one, and a 5xx from an
+ * unmapped port could still redden a row, exactly the false red this rule
+ * exists to remove): for an unmapped port, **only `answering` counts**.
+ * Every other outcome -- a failure, a 5xx, a redirect, a 404, anything
+ * that is not a clean answer -- is `not-probed`, never anything else.
+ * `agent/src/docker.ts`'s `toPublishedPorts` filters what it can (TCP,
+ * loopback-reachable), but cannot know whether the *protocol* on that port
+ * is even HTTP, let alone that answering with some status IS this
+ * system's user-facing surface behaving correctly. A published metrics
+ * exporter or internal API returning 500 there is an ordinary state of
+ * affairs, not an outage of the application the row describes -- we never
+ * had grounds to expect an HTTP answer from that port at all, so a good
+ * one is a happy surprise worth recording and anything else is a question
+ * we had no right to ask. Because `worstOf` can only ever take the WORSE
+ * of two states, a healthy (`answering`) outcome here can never wrongly
+ * upgrade a row, so trying still costs nothing.
+ *
+ * For a KNOWN hostname, behaviour is unchanged and ordinary:
+ * `classifyHttpStatus` on a real response, `classifyProbeFailure('network')`
+ * on a failure -- a mapped port's vhost is the standing evidence an
+ * unmapped one lacks, so its full range of outcomes (including
+ * `proxy-no-upstream`, `answering-oddly`, `not-answering`) all apply
+ * normally.
  *
  * No TLS is ever involved on this axis, so every failure here is
  * network-shaped: connection refused (nothing listening on that port), the
@@ -320,7 +356,14 @@ export async function probeHostnameOnBox(
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const { status } = await requestImpl(port, hostname, controller.signal)
-    return { hostname, outcome: classifyHttpStatus(status), status }
+    const outcome = classifyHttpStatus(status)
+    // An unmapped port's evidence can only be positive (spec §3.1,
+    // 875e78d): anything other than a clean `answering` collapses to
+    // `not-probed` here, not just a thrown/rejected failure below.
+    if (hostname === null && outcome !== 'answering') {
+      return { hostname, outcome: 'not-probed', status }
+    }
+    return { hostname, outcome, status }
   } catch {
     return {
       hostname,
