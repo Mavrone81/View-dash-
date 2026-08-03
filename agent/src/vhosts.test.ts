@@ -6,7 +6,6 @@ import {
   parseUpstreams,
   readVhostDir,
   nodeVhostFs,
-  isVhostDirReachable,
   discoverHostnamesFromDir,
 } from './vhosts.js'
 import { mkdtemp, mkdir, writeFile, symlink, readdir, readFile, rm } from 'node:fs/promises'
@@ -334,25 +333,6 @@ describe('reading the vhost directory', () => {
   })
 })
 
-describe('isVhostDirReachable', () => {
-  // readVhostDir returns [] both when the directory holds no vhosts AND
-  // when it cannot be read at all -- these two tests exist so a caller can
-  // tell those apart before believing an empty scan.
-  it('reports true when the directory can be listed, even if it is empty', async () => {
-    expect(await isVhostDirReachable('/enabled', { readdir: async () => [] })).toBe(true)
-  })
-
-  it('reports false when the directory cannot be listed', async () => {
-    expect(
-      await isVhostDirReachable('/enabled', {
-        readdir: async () => {
-          throw new Error('ENOENT')
-        },
-      }),
-    ).toBe(false)
-  })
-})
-
 describe('discoverHostnamesFromDir', () => {
   it('discovers hostnames by port when the directory is reachable', async () => {
     const byPort = await discoverHostnamesFromDir('/enabled', {
@@ -360,6 +340,26 @@ describe('discoverHostnamesFromDir', () => {
       readFile: async () => 'server { server_name found.example.invalid; location / { proxy_pass http://127.0.0.1:8081; } }',
     })
     expect(byPort?.get(8081)).toEqual(['found.example.invalid'])
+  })
+
+  it('reports an empty map (not null) when the directory can be listed but genuinely holds no vhosts', async () => {
+    const byPort = await discoverHostnamesFromDir('/enabled', {
+      readdir: async () => [],
+      readFile: async () => '',
+    })
+    expect(byPort).toEqual(new Map())
+  })
+
+  it('reads the directory listing exactly ONCE -- no separate reachability check before it, which would open a TOCTOU window', async () => {
+    let readdirCalls = 0
+    await discoverHostnamesFromDir('/enabled', {
+      readdir: async () => {
+        readdirCalls++
+        return []
+      },
+      readFile: async () => '',
+    })
+    expect(readdirCalls).toBe(1)
   })
 
   // The discriminating case: a directory that cannot be listed must come

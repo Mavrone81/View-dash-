@@ -49,8 +49,17 @@ export function worstOf(containerHealth: HealthState, probed: HealthState | null
   return RANK[probed] > RANK[containerHealth] ? probed : containerHealth
 }
 
-/** The subset of `fetch` this module uses, so a test needs no network and no global patching. */
-export type FetchLike = (url: string, init: { signal: AbortSignal; redirect: 'manual' }) => Promise<{ status: number }>
+/**
+ * The subset of `fetch` this module uses, so a test needs no network and no
+ * global patching. `headers` is optional because only the on-box probe
+ * needs one (an explicit `Host`, required now that it addresses a container
+ * port directly rather than a hostname -- see `probeHostnameOnBox`); the
+ * external probe in `probeUrl` never sets it.
+ */
+export type FetchLike = (
+  url: string,
+  init: { signal: AbortSignal; redirect: 'manual'; headers?: Record<string, string> },
+) => Promise<{ status: number }>
 
 export const DEFAULT_PROBE_TIMEOUT_MS = 5_000
 
@@ -120,25 +129,112 @@ export async function probeUrl(
   }
 }
 
-export function hostnamesForSystem(publishedPorts: number[], byPort: Map<number, string[]>): string[] {
-  const out: string[] = []
-  for (const p of publishedPorts) out.push(...(byPort.get(p) ?? []))
+/**
+ * A hostname paired with the loopback port that serves it -- or `null` for
+ * the hostname when a published port has no vhost mapping at all (see
+ * `hostnamesForSystem`'s docstring for why that is still worth probing).
+ *
+ * The on-box probe (see `probeHostnameOnBox` below) addresses the container
+ * port directly rather than resolving the hostname -- see the spec's §3.1
+ * correction -- so knowing WHICH port a given hostname belongs to is no
+ * longer optional context, it is the dial target itself.
+ */
+export type HostnameTarget = { hostname: string | null; port: number }
+
+/**
+ * Pairs each of a system's published ports with the hostname(s) the host's
+ * reverse-proxy config maps to that port.
+ *
+ * A published port with NO vhost mapping still yields ONE target, with
+ * `hostname: null`, rather than nothing: fix round 1 asked explicitly
+ * whether a port with no known hostname should still be probed with no
+ * `Host` header, and the call here is yes. "The app is up" is real evidence
+ * worth having for the one case §4 of the spec measured live -- a system
+ * with legitimately no vhost -- and, more importantly, for the transient
+ * gap this whole module exists to cover: a stack whose container just
+ * started publishing a port but whose vhost has not been written yet.
+ * Probing nothing there until a human edits nginx would be the exact
+ * "robust and expendable" property this design is supposed to remove,
+ * reappearing one layer down. `probeHostnameOnBox` sends no `Host` header
+ * at all for a `null` target -- there is no name to claim.
+ *
+ * Deduplicated on the (port, hostname) pair, not just the hostname: the
+ * same pair can appear twice if the same vhost file is reachable under two
+ * different names in the enabled-vhost directory (a stray duplicate
+ * symlink is the realistic cause), and probing it twice doubles real
+ * requests against a production root for zero new information. A
+ * `Map`/`Set` cannot be used directly to dedupe a compound key, so an
+ * explicit composite string does the job. A `null`-hostname target needs no
+ * such dedupe: there is exactly one per port by construction.
+ */
+export function hostnamesForSystem(publishedPorts: number[], byPort: Map<number, string[]>): HostnameTarget[] {
+  const seen = new Set<string>()
+  const out: HostnameTarget[] = []
+  for (const p of publishedPorts) {
+    const hostnames = byPort.get(p) ?? []
+    if (hostnames.length === 0) {
+      out.push({ hostname: null, port: p })
+      continue
+    }
+    for (const h of hostnames) {
+      const key = `${p}:${h}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push({ hostname: h, port: p })
+    }
+  }
   return out
 }
 
-/** Node's TLS errors all carry a code beginning ERR_TLS_, or ERR_SSL_ from OpenSSL. */
-function isTlsError(err: unknown): boolean {
-  const code = (err as { code?: unknown })?.code
-  return typeof code === 'string' && (code.startsWith('ERR_TLS_') || code.startsWith('ERR_SSL_'))
-}
-
 /**
- * Probes one hostname from ON the monitored host, through loopback.
+ * Probes one hostname from ON the monitored host: `http://127.0.0.1:<port>/`
+ * with an explicit `Host: <hostname>` header, per the spec's §3.1
+ * correction (commit `8387ae6`).
  *
- * This proves the application and the proxy are working. It cannot prove
- * DNS, routing or the certificate a real visitor is handed -- that is the
- * external probe's job, and the disagreement between the two is what
- * locates a fault.
+ * This is NOT `https://<hostname>/`, which is what this function originally
+ * did and which a seam review caught as broken in two ways at once:
+ *
+ *  - It resolved through PUBLIC DNS and traversed the exact path a real
+ *    visitor takes -- the reverse proxy, TLS, egress, DNS -- so one egress
+ *    rule or resolver hiccup would redden every row on the board while
+ *    every application was fine, AND it meant this probe and the external
+ *    one always measured the same path and could never disagree, which
+ *    defeats the entire two-probe design (see spec §3's table: the
+ *    "application fine, external broken" row is the reason this design
+ *    exists at all).
+ *  - It hardcoded `https://`, so a vhost serving plain HTTP -- a stack
+ *    deployed before its certificate exists, precisely the "probed the day
+ *    it deploys" case this module advertises -- got a certificate mismatch
+ *    from whichever server block happens to own 443, and rendered red
+ *    while working perfectly.
+ *
+ * Addressing the port directly dissolves both: there is no DNS, no egress,
+ * no TLS, and no reverse proxy anywhere in this request's path, so there is
+ * nothing to guess a scheme for and nothing shared with the external
+ * probe's path. That also means a 502/504 can never legitimately arise on
+ * THIS axis -- there is no proxy here to emit one. If a container's own
+ * application happens to return a raw 502 for its own reasons,
+ * `classifyHttpStatus` (shared with the external probe, deliberately -- see
+ * `probeUrl`) will still label it `proxy-no-upstream`, which is a
+ * permissible imprecision rather than something to special-case: one rule
+ * in the tree matters more than perfect per-axis wording for an edge case
+ * with no evidence it occurs.
+ *
+ * The `Host` header is required, not cosmetic, WHEN a hostname is known: a
+ * name-based vhost may redirect or refuse a request that arrives without
+ * the name it expects. `hostname` is `null` for a published port with no
+ * vhost mapping at all (see `hostnamesForSystem`) -- fix round 1's explicit
+ * call: still probe it, just with no `Host` header, since there is no name
+ * to claim. "The app answered on its port" is real, if weaker, evidence,
+ * and it is the only evidence available in the gap between a stack's first
+ * deploy and its vhost being written -- refusing to probe there would
+ * reintroduce, for that one port, the exact "must wait on a human to edit
+ * config" property this whole module exists to remove.
+ *
+ * No TLS is ever involved on this axis, so every failure here is
+ * network-shaped: connection refused (nothing listening on that port),
+ * a timeout, or the abort below firing. `classifyProbeFailure('network')`
+ * reflects that; there is no TLS branch to route to any more.
  *
  * NEVER throws, for the same reason as `probeUrl`: a probe is a diagnostic
  * running inside the collection loop of an agent watching nine businesses'
@@ -146,24 +242,25 @@ function isTlsError(err: unknown): boolean {
  * reports, not an exception it raises.
  */
 export async function probeHostnameOnBox(
-  hostname: string,
+  hostname: string | null,
+  port: number,
   fetchImpl: FetchLike,
   timeoutMs: number = DEFAULT_PROBE_TIMEOUT_MS,
-): Promise<{ hostname: string; outcome: ProbeOutcome; status: number | null }> {
+): Promise<{ hostname: string | null; outcome: ProbeOutcome; status: number | null }> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const { status } = await fetchImpl(`https://${hostname}/`, {
+    const { status } = await fetchImpl(`http://127.0.0.1:${port}/`, {
       signal: controller.signal,
       redirect: 'manual',
+      // Omitted entirely (not present-with-undefined) when there is no
+      // hostname to claim -- exactOptionalPropertyTypes forbids the latter,
+      // and fetch would otherwise send a literal "Host: null".
+      ...(hostname !== null ? { headers: { Host: hostname } } : {}),
     })
     return { hostname, outcome: classifyHttpStatus(status), status }
-  } catch (err) {
-    return {
-      hostname,
-      outcome: classifyProbeFailure(isTlsError(err) ? 'tls' : 'network'),
-      status: null,
-    }
+  } catch {
+    return { hostname, outcome: classifyProbeFailure('network'), status: null }
   } finally {
     clearTimeout(timer)
   }

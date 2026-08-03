@@ -349,7 +349,7 @@ export type VhostFs = {
 /**
  * The production `VhostFs`, wired directly to `node:fs/promises`. This is
  * the exact object handed to `readVhostDir` on a real host -- see
- * `agent/src/main.ts` -- and it is deliberately NOT
+ * `agent/src/agent-deps.ts` -- and it is deliberately NOT
  * `readdir(dir, { withFileTypes: true })` filtered on `dirent.isFile()`,
  * which looks like the more careful, "only list real files" version.
  *
@@ -375,6 +375,25 @@ export const nodeVhostFs: VhostFs = {
 }
 
 /**
+ * Reads the text of every name in `names`, resolved against `dir`, skipping
+ * (not failing on) any single one that cannot be read. Shared by
+ * `readVhostDir` and `discoverHostnamesFromDir`, both of which need this
+ * exact "read what you can, drop what you can't" loop after their own,
+ * DIFFERENT handling of the initial `readdir`.
+ */
+async function readNamedFiles(dir: string, names: string[], fs: VhostFs): Promise<Array<{ text: string }>> {
+  const out: Array<{ text: string }> = []
+  for (const n of names) {
+    try {
+      out.push({ text: await fs.readFile(join(dir, n)) })
+    } catch {
+      // One unreadable file must not blind the scan to the rest.
+    }
+  }
+  return out
+}
+
+/**
  * Reads every vhost file in a directory.
  *
  * `readFile` follows symlinks; this is load-bearing rather than incidental.
@@ -395,8 +414,9 @@ export const nodeVhostFs: VhostFs = {
  * gap: a host with genuinely zero vhosts and a misconfigured probe path
  * look identical here. Whatever calls this must not treat an empty result
  * as "this system serves nothing" without also checking that the
- * directory itself is reachable -- otherwise this reintroduces, one layer
- * up, exactly the silent-empty-scan failure this module exists to prevent.
+ * directory itself is reachable -- see `discoverHostnamesFromDir` below,
+ * which is the composed call that actually makes that distinction, in one
+ * `readdir`, rather than this function plus a second check.
  */
 export async function readVhostDir(dir: string, fs: VhostFs): Promise<Array<{ text: string }>> {
   let names: string[]
@@ -405,56 +425,38 @@ export async function readVhostDir(dir: string, fs: VhostFs): Promise<Array<{ te
   } catch {
     return []
   }
-  const out: Array<{ text: string }> = []
-  for (const n of names) {
-    try {
-      out.push({ text: await fs.readFile(join(dir, n)) })
-    } catch {
-      // One unreadable file must not blind the scan to the rest.
-    }
-  }
-  return out
+  return readNamedFiles(dir, names, fs)
 }
 
 /**
- * Checks whether the vhost directory can be listed at all, WITHOUT reading
- * any file inside it.
- *
- * `readVhostDir` cannot make this distinction on its own -- see its
- * docstring immediately above -- so a `[]` from `readVhostDir` is
- * ambiguous between "this host genuinely has zero vhosts" and "the
- * configured path is wrong, or unreadable, and nothing was actually
- * scanned". Anything about to treat an empty `readVhostDir` result as "no
- * HTTP surface" MUST call this first: `false` means the empty result is a
- * diagnostic failure, not a fact about the host, and must not be reported
- * as though it were -- see `agent/src/main.ts`'s `hostnamesByPort`.
- */
-export async function isVhostDirReachable(dir: string, fs: Pick<VhostFs, 'readdir'>): Promise<boolean> {
-  try {
-    await fs.readdir(dir)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/**
- * Composes `isVhostDirReachable` + `readVhostDir` + `discoverHostnamesByPort`
+ * Composes a directory listing + file reads + `discoverHostnamesByPort`
  * into the single call `agent/src/collect.ts`'s `CollectDeps.hostnamesByPort`
  * needs -- this is the actual seam that joins vhost discovery to the
- * collection loop; see `agent/src/main.ts`.
+ * collection loop; see `agent/src/agent-deps.ts`.
  *
  * Returns `null`, NOT an empty `Map`, when the directory itself could not be
  * listed. Collapsing "unreadable" into "empty" here would let a
  * misconfigured or temporarily-inaccessible vhost path render as "no system
  * on this host has an HTTP surface" -- a false claim about every system on
- * the board, not merely a gap in one collection tick. See
- * `isVhostDirReachable` and `readVhostDir`'s docstrings for the underlying
- * ambiguity this composes around.
+ * the board, not merely a gap in one collection tick.
+ *
+ * Deliberately does ONE `readdir`, not `readVhostDir`'s own `readdir` after
+ * a separate reachability check: an earlier version of this function called
+ * a standalone `isVhostDirReachable` and then `readVhostDir`, which issued
+ * two `readdir` syscalls with a real (if small) TOCTOU window between
+ * them -- the directory could vanish or reappear between the two calls,
+ * making the "reachable" answer stale by the time the second call ran.
+ * Reading the names once and branching on whether THAT read succeeded
+ * removes the window entirely, rather than narrowing it.
  */
 export async function discoverHostnamesFromDir(dir: string, fs: VhostFs): Promise<Map<number, string[]> | null> {
-  if (!(await isVhostDirReachable(dir, fs))) return null
-  const files = await readVhostDir(dir, fs)
+  let names: string[]
+  try {
+    names = await fs.readdir(dir)
+  } catch {
+    return null
+  }
+  const files = await readNamedFiles(dir, names, fs)
   return discoverHostnamesByPort(files)
 }
 

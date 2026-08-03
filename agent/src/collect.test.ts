@@ -214,16 +214,16 @@ describe('collectSnapshot', () => {
       expect(alpha.health).not.toBe('healthy')
     })
 
-    it('leaves a system whose published ports match no vhost exactly as its containers describe it, and never probes', async () => {
-      // A system with no vhost legitimately has no HTTP surface (a worker,
-      // a database, a background job) -- this must not be reported as a
-      // failure, and hostnamesForSystem returning [] must not lead to a
-      // probe call at all.
+    it('never probes a system that publishes no port at all -- there is nothing to dial', async () => {
+      // A system with no published port legitimately has no HTTP surface
+      // (a worker, a database, a background job): this must not be
+      // reported as a failure, and there is no port for the on-box probe
+      // to address in the first place.
       const probeOnBoxHostname = vi.fn()
       const snap = await collectSnapshot(
         deps({
           listContainers: async () => [
-            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [9999] },
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [] },
           ],
           hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
           probeOnBoxHostname,
@@ -231,6 +231,29 @@ describe('collectSnapshot', () => {
       )
       expect(snap.systems[0]!.health).toBe('healthy')
       expect(probeOnBoxHostname).not.toHaveBeenCalled()
+    })
+
+    it('still probes a published port that matches no vhost, with a null hostname -- fix round 1\'s explicit call, not a guess', async () => {
+      // A published port with no vhost mapping is NOT the same as no HTTP
+      // surface at all: the container is up and Docker has published a
+      // port, but nobody (yet) wrote the nginx vhost for it -- exactly the
+      // gap between a stack's first deploy and its vhost being written.
+      // "The app answered on its port" is real evidence worth having there.
+      const calls: Array<{ hostname: string | null; port: number }> = []
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [9999] },
+          ],
+          hostnamesByPort: async () => new Map([[8081, ['other.example.invalid']]]),
+          probeOnBoxHostname: async (hostname, port) => {
+            calls.push({ hostname, port })
+            return { outcome: 'answering' as const, status: 200 }
+          },
+        }),
+      )
+      expect(calls).toEqual([{ hostname: null, port: 9999 }])
+      expect(snap.systems[0]!.health).toBe('healthy')
     })
 
     it('does not downgrade anything when the vhost directory could not be read this tick', async () => {
@@ -265,6 +288,26 @@ describe('collectSnapshot', () => {
       expect(probeOnBoxHostname).not.toHaveBeenCalled()
     })
 
+    it('never lets the whole snapshot fail when hostnamesByPort() itself rejects, unlike every other on-box call which is per-system', async () => {
+      // This call sits OUTSIDE the per-system Promise.all (it runs once,
+      // before any system is processed), so it needs its own guard: without
+      // one, a rejection here would fail collectSnapshot entirely --
+      // container state, sha, and URL-probe results for EVERY system, not
+      // just the on-box axis of one.
+      const snap = await collectSnapshot(
+        deps({
+          listContainers: async () => [
+            { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081] },
+          ],
+          hostnamesByPort: async () => {
+            throw new Error('vhost read exploded')
+          },
+        }),
+      )
+      expect(snap.systems).toHaveLength(1)
+      expect(snap.systems[0]!.health).toBe('healthy')
+    })
+
     it('probes only the hostnames that resolve from THIS system\'s own published ports, never another system\'s', async () => {
       const probed: string[] = []
       const byPort = new Map([
@@ -278,8 +321,8 @@ describe('collectSnapshot', () => {
             { names: ['/b'], project: 'beta', state: 'running', health: null, publishedPorts: [9001] },
           ],
           hostnamesByPort: async () => byPort,
-          probeOnBoxHostname: async (hostname: string) => {
-            probed.push(hostname)
+          probeOnBoxHostname: async (hostname) => {
+            probed.push(hostname ?? '')
             return { outcome: 'answering' as const, status: 200 }
           },
         }),
@@ -299,10 +342,11 @@ describe('collectSnapshot', () => {
             { names: ['/a'], project: 'alpha', state: 'running', health: null, publishedPorts: [8081, 9001] },
           ],
           hostnamesByPort: async () => byPort,
-          probeOnBoxHostname: async (hostname: string) => {
-            events.push(`start:${hostname}`)
-            await new Promise((r) => setTimeout(r, hostname.startsWith('slow') ? 80 : 5))
-            events.push(`end:${hostname}`)
+          probeOnBoxHostname: async (hostname) => {
+            const h = hostname ?? ''
+            events.push(`start:${h}`)
+            await new Promise((r) => setTimeout(r, h.startsWith('slow') ? 80 : 5))
+            events.push(`end:${h}`)
             return { outcome: 'answering' as const, status: 200 }
           },
         }),
@@ -335,7 +379,7 @@ describe('collectSnapshot', () => {
       // failing the entire snapshot for every system, not just this one.
       const syncThrow = (() => {
         throw new Error('boom')
-      }) as unknown as (hostname: string) => Promise<{ outcome: ProbeOutcome; status: number | null }>
+      }) as unknown as (hostname: string | null, port: number) => Promise<{ outcome: ProbeOutcome; status: number | null }>
       const snap = await collectSnapshot(
         deps({
           listContainers: async () => [
@@ -347,7 +391,11 @@ describe('collectSnapshot', () => {
         }),
       )
       expect(snap.systems).toHaveLength(2)
-      expect(snap.systems.find((s) => s.key === 'alpha')!.health).toBe('down')
+      // `unknown`, not `down`: this is OUR machinery faulting (a
+      // badly-behaved injected function), not a real probe attempt that
+      // found the customer's system unreachable -- see the `catch` block's
+      // comment in collect.ts for why those two must not read the same.
+      expect(snap.systems.find((s) => s.key === 'alpha')!.health).toBe('unknown')
       // beta has no published ports, so it is never probed at all, and must
       // not be caught in alpha's failure.
       expect(snap.systems.find((s) => s.key === 'beta')!.health).toBe('healthy')

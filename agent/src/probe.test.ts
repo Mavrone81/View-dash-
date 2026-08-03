@@ -118,46 +118,96 @@ describe('probeUrl', () => {
 })
 
 describe('mapping ports to hostnames', () => {
-  it('collects every hostname across all of a system\'s published ports', () => {
+  it('pairs every hostname with the port it belongs to, across all of a system\'s published ports', () => {
     const byPort = new Map([
       [8081, ['alpha.example.invalid']],
       [9001, ['gamma.example.invalid']],
     ])
     expect(hostnamesForSystem([8081, 9001], byPort)).toEqual([
-      'alpha.example.invalid',
-      'gamma.example.invalid',
+      { hostname: 'alpha.example.invalid', port: 8081 },
+      { hostname: 'gamma.example.invalid', port: 9001 },
     ])
   })
 
-  it('returns nothing for a system with no vhost, rather than guessing one', () => {
-    expect(hostnamesForSystem([7777], new Map([[8081, ['alpha.example.invalid']]]))).toEqual([])
+  // Fix round 1's explicit call: a published port with NO vhost mapping is
+  // still worth probing -- just with no Host header to claim, since none is
+  // known. This used to return nothing at all for such a port; the change
+  // is deliberate (see hostnamesForSystem's docstring) and this is the test
+  // that pins the new behaviour, replacing the old "returns nothing"
+  // assertion.
+  it('still yields a target for a published port with no vhost mapping, with hostname null rather than guessed or omitted', () => {
+    expect(hostnamesForSystem([7777], new Map([[8081, ['alpha.example.invalid']]]))).toEqual([
+      { hostname: null, port: 7777 },
+    ])
+  })
+
+  it('yields nothing at all for a port that is not even published', () => {
+    // Contrast with the above: 7777 above WAS published (it's in the caller's
+    // publishedPorts list) but had no vhost. A port that was never published
+    // in the first place is simply never iterated.
+    expect(hostnamesForSystem([], new Map([[8081, ['alpha.example.invalid']]]))).toEqual([])
+  })
+
+  // Fix round 1: a stray duplicate symlink in the enabled-vhost directory
+  // makes the same (port, hostname) pair appear twice in `byPort`'s array
+  // for that port. Without dedupe here, that doubles a real request against
+  // a production root every tick for zero new information, and would
+  // double the wire entry once Task 5 carries these results.
+  it('deduplicates a (port, hostname) pair that appears twice for the same port', () => {
+    const byPort = new Map([[8081, ['alpha.example.invalid', 'alpha.example.invalid']]])
+    expect(hostnamesForSystem([8081], byPort)).toEqual([{ hostname: 'alpha.example.invalid', port: 8081 }])
+  })
+
+  it('does NOT dedupe the same hostname on two different ports -- that is two different backends claiming the same name, not one duplicate request', () => {
+    const byPort = new Map([
+      [8081, ['alpha.example.invalid']],
+      [9001, ['alpha.example.invalid']],
+    ])
+    expect(hostnamesForSystem([8081, 9001], byPort)).toEqual([
+      { hostname: 'alpha.example.invalid', port: 8081 },
+      { hostname: 'alpha.example.invalid', port: 9001 },
+    ])
   })
 })
 
 describe('on-box probing', () => {
-  it('reports the status it saw alongside the outcome', async () => {
-    const r = await probeHostnameOnBox('alpha.example.invalid', async () => ({ status: 301 }))
+  it('addresses the published container port directly, on loopback, with the hostname carried ONLY as a Host header', async () => {
+    let seenUrl: string | undefined
+    let seenHeaders: Record<string, string> | undefined
+    const r = await probeHostnameOnBox('alpha.example.invalid', 8081, async (url, init) => {
+      seenUrl = url
+      seenHeaders = init.headers
+      return { status: 301 }
+    })
+    expect(seenUrl).toBe('http://127.0.0.1:8081/')
+    expect(seenHeaders).toEqual({ Host: 'alpha.example.invalid' })
     expect(r).toEqual({ hostname: 'alpha.example.invalid', outcome: 'answering', status: 301 })
   })
 
-  it('names a 502 as the proxy having no upstream', async () => {
-    const r = await probeHostnameOnBox('alpha.example.invalid', async () => ({ status: 502 }))
+  it('sends no Host header at all for a null hostname, rather than a literal "null"', async () => {
+    let seenHeaders: Record<string, string> | undefined
+    let sawHeadersKey = false
+    const r = await probeHostnameOnBox(null, 8081, async (_url, init) => {
+      seenHeaders = init.headers
+      sawHeadersKey = 'headers' in init
+      return { status: 200 }
+    })
+    expect(sawHeadersKey).toBe(false)
+    expect(seenHeaders).toBeUndefined()
+    expect(r).toEqual({ hostname: null, outcome: 'answering', status: 200 })
+  })
+
+  it('names a 502 as the proxy having no upstream (classifyHttpStatus is one shared rule, even though this axis has no proxy in its own path)', async () => {
+    const r = await probeHostnameOnBox('alpha.example.invalid', 8081, async () => ({ status: 502 }))
     expect(r.outcome).toBe('proxy-no-upstream')
   })
 
-  it('distinguishes a TLS failure from a dead application', async () => {
-    const r = await probeHostnameOnBox('alpha.example.invalid', async () => {
-      throw Object.assign(new Error('handshake'), { code: 'ERR_TLS_CERT_ALTNAME_INVALID' })
-    })
-    expect(r.outcome).toBe('tls-failed')
-    expect(r.status).toBeNull()
-  })
-
   it('never throws, whatever the fetch does', async () => {
-    const r = await probeHostnameOnBox('alpha.example.invalid', async () => {
+    const r = await probeHostnameOnBox('alpha.example.invalid', 8081, async () => {
       throw new Error('boom')
     })
     expect(r.outcome).toBe('not-answering')
+    expect(r.status).toBeNull()
   })
 
   it('is bounded in time, does not hang the collection loop', async () => {
@@ -166,7 +216,7 @@ describe('on-box probing', () => {
         init.signal.addEventListener('abort', () => reject(new Error('aborted')))
       })
     const startedAt = Date.now()
-    const r = await probeHostnameOnBox('alpha.example.invalid', neverReplies, 50)
+    const r = await probeHostnameOnBox('alpha.example.invalid', 8081, neverReplies, 50)
     expect(r.outcome).toBe('not-answering')
     expect(Date.now() - startedAt).toBeLessThan(2_000)
   })
