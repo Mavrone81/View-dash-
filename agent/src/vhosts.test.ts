@@ -229,6 +229,44 @@ server {
     expect(byPort.get(9700)).toEqual(['quoteone.example.invalid'])
     expect(byPort.get(9701)).toEqual(['quotetwo.example.invalid'])
   })
+
+  // The first block is missing its own closing brace entirely -- not hidden
+  // inside a quote this time, just genuinely absent, the shape a collector
+  // can catch a file in mid-save. A non-fail-closed scanner swallows the
+  // second (well-formed) block while hunting for a brace to rebalance
+  // against, merging both hostnames into one blob with the FIRST block's
+  // root location winning for both -- trunctwo would wrongly acquire
+  // truncone's port. Neither block can be trusted once one of them is
+  // unterminated: there is no reliable place to draw the boundary between
+  // "block one's missing close" and "block two starts here" without
+  // guessing, so both are dropped.
+  const UNTERMINATED_FIRST = `
+server {
+    listen 443 ssl;
+    server_name truncone.example.invalid;
+    location / {
+        proxy_pass http://127.0.0.1:9800;
+    }
+server {
+    listen 443 ssl;
+    server_name trunctwo.example.invalid;
+    location / {
+        proxy_pass http://127.0.0.1:9801;
+    }
+}
+`
+
+  it('drops an unterminated first block rather than letting the second block\'s hostname acquire its port', () => {
+    const blocks = parseServerBlocks(UNTERMINATED_FIRST, NONE)
+    expect(blocks.some((b) => b.hostnames.includes('trunctwo.example.invalid') && b.upstreamPort === 9800)).toBe(false)
+    expect(blocks).toEqual([])
+  })
+
+  it('keeps an unterminated first block from cross-attributing the second block\'s hostname when discovering by port', () => {
+    const byPort = discoverHostnamesByPort([{ text: UNTERMINATED_FIRST }])
+    expect(byPort.get(9800)).toBeUndefined()
+    expect([...byPort.values()].flat()).not.toContain('trunctwo.example.invalid')
+  })
 })
 
 describe('parseUpstreams', () => {

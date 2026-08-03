@@ -62,31 +62,61 @@ function stripComments(text: string): string {
  * `server` block inside a file -- that a non-greedy match would stop at
  * prematurely.
  *
- * Quote-aware in the same way `stripComments` is above: a directive value
- * can carry a literal, UNBALANCED brace inside a quoted string (e.g.
- * `add_header X-Test "{oops";`), and counting that brace as structural
- * makes the depth run one level short -- the scanner then consumes the
- * *next* `server { }` block's own closing brace to rebalance, silently
- * merging two blocks into one. `server_name` matching then sees both
- * blocks' hostnames in a single blob and the first `location /` wins, so
- * the second block's hostname gets attributed to the first block's port --
- * the exact cross-block mis-attribution the server-block split exists to
- * prevent, reopened through a brace hidden inside a string instead of a
- * missing split. A brace inside an open quote is therefore never counted.
+ * QUOTE-AWARENESS: a directive value can carry a literal, UNBALANCED brace
+ * inside a quoted string (e.g. `add_header X-Test "{oops";`), and counting
+ * that brace as structural makes the depth run one level short -- the
+ * scanner then consumes the *next* `server { }` block's own closing brace
+ * to rebalance, silently merging two blocks into one. `server_name`
+ * matching then sees both blocks' hostnames in a single blob and the first
+ * `location /` wins, so the second block's hostname gets attributed to the
+ * first block's port -- the exact cross-block mis-attribution the
+ * server-block split exists to prevent, reopened through a brace hidden
+ * inside a string instead of a missing split. A brace inside an open quote
+ * is therefore never counted.
  *
- * Malformed input -- an unterminated `server`/`location` block missing its
- * final `}` -- is NOT detected here: the loop simply runs to the end of
- * `text` with `depth` still above 0, and the returned body is silently
- * missing its last character (the slice assumes a closing brace exists at
- * `i - 1`). This is deliberately left undetected rather than guarded: a
- * config the host is actually running was necessarily accepted by nginx,
- * which itself refuses to (re)load an unbalanced file, so truncated input
- * can only occur on a config nothing has read successfully -- input this
- * module was never handed the job of validating. Guarding it here would
- * mean this module doing nginx's own syntax-checking job for a case its
- * caller (a currently-loaded config on a running host) cannot produce.
+ * This tracks quotes the same way `stripComments` does, but NOT with the
+ * same scope: `stripComments` resets `inSingle`/`inDouble` at every line
+ * break (it operates line by line), while this function carries quote
+ * state continuously across the whole text with no per-line reset. An
+ * nginx quoted value CAN legitimately span multiple lines, so
+ * `stripComments` can wrongly delete a continuation line that happens to
+ * contain a `#` inside that still-open quote. That gap is not reachable
+ * through anything this module actually reads -- `server_name`,
+ * `proxy_pass` and `listen` are always single-line directives -- so it is
+ * not a live bug, but the two functions are not equivalent and a future
+ * directive spanning lines could expose the difference.
+ *
+ * Neither this function nor `stripComments` handles a backslash-escaped
+ * quote (`\"`) inside a quoted value -- both would treat it as closing the
+ * string early. Pre-existing, shared identically by both (so they can't
+ * disagree with each other about where a string ends), and not reachable
+ * by any directive this module parses. Noted rather than fixed: nginx
+ * directive values that need this are rare, and adding escape-handling to
+ * one function without the other would make them inconsistent instead of
+ * both simply incomplete in the same way.
+ *
+ * FAIL-CLOSED ON MALFORMED INPUT: an unterminated `server`/`location`
+ * block missing its final `}` makes the loop run to the end of `text` with
+ * `depth` still above 0. `complete: false` signals exactly that case, and
+ * every caller below drops the block rather than trusting the body the
+ * slice would otherwise produce.
+ *
+ * This used to be treated as unreachable, on the reasoning that a config
+ * the host is actually running was necessarily accepted by nginx, which
+ * itself refuses to (re)load an unbalanced file. That reasoning does not
+ * hold for what THIS module reads: `readVhostDir` pulls raw files off disk
+ * on the collector's own poll cycle, with no relationship to nginx's
+ * validated in-memory state. A file mid-save by a human editor, or
+ * mid-write by a deploy step, can sit on disk transiently unbalanced at
+ * the exact instant the collector scans it, before `nginx -t` has ever
+ * seen that content -- a real caller today, not a hypothetical future one.
+ * Silently returning a truncated body in that case reproduces the same
+ * cross-block mis-attribution as the quote bug above, arriving via a race
+ * instead of a hidden brace: an unterminated block swallows whatever
+ * follows it, and a hostname from a LATER, well-formed block can land on
+ * the truncated block's (wrong, or entirely fictitious) port.
  */
-function balancedBody(text: string, bodyStart: number): { body: string; end: number } {
+function balancedBody(text: string, bodyStart: number): { body: string; end: number; complete: boolean } {
   let depth = 1
   let i = bodyStart
   let inSingle = false
@@ -101,18 +131,29 @@ function balancedBody(text: string, bodyStart: number): { body: string; end: num
     }
     i++
   }
-  return { body: text.slice(bodyStart, i - 1), end: i }
+  return { body: text.slice(bodyStart, i - 1), end: i, complete: depth === 0 }
 }
 
-/** Extracts every `location <selector> { ... }` block from a server block's text. */
+/**
+ * Extracts every `location <selector> { ... }` block from a server block's
+ * text.
+ *
+ * A location whose body is unterminated (see `balancedBody`'s
+ * FAIL-CLOSED note) is dropped rather than returned with a truncated body:
+ * it contributes no entry, so `.find((loc) => loc.selector === '/')` in
+ * `parseBlockEntry` cannot find it and resolves the same `upstreamPort:
+ * null` as a server block that never declared a root location at all. See
+ * the comment on that lookup for why this collapse is accepted rather than
+ * distinguished.
+ */
 function extractLocations(text: string): Array<{ selector: string; body: string }> {
   const out: Array<{ selector: string; body: string }> = []
   const re = /location\s+([^{]+?)\s*\{/g
   let m: RegExpExecArray | null
   while ((m = re.exec(text)) !== null) {
     const selector = (m[1] ?? '').trim()
-    const { body, end } = balancedBody(text, re.lastIndex)
-    out.push({ selector, body })
+    const { body, end, complete } = balancedBody(text, re.lastIndex)
+    if (complete) out.push({ selector, body })
     re.lastIndex = end
   }
   return out
@@ -143,8 +184,14 @@ function extractServerBlocks(text: string): string[] {
   const re = /\bserver\s*\{/g
   let m: RegExpExecArray | null
   while ((m = re.exec(text)) !== null) {
-    const { body, end } = balancedBody(text, re.lastIndex)
-    out.push(body)
+    const { body, end, complete } = balancedBody(text, re.lastIndex)
+    // An unterminated block (see balancedBody's FAIL-CLOSED note) is
+    // dropped, not returned truncated: it contributes no VhostEntry at
+    // all, which is unambiguous at this layer -- there is no "entry that
+    // means unparseable" to confuse with a real one, only an absent one.
+    // `end` is always text.length here (the scan ran out of text without
+    // closing), so no further match can be found in this text either way.
+    if (complete) out.push(body)
     re.lastIndex = end
   }
   return out
@@ -242,6 +289,18 @@ function parseBlockEntry(clean: string, upstreams: ReadonlyMap<string, number>):
   // the first place -- inert today, and silently wrong the day someone
   // adds one. Recorded here rather than only in the slice's design doc,
   // because a report nobody opens does not stop a modifier from shipping.
+  //
+  // `VhostEntry` cannot distinguish, and this lookup does not try to:
+  // (a) no root location was ever declared, (b) a root location was
+  // declared but its own body was unterminated and dropped by
+  // `extractLocations`, and (c) a root location exists and resolves but to
+  // no reachable upstream. All three collapse to `upstreamPort: null`.
+  // (b) is a genuinely different situation from (a)/(c) -- it means "this
+  // block's config could not be parsed," not "this block declares no
+  // proxy" -- but adding a way to tell them apart would mean growing
+  // `VhostEntry` for a case with no live evidence (unlike the disk-race
+  // truncation this same file now fails closed on at the whole-block
+  // level, which does have one). Recorded here rather than papered over.
   const root = extractLocations(clean).find((loc) => loc.selector === '/')
   const upstreamPort = root ? resolveProxyPort(root.body, upstreams) : null
 
