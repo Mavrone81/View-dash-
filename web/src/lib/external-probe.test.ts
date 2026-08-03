@@ -1,8 +1,20 @@
 import { describe, it, expect } from 'vitest'
 import { createServer as createHttpsServer } from 'node:https'
-import { createServer as createTlsServer } from 'node:tls'
-import type { Server } from 'node:net'
+import { createServer as createTlsServer, type Server as TlsServer, type TLSSocket } from 'node:tls'
+import { Socket, type Server } from 'node:net'
 import { probeExternally, httpsExternalRequest, type ExternalDeps } from './external-probe.js'
+
+// `_getActiveHandles` is a real, long-standing Node internal (not in
+// @types/node), used here for exactly what it's for: detecting a socket
+// handle leak in a test. Same technique `agent/src/probe.test.ts` uses for
+// the on-box transport's own socket-drain test. Narrowly typed rather than
+// cast through `any`.
+type ProcessWithActiveHandles = typeof process & { _getActiveHandles?: () => unknown[] }
+
+function countActiveSockets(): number {
+  const handles = (process as ProcessWithActiveHandles)._getActiveHandles?.() ?? []
+  return handles.filter((h) => h instanceof Socket).length
+}
 
 const at = (d: string) => new Date(d)
 
@@ -190,6 +202,45 @@ function listenEphemeral(server: Server): Promise<number> {
       resolve(address.port)
     })
   })
+}
+
+/**
+ * Builds a raw TLS listener that completes a real handshake and then goes
+ * silent forever -- the "accepts a connection and then stalls" scenario a
+ * couple of tests below need -- and tracks every socket it accepts so
+ * `closeAll` can destroy them explicitly.
+ *
+ * This tracking exists because `tls.Server`/`net.Server`, unlike
+ * `http.Server`, has no `closeAllConnections()`: `server.close()` only
+ * stops NEW connections, it never touches a socket already accepted. A
+ * fix-round review reproduced exactly this: the first version of the two
+ * tests using a bare `createTlsServer(...)` + `server.close()` in `finally`
+ * left the server-side socket sitting in CLOSE_WAIT indefinitely once the
+ * client aborted, leaking one socket handle per run while the suite stayed
+ * green throughout -- the precise "two sockets leaked, suite still green"
+ * shape Task 4's own fix rounds warned about. The review also established
+ * this was a TEST-FIXTURE leak, not a shipping one: `httpsExternalRequest`
+ * destroys its own (client-side) socket correctly on abort, and against a
+ * real remote server the far end's own FIN closes the connection this
+ * in-process fixture never sends on its own.
+ */
+function createStallingTlsServer(): { server: TlsServer; closeAll: () => void } {
+  const accepted = new Set<TLSSocket>()
+  const server = createTlsServer({ key: KEY_A, cert: CERT_A }, (socket) => {
+    accepted.add(socket)
+    socket.on('close', () => accepted.delete(socket))
+    // Accept the TLS connection and then do nothing: no HTTP response,
+    // ever. The socket is left open until the client -- or this fixture's
+    // own cleanup below -- closes it.
+    socket.on('error', () => {})
+  })
+  return {
+    server,
+    closeAll: () => {
+      for (const socket of accepted) socket.destroy()
+      server.close()
+    },
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,11 +514,7 @@ describe('the real external transport (httpsExternalRequest), against real liste
   // HTTP response. Built on raw `node:tls`, not `node:https`, specifically
   // so the handshake can succeed with no HTTP framing following it at all.
   it('is bounded in time when a listener completes TLS and then stalls, and does not classify the stall as a certificate failure', async () => {
-    const server = createTlsServer({ key: KEY_A, cert: CERT_A }, (socket) => {
-      // Accept the TLS connection and then do nothing: no HTTP response,
-      // ever. The socket is left open until the client gives up.
-      socket.on('error', () => {})
-    })
+    const { server, closeAll } = createStallingTlsServer()
     const port = await listenEphemeral(server)
     const deps: ExternalDeps = {
       request: (hostname, signal) => httpsExternalRequest(hostname, signal, { port, ca: CERT_A }),
@@ -480,14 +527,12 @@ describe('the real external transport (httpsExternalRequest), against real liste
       expect(r.certExpiresAt).toBeNull()
       expect(Date.now() - startedAt).toBeLessThan(2_000)
     } finally {
-      server.close()
+      closeAll()
     }
   })
 
   it('aborts a real in-flight request promptly when the signal fires, rather than waiting for the far end', async () => {
-    const server = createTlsServer({ key: KEY_A, cert: CERT_A }, (socket) => {
-      socket.on('error', () => {})
-    })
+    const { server, closeAll } = createStallingTlsServer()
     const port = await listenEphemeral(server)
     try {
       const controller = new AbortController()
@@ -496,7 +541,47 @@ describe('the real external transport (httpsExternalRequest), against real liste
       await expect(httpsExternalRequest('127.0.0.1', controller.signal, { port, ca: CERT_A })).rejects.toThrow()
       expect(Date.now() - startedAt).toBeLessThan(2_000)
     } finally {
-      server.close()
+      closeAll()
     }
+  })
+
+  // Fix round 1: a bare `createTlsServer(...)` + `server.close()` -- what
+  // the two tests above used to do -- leaks the server-side socket into
+  // CLOSE_WAIT forever once the client aborts, because `tls.Server` (unlike
+  // `http.Server`) has no `closeAllConnections()` and `close()` alone never
+  // touches an already-accepted socket. This test asserts that property
+  // directly, the way `agent/src/probe.test.ts`'s on-box drain test does,
+  // rather than trusting the comment on `createStallingTlsServer` above.
+  it('does not leak a server-side socket per stall-and-abort cycle', async () => {
+    async function stallThenAbort(): Promise<void> {
+      const { server, closeAll } = createStallingTlsServer()
+      const port = await listenEphemeral(server)
+      try {
+        const controller = new AbortController()
+        setTimeout(() => controller.abort(), 20)
+        await expect(httpsExternalRequest('127.0.0.1', controller.signal, { port, ca: CERT_A })).rejects.toThrow()
+        // Give the server a moment to have actually registered the
+        // accepted socket before cleanup runs.
+        await new Promise((r) => setTimeout(r, 20))
+      } finally {
+        closeAll()
+      }
+    }
+    // One warm-up cycle so its own setup (real, not a leak) doesn't
+    // pollute the baseline measurement below.
+    await stallThenAbort()
+    await new Promise((r) => setTimeout(r, 50))
+    const before = countActiveSockets()
+    const N = 10
+    for (let i = 0; i < N; i++) {
+      await stallThenAbort()
+    }
+    // Give destroyed sockets a moment to actually finish closing.
+    await new Promise((r) => setTimeout(r, 150))
+    const after = countActiveSockets()
+    // With the fix this stays flat; without it, one server-side socket
+    // leaks per cycle, so growth tracks N. A bound well below N
+    // discriminates cleanly either way.
+    expect(after - before).toBeLessThan(N / 2)
   })
 })
