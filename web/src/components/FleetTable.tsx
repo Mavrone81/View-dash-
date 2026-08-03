@@ -26,23 +26,29 @@ export type HostnameAnswer = {
   verdict: Verdict
   onBoxOutcome: ProbeOutcome | null
   /**
-   * `null` in TWO cases, deliberately conflated: no external result exists
-   * for this hostname at all, OR one exists but is older than
+   * `null` in THREE cases, deliberately conflated: no external result
+   * exists for this hostname at all; one exists but is older than
    * `fleet-query.ts`'s `EXTERNAL_RESULT_STALE_AFTER_MS` (Task 8 fix round 1,
-   * C3) -- a result that old is not trusted as a CURRENT opinion, the same
-   * "stop vouching for it" rule `staleness.ts`'s `displayState` already
-   * applies to a stale on-box observation. `externalAgeMs` below is what
-   * still lets a renderer tell "never checked" apart from "checked, but
-   * long enough ago that we stopped trusting it".
+   * C3); or the whole board is under a fleet-wide external failure (Task 8
+   * fix round 1, C2b) and this reading, however fresh, is not trusted this
+   * tick. In every case the CONTENT is not trusted as a current opinion --
+   * the same "stop vouching for it" rule `staleness.ts`'s `displayState`
+   * already applies to a stale on-box observation. `externalAgeMs` below is
+   * what still lets a renderer tell "never checked" apart from "checked,
+   * but not trusted right now" (see fix round 2's M1).
    */
   externalOutcome: ProbeOutcome | null
   /** Milliseconds between `now` (the query's own clock) and the external
    * probe's `observedAt` -- spec §5.1's "show the age of the last external
-   * result, so a stale one is never mistaken for a fresh one." `null` when
-   * no external result exists for this hostname at all. UNLIKE
+   * result, so a stale one is never mistaken for a fresh one." `null` ONLY
+   * when no external result exists for this hostname at all. UNLIKE
    * `externalOutcome`/`certDaysRemaining`, this is NEVER nulled by
-   * staleness -- an operator must still be able to see "checked 9 days
-   * ago" even once the board has stopped trusting that reading's content. */
+   * staleness OR by a fleet-wide failure (Task 8 fix round 2, I1 -- an
+   * earlier version nulled it together with the content on a fleet-wide
+   * failure, so a result stored 4 minutes ago, carrying a certificate 3
+   * days from expiry, rendered as "never checked externally") -- an
+   * operator must still be able to see "checked 9 days ago" even once the
+   * board has stopped trusting that reading's content. */
   externalAgeMs: number | null
   listensTls: boolean | null
   /** `null` whenever `externalOutcome` is (no result, or stale -- see
@@ -320,7 +326,30 @@ function formatAge(ms: number): string {
  */
 export type CertSeverity = 'red' | 'amber' | 'ok' | 'unknown' | 'none'
 
-type CertEvidence = Pick<HostnameAnswer, 'listensTls' | 'certDaysRemaining' | 'externalOutcome'>
+/**
+ * Fix round 2 (Task 8 review), C1: how "bad" each severity is, for taking
+ * the WORST across every named hostname (see `worstCertSeverity` below) --
+ * the Cert-column equivalent of `fleet-query.ts`'s `VERDICT_SEVERITY`,
+ * which Answers already had and Cert did not.
+ *
+ * `ok` and `none` tie at the bottom: a plain-HTTP-by-design hostname is not
+ * a certificate concern at all, so it must not make a row look WORSE, but
+ * it also must not be allowed to hide a genuine problem elsewhere on the
+ * same row -- ties resolve in `worstCertSeverity` by simply not being the
+ * max. `unknown` outranks both of them on purpose, the same reasoning
+ * `fleet-query.ts`'s `VERDICT_SEVERITY` gives for `unprobed`/`unconfirmed`
+ * outranking `healthy`: a row must not read as fully fine while one of its
+ * hostnames' certificate status is simply unverified.
+ */
+const CERT_SEVERITY_RANK: Record<CertSeverity, number> = {
+  ok: 0,
+  none: 0,
+  unknown: 1,
+  amber: 2,
+  red: 3,
+}
+
+type CertEvidence = Pick<HostnameAnswer, 'listensTls' | 'certDaysRemaining' | 'externalOutcome' | 'externalAgeMs'>
 
 function certSeverity(h: CertEvidence | null): CertSeverity {
   if (h === null) return 'unknown'
@@ -337,13 +366,56 @@ function certSeverity(h: CertEvidence | null): CertSeverity {
   return h.externalOutcome === 'tls-failed' ? 'red' : 'unknown'
 }
 
+/**
+ * Fix round 2 (Task 8 review), C1 -- THE fix: the Cert column's `<td>`
+ * used to carry only the PRIMARY hostname's own severity, computed by
+ * `primaryHostname()` (Task 7), which chooses by which hostname ANSWERS --
+ * a criterion with no relationship whatsoever to certificate health. A
+ * sibling hostname two days from expiry could sit behind a closed
+ * `<details>` while the cell itself rendered `ok`/green, because nothing
+ * folded the per-hostname severities the way `fleet-query.ts`'s
+ * `worstVerdict` already folds Answers. This is spec §8's no-averaging
+ * rule, unapplied to the one column whose entire purpose is warning about
+ * an expiring certificate -- and it failed SILENTLY, toward reassurance,
+ * which is the most dangerous direction a defect on this board can point.
+ *
+ * The row's TEXT still shows the primary hostname's own days-remaining
+ * figure (a real number is more informative than a generic severity word,
+ * and it is still genuinely true of the primary) -- only the colour is
+ * now worst-of. A row whose cell reads red with a primary hostname that
+ * says "60d remaining" is not a contradiction: it is exactly the signal
+ * that something else on this row needs the expansion opened.
+ */
+function worstCertSeverity(answers: readonly HostnameAnswer[]): CertSeverity {
+  const severities = answers.map((h) => certSeverity(h))
+  if (severities.length === 0) return 'unknown'
+  return severities.reduce((worst, s) => (CERT_SEVERITY_RANK[s] > CERT_SEVERITY_RANK[worst] ? s : worst))
+}
+
+/**
+ * Fix round 2 (Task 8 review), M1: `externalOutcome === null` no longer
+ * distinguishes "never checked" from "checked, but no longer current"
+ * (stale, or fleet-wide-suppressed -- see `fleet-query.ts`'s
+ * `buildHostnameAnswers`) -- both null it identically. `externalAgeMs`,
+ * which I1 fixed to stay populated in BOTH cases, is what tells them apart:
+ * `null` age genuinely means never checked; a real age means there IS a
+ * reading, it is simply not being trusted as current right now. Without
+ * this, a 9-day-old (or fleet-wide-suppressed 4-minutes-old) result read
+ * as "not checked yet" -- a sentence the evidence does not support, and one
+ * that actively contradicts the Answers cell on the SAME row, which shows
+ * that age plainly (spec §5.1).
+ */
 function certLabel(h: CertEvidence | null): string {
   if (h === null) return CERT_NO_SURFACE_LABEL
   if (h.listensTls === false) return 'no TLS configured'
   if (h.listensTls === null) return 'TLS status unknown this tick'
   if (h.certDaysRemaining !== null) return `${h.certDaysRemaining}d remaining`
   if (h.externalOutcome === 'tls-failed') return 'no certificate'
-  if (h.externalOutcome === null) return 'certificate not checked yet'
+  if (h.externalOutcome === null) {
+    return h.externalAgeMs === null
+      ? 'certificate not checked yet'
+      : `certificate last checked ${formatAge(h.externalAgeMs)}, no longer current`
+  }
   return 'certificate not observed this check'
 }
 
@@ -623,7 +695,7 @@ function CertCell({ r }: { r: FleetRow }) {
   const primary = r.hostnameAnswers.find((h) => h.hostname === r.primaryHostname) ?? null
   const others = r.hostnameAnswers.filter((h) => h.hostname !== r.primaryHostname)
   return (
-    <td className="col-cert" data-severity={certSeverity(primary)} data-testid="cert-cell">
+    <td className="col-cert" data-severity={worstCertSeverity(r.hostnameAnswers)} data-testid="cert-cell">
       {certLabel(primary)}
       {others.length > 0 && (
         <details className="cert-expand">

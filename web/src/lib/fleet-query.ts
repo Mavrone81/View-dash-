@@ -9,8 +9,18 @@ import type { FleetRow, HostnameAnswer } from '../components/FleetTable.js'
 /**
  * Five minutes -- the external probe's own cadence (spec §5.1). Recorded
  * here, not imported from Task 9's not-yet-written scheduler, so this file
- * carries no dependency on work that has not landed; Task 9 should import
+ * carries no dependency on work that has not landed; Task 9 MUST import
  * THIS constant rather than choosing the number a second, independent time.
+ *
+ * TASK 9 OBLIGATION, recorded rather than enforced (fix round 2, Task 8
+ * review): nothing in this codebase stops Task 9's scheduler from picking
+ * its own interval instead of importing this one. If it does,
+ * `EXTERNAL_RESULT_STALE_AFTER_MS` below silently stops meaning "three
+ * missed cycles" -- it would just be a number that happens to be 15
+ * minutes, decoupled from whatever the real cadence turned out to be. The
+ * reviewer endorsed 15 minutes as the right ceiling for a 5-minute cadence;
+ * that reasoning only holds if the two constants are ever actually the same
+ * one.
  */
 export const EXTERNAL_PROBE_INTERVAL_MS = 300_000
 
@@ -445,8 +455,21 @@ function buildHostnameAnswers(
     const onBoxEntry = onBoxProbes?.find((p) => p.hostname === h.hostname) ?? null
     const onBoxAxis = onBoxEntry ? toAxis(onBoxEntry.outcome, onBoxEntry.status) : null
 
-    const external = fleetWideFailure ? undefined : externalByHostname.get(h.hostname)
-    const externalAgeMs = external ? now.getTime() - external.observedAt.getTime() : null
+    // Fix round 2 (Task 8 review), I1: `externalAgeMs` is read from the RAW
+    // map lookup, UNCONDITIONALLY -- age is an observed fact about when the
+    // last probe ran, independent of whether this tick's fleet-wide guard
+    // or staleness ceiling currently trusts its CONTENT. The previous
+    // version computed age from `external` AFTER it had already been forced
+    // to `undefined` by `fleetWideFailure`, so a result stored 4 minutes
+    // ago -- carrying a certificate 3 days from expiry -- rendered as
+    // "never checked externally" during a fleet-wide fallback, directly
+    // contradicting C3's own rule that age is the one field never nulled.
+    const rawExternal = externalByHostname.get(h.hostname)
+    const externalAgeMs = rawExternal ? now.getTime() - rawExternal.observedAt.getTime() : null
+
+    // The CONTENT (axis, cert) is what the fleet-wide guard and the
+    // staleness ceiling actually gate -- never the age above.
+    const external = fleetWideFailure ? undefined : rawExternal
     const externalIsCurrent = external !== undefined && externalAgeMs !== null && externalAgeMs <= EXTERNAL_RESULT_STALE_AFTER_MS
 
     const externalAxis = externalIsCurrent ? toAxis(external.outcome, external.status) : null
@@ -485,14 +508,32 @@ function systemRow(
 
   // `hostname: null` entries are a published port with no vhost mapping --
   // Task 5's positive "a port with no name answered" fact, not tied to any
-  // named hostname so it cannot enter `hostnameAnswers` above. Only
-  // `answering` is ever kept for DISPLAY (see FleetRow.unnamedOnBoxProbes's
-  // docstring), but ALL of them (including a `not-probed` one) contribute to
-  // `worstVerdict` below via `combine(axis, null)`, which folds a
-  // no-opinion entry to `unprobed` on its own and so cannot distort the
-  // result either way.
+  // named hostname so it cannot enter `hostnameAnswers` above.
+  //
+  // Fix round 2 (Task 8 review), C2 -- corrected claim: an earlier version
+  // of this comment asserted that feeding EVERY unnamed entry through
+  // `combine(axis, null)` "cannot distort the result either way". That was
+  // false, and the render disproved it: `combine(answeringAxis, null)` is
+  // `unconfirmed` (an opinion on one axis, none on the other) and
+  // `combine(notProbedAxis, null)` -- since `not-probed` has NO opinion --
+  // is `unprobed`. Both outrank `healthy` in `VERDICT_SEVERITY`, so folding
+  // either into `worstVerdict` alongside a genuinely healthy NAMED hostname
+  // DOWNGRADED the row -- a silent unmapped database/cache/exporter port
+  // (common on a multi-stack host) could drag a fully healthy system down
+  // to `unprobed` or `unconfirmed`, exactly the "picking a winner"/inventing
+  // a fact this whole design exists to refuse, just aimed at an evidence
+  // source instead of a named hostname.
+  //
+  // Spec §3.1 is explicit that an unmapped port is evidence that can ONLY
+  // be positive ("only `answering` counts. Every other outcome is
+  // `not-probed`"), so its contribution here must be able to ONLY help,
+  // never hurt: an `answering` entry contributes `healthy` (severity 0,
+  // the floor of `VERDICT_SEVERITY` -- it can never make `worstVerdict`
+  // read worse than whatever the named hostnames already produced), and
+  // every other outcome (in practice only `not-probed`, per the agent's own
+  // discipline -- see shared/src/wire.ts) contributes NOTHING at all.
   const unnamed = (onBoxProbes ?? []).filter((p) => p.hostname === null)
-  const unnamedVerdicts: Verdict[] = unnamed.map((p) => combine(toAxis(p.outcome, p.status), null))
+  const unnamedVerdicts: Verdict[] = unnamed.filter((p) => p.outcome === 'answering').map(() => 'healthy')
 
   const verdict = worstVerdict([...hostnameAnswers.map((h) => h.verdict), ...unnamedVerdicts])
 

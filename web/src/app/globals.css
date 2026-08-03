@@ -366,6 +366,32 @@ h1 {
   color: var(--ink-muted);
 }
 
+/* Fix round 2 (Task 8 review), C1: the cert-expansion rows carry the SAME
+   `data-severity` attribute as `.col-cert` above, and until this rule
+   existed nothing styled it -- confirmed by the reviewer, who deleted the
+   attribute and watched the full suite stay green. A sibling hostname two
+   days from expiry rendered in the SAME muted grey as "no certificate
+   expected" once inside the `<details>`, no matter how alarming its own
+   severity was. These four rules are deliberately identical to `.col-cert`'s
+   own, not merely similar, so the expanded and collapsed views can never
+   disagree about what a given severity looks like. */
+.cert-expand li[data-severity='ok'] {
+  color: var(--good);
+}
+
+.cert-expand li[data-severity='amber'] {
+  color: var(--warn);
+}
+
+.cert-expand li[data-severity='red'] {
+  color: var(--alarm);
+}
+
+.cert-expand li[data-severity='unknown'],
+.cert-expand li[data-severity='none'] {
+  color: var(--ink-muted);
+}
+
 /* Never-reported (em dash), NOT a genuine 0/0 -- these two must stay visibly
    distinct, see FleetRow.containersRunning. */
 .col-containers--unknown {

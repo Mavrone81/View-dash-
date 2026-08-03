@@ -980,6 +980,54 @@ describe('the Answers/Cert join (Task 8)', () => {
       // fallback that never applied.
       expect(board.rows[0]!.verdict).toBe('unconfirmed')
     })
+
+    // THE DENIAL TEST for fix round 2's I1: a fleet-wide failure must not
+    // erase the AGE of a genuinely recent, good result -- only its content.
+    // A result stored 4 minutes ago, carrying a certificate 3 days from
+    // expiry, must still report that real age even while the verdict/cert
+    // content is correctly suppressed by the fallback. Before this fix,
+    // `external` was forced to `undefined` before `externalAgeMs` was ever
+    // computed, so this rendered as "never checked externally" and the
+    // 3-day certificate simply vanished during the one window an operator
+    // most needs to see it.
+    it('reports the real age of a recent result even while a fleet-wide failure suppresses its content', async () => {
+      const { system } = await makeSystem('sys-fleet-fail-age', 'host-fleet-fail-age')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const fourMinutesAgo = new Date(now.getTime() - 4 * 60_000)
+      const expires = new Date(now.getTime() + 3 * 86_400_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: {
+          hostname: HOSTNAME_A,
+          outcome: 'answering',
+          status: 200,
+          certExpiresAt: expires,
+          observedAt: fourMinutesAgo,
+        },
+      })
+      await prisma.externalProbeRun.create({ data: { ranAt: now, reachedAnything: false } })
+
+      const { rows } = await latestPerSystem(now)
+
+      const answer = rows[0]!.hostnameAnswers[0]!
+      // Content correctly suppressed by the fallback.
+      expect(answer.externalOutcome).toBeNull()
+      expect(answer.certDaysRemaining).toBeNull()
+      // Age is NOT suppressed -- it is a fact about the stored evidence,
+      // independent of whether this tick trusts its content.
+      expect(answer.externalAgeMs).not.toBeNull()
+      expect(answer.externalAgeMs).toBeCloseTo(4 * 60_000, -3)
+    })
   })
 
   describe('latestExternalProbeRun', () => {
@@ -1153,7 +1201,7 @@ describe('the Answers/Cert join (Task 8)', () => {
     expect(emptyRow.verdict).toBe('unprobed')
   })
 
-  it('surfaces an unnamed on-box probe (a published port with no vhost) that answered, distinct from having no evidence at all', async () => {
+  it('surfaces an unnamed on-box probe (a published port with no vhost) that answered, and reads healthy on that evidence alone', async () => {
     const { system } = await makeSystem('sys-unnamed-port', 'host-unnamed-port')
     const now = new Date('2026-08-03T00:00:00Z')
     await prisma.systemObservation.create({
@@ -1172,9 +1220,77 @@ describe('the Answers/Cert join (Task 8)', () => {
 
     expect(rows[0]!.unnamedOnBoxProbes).toHaveLength(1)
     expect(rows[0]!.unnamedOnBoxProbes[0]!.outcome).toBe('answering')
-    // No hostname exists for it to attach to, so it cannot make the row
-    // "healthy" -- but it is still evidence, so the row must not read as
-    // flatly unprobed either.
-    expect(rows[0]!.verdict).toBe('unconfirmed')
+    // Fix round 2 (Task 8 review), C2: an unmapped port's answer is
+    // evidence that can only be POSITIVE (spec §3.1) -- with no named
+    // hostname on this system at all, it is the only evidence there is,
+    // and it must not be worth LESS than nothing.
+    expect(rows[0]!.verdict).toBe('healthy')
+  })
+
+  // THE DENIAL TEST for fix round 2's C2: the reviewer's exact
+  // reproduction -- one NAMED hostname healthy on both axes, plus one
+  // published port with no vhost that recorded `not-probed`. The system is
+  // fully working; the unmapped port merely has nothing to say. Before this
+  // fix, `combine(notProbedAxis, null)` folded to `unprobed` (severity 1,
+  // strictly worse than `healthy`'s 0) and dragged the whole row down to
+  // "not probed" -- a silent unmapped database/cache/exporter port, common
+  // on a multi-stack host, downgrading an otherwise fully healthy system.
+  it('does not let a not-probed unmapped port downgrade an otherwise fully healthy row', async () => {
+    const { system } = await makeSystem('sys-named-plus-unnamed', 'host-named-plus-unnamed')
+    const now = new Date('2026-08-03T12:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+        onBoxProbes: [
+          { hostname: HOSTNAME_A, outcome: 'answering', status: 200 },
+          { hostname: null, outcome: 'not-probed', status: null },
+        ],
+      },
+    })
+    await prisma.externalProbeResult.create({
+      data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+    })
+
+    const { rows } = await latestPerSystem(now)
+
+    expect(rows[0]!.verdict).toBe('healthy')
+  })
+
+  // Same reproduction, but the unmapped port ANSWERED instead of recording
+  // `not-probed`. Before this fix, `combine(answeringAxis, null)` folded to
+  // `unconfirmed` (severity 2) and downgraded the row just as badly, for
+  // the OPPOSITE reason (an opinion with nothing to combine it against,
+  // rather than no opinion at all) -- both wrong, for the same underlying
+  // cause: feeding an unmapped port's result through the two-axis `combine`
+  // at all, when it has no second axis to compare against.
+  it('does not let an ANSWERING unmapped port downgrade an otherwise fully healthy row either', async () => {
+    const { system } = await makeSystem('sys-named-plus-answering-unnamed', 'host-named-plus-answering-unnamed')
+    const now = new Date('2026-08-03T12:00:00Z')
+    await prisma.systemObservation.create({
+      data: {
+        systemId: system.id,
+        receivedAt: now,
+        health: 'healthy',
+        containersTotal: 1,
+        containersRunning: 1,
+        hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+        onBoxProbes: [
+          { hostname: HOSTNAME_A, outcome: 'answering', status: 200 },
+          { hostname: null, outcome: 'answering', status: 200 },
+        ],
+      },
+    })
+    await prisma.externalProbeResult.create({
+      data: { hostname: HOSTNAME_A, outcome: 'answering', status: 200, observedAt: now },
+    })
+
+    const { rows } = await latestPerSystem(now)
+
+    expect(rows[0]!.verdict).toBe('healthy')
   })
 })

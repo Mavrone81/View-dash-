@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, within } from '@testing-library/react'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { FleetTable } from './FleetTable.js'
 import type { Beat } from '../lib/beats.js'
 
@@ -596,6 +598,62 @@ describe('FleetTable', () => {
       expect(summaryDetail?.textContent).toMatch(/proxy up, app not responding/i)
       expect(summaryAge?.textContent).toMatch(/3m ago/)
     })
+
+    // M2 (fix round 2): the per-hostname expansion's OWN age for each
+    // hostname survived only by accident -- nothing pinned it, so deleting
+    // it (C3's own claimed fix) left the full suite green. A system with
+    // several hostnames must not have only the arbitrary summary's age
+    // visible; each hostname's own row in the expansion needs its own.
+    it('shows each hostname\'s OWN age in the per-hostname expansion, not just the summary\'s', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [
+                { hostname: 'alpha.example.invalid', listensTls: true },
+                { hostname: 'beta.example.invalid', listensTls: true },
+              ],
+              primaryHostname: 'alpha.example.invalid',
+              hostnameAnswers: [
+                healthyHostnameAnswer({ externalAgeMs: 2 * 60_000 }),
+                healthyHostnameAnswer({ hostname: 'beta.example.invalid', externalAgeMs: 8 * 60_000 }),
+              ],
+              verdict: 'healthy',
+              leadHostnameAnswer: healthyHostnameAnswer({ externalAgeMs: 2 * 60_000 }),
+            }),
+          ]}
+        />,
+      )
+      const expansion = screen.getByTestId('answers-cell').querySelector<HTMLElement>('.answer-expand')!
+      const items = within(expansion).getAllByRole('listitem')
+      expect(items.find((li) => li.textContent?.includes('alpha'))?.textContent).toMatch(/2m ago/)
+      expect(items.find((li) => li.textContent?.includes('beta'))?.textContent).toMatch(/8m ago/)
+    })
+
+    // M2 (fix round 2): `ageDetail(null)`'s exact wording was unpinned --
+    // changing it to an outright lie about evidence age ('checked just
+    // now' instead of 'never checked externally') passed the full suite.
+    // This is the phrase that appears on nearly every row on first deploy
+    // (before any external result exists at all), so it matters more than
+    // most.
+    it('says "never checked externally", not a fabricated recency, when no external result exists at all', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [{ hostname: 'alpha.example.invalid', listensTls: true }],
+              primaryHostname: 'alpha.example.invalid',
+              verdict: 'unconfirmed',
+              hostnameAnswers: [healthyHostnameAnswer({ verdict: 'unconfirmed', externalOutcome: null, externalAgeMs: null })],
+              leadHostnameAnswer: healthyHostnameAnswer({ verdict: 'unconfirmed', externalOutcome: null, externalAgeMs: null }),
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('answers-cell')
+      expect(within(cell).getByText(/never checked externally/i)).toBeTruthy()
+      expect(within(cell).queryByText(/checked just now/i)).toBeNull()
+    })
   })
 
   // Spec §6/§8: "Cert -- days remaining, amber under 21, red under 7. 'No
@@ -697,7 +755,7 @@ describe('FleetTable', () => {
               tlsConfigured: true,
               certDaysRemaining: null,
               hostnameAnswers: [
-                healthyHostnameAnswer({ certDaysRemaining: null, certExpiresAt: null, externalOutcome: null }),
+                healthyHostnameAnswer({ certDaysRemaining: null, certExpiresAt: null, externalOutcome: null, externalAgeMs: null }),
               ],
             }),
           ]}
@@ -795,6 +853,165 @@ describe('FleetTable', () => {
       const cell = screen.getByTestId('cert-cell')
       expect(within(cell).queryByText(/no http surface/i)).toBeNull()
       expect(cell.textContent?.toLowerCase()).toContain('not available')
+    })
+
+    // THE DENIAL TEST for fix round 2's C1: the reviewer's exact reproduction
+    // -- a primary hostname healthy and fresh (60d), a SIBLING two days from
+    // expiry. The primary's own severity is `ok`, and `primaryHostname()`
+    // chooses by which hostname ANSWERS, which has no relationship to
+    // certificate health -- so a cell that only read the primary's severity
+    // rendered green over a certificate two days out, with the red evidence
+    // sitting inertly inside a CLOSED `<details>` (and, before this round's
+    // CSS fix, not even coloured once opened -- see the CSS-coverage test
+    // below). The fix takes the WORST severity across every hostname while
+    // keeping the primary's own number as the visible text.
+    it('colours the cell red when a SIBLING hostname is near expiry, even though the primary is healthy and fresh', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [
+                { hostname: 'alpha.example.invalid', listensTls: true },
+                { hostname: 'beta.example.invalid', listensTls: true },
+              ],
+              primaryHostname: 'alpha.example.invalid',
+              hostnameAnswers: [
+                healthyHostnameAnswer({ certDaysRemaining: 60 }),
+                healthyHostnameAnswer({ hostname: 'beta.example.invalid', certDaysRemaining: 2 }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('cert-cell')
+      expect(cell.getAttribute('data-severity')).toBe('red')
+      // The primary's OWN number is still the visible text -- a real,
+      // true number, not replaced by a generic severity word.
+      expect(cell.textContent).toMatch(/60d remaining/)
+    })
+
+    it('still reads ok when every hostname is healthy and fresh -- the worst-of fold does not invent a problem', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [
+                { hostname: 'alpha.example.invalid', listensTls: true },
+                { hostname: 'beta.example.invalid', listensTls: true },
+              ],
+              primaryHostname: 'alpha.example.invalid',
+              hostnameAnswers: [
+                healthyHostnameAnswer({ certDaysRemaining: 60 }),
+                healthyHostnameAnswer({ hostname: 'beta.example.invalid', certDaysRemaining: 45 }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      expect(screen.getByTestId('cert-cell').getAttribute('data-severity')).toBe('ok')
+    })
+
+    // `unknown` must outrank `ok` in the worst-of fold, the same reasoning
+    // `VERDICT_SEVERITY` gives for `unprobed`/`unconfirmed` outranking
+    // `healthy`: a row must not read as fully fine (green) while one of its
+    // hostnames' certificate status is simply unverified.
+    it('reads unknown, not ok, when one hostname is healthy but a sibling has never been checked', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: [
+                { hostname: 'alpha.example.invalid', listensTls: true },
+                { hostname: 'beta.example.invalid', listensTls: true },
+              ],
+              primaryHostname: 'alpha.example.invalid',
+              hostnameAnswers: [
+                healthyHostnameAnswer({ certDaysRemaining: 60 }),
+                healthyHostnameAnswer({
+                  hostname: 'beta.example.invalid',
+                  certDaysRemaining: null,
+                  certExpiresAt: null,
+                  externalOutcome: null,
+                  externalAgeMs: null,
+                }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      expect(screen.getByTestId('cert-cell').getAttribute('data-severity')).toBe('unknown')
+    })
+
+    // M2: the cert-expansion's `data-severity` was purely decorative --
+    // nothing in globals.css styled it, confirmed by the reviewer deleting
+    // the attribute and watching all 797 tests stay green. jsdom in this
+    // test environment does not apply external stylesheet rules, so the
+    // only way to PIN that CSS coverage actually exists (as opposed to
+    // merely re-asserting the DOM attribute, which is exactly what stayed
+    // green before) is to read the stylesheet itself, the same way the
+    // reviewer diagnosed the gap.
+    it('has a CSS rule that actually colours each severity inside the cert expansion, not just on the collapsed cell', () => {
+      const css = readFileSync(join(import.meta.dirname, '../app/globals.css'), 'utf8')
+      for (const severity of ['red', 'amber', 'ok', 'unknown', 'none']) {
+        expect(css).toMatch(new RegExp(`\\.cert-expand li\\[data-severity=['"]${severity}['"]\\]`))
+      }
+    })
+
+    // M1: staleness/fleet-wide suppression nulls `externalOutcome`
+    // identically to "never checked" -- but `externalAgeMs` (fixed in I1 to
+    // stay populated) is what lets the label tell them apart. A result
+    // checked 9 days ago is a DIFFERENT sentence from one never checked at
+    // all, even though neither currently counts as a trusted opinion.
+    it('says a certificate was checked before, just not recently enough to trust, rather than claiming it was never checked', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: oneHostname,
+              primaryHostname: 'alpha.example.invalid',
+              tlsConfigured: true,
+              certDaysRemaining: null,
+              hostnameAnswers: [
+                healthyHostnameAnswer({
+                  certDaysRemaining: null,
+                  certExpiresAt: null,
+                  externalOutcome: null,
+                  externalAgeMs: 9 * 24 * 60 * 60_000,
+                }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('cert-cell')
+      expect(within(cell).queryByText(/not checked yet/i)).toBeNull()
+      expect(within(cell).getByText(/last checked 9d ago, no longer current/i)).toBeTruthy()
+    })
+
+    it('still says "not checked yet" when there is truly no age at all -- distinct from the stale case above', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: oneHostname,
+              primaryHostname: 'alpha.example.invalid',
+              tlsConfigured: true,
+              certDaysRemaining: null,
+              hostnameAnswers: [
+                healthyHostnameAnswer({
+                  certDaysRemaining: null,
+                  certExpiresAt: null,
+                  externalOutcome: null,
+                  externalAgeMs: null,
+                }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('cert-cell')
+      expect(within(cell).getByText(/not checked yet/i)).toBeTruthy()
+      expect(within(cell).queryByText(/no longer current/i)).toBeNull()
     })
   })
 
