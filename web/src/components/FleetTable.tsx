@@ -928,8 +928,23 @@ export function FleetTable({
    * it does not itself change any row's colour. That is the point: the
    * failure mode this guards against is turning a local probe fault into
    * twenty false outages, not hiding the banner.
+   *
+   * Final whole-branch review, I1: REQUIRED, not optional, even though
+   * `null` is one of its legal values. Before this fix, `page.tsx` -- the
+   * board's ONLY production render -- could have this attribute deleted
+   * entirely and `tsc -b` stayed clean with every test passing: an
+   * optional property is a legal target of the `delete` operator (and,
+   * more realistically, a legal thing to simply never pass), so a refactor
+   * that dropped it would silently fall the whole board back to "not yet
+   * confirmed" on every row during a genuine dashboard-network outage, with
+   * no banner explaining why -- exactly the confusion this banner exists
+   * to prevent. This is the THIRD instance of the same seam class in this
+   * slice (`agent/src/collect.ts`'s `CollectDeps.onBoxProbing`,
+   * `web/src/lib/probe-scheduler.ts`'s `productionDeps.request`'s `scheme`
+   * handoff): a required field is a compile error to omit; an optional one
+   * is not.
    */
-  lastExternalSweep?: { reachedAnything: boolean; ageMs: number } | null
+  lastExternalSweep: { reachedAnything: boolean; ageMs: number } | null
 }) {
   // Fix round 1 (Task 8 review), Minor 2: the banner is a fact about the
   // DASHBOARD's own probing, independent of whether any system happens to

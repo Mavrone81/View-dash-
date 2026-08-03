@@ -63,29 +63,29 @@ const healthyHostnameAnswer = (over = {}) => ({
 
 describe('FleetTable', () => {
   it('shows the short sha and the change description', () => {
-    render(<FleetTable rows={[row()]} />)
+    render(<FleetTable rows={[row()]} lastExternalSweep={null} />)
     expect(screen.getByText('abcdef1')).toBeTruthy()
     expect(screen.getByText('fix: the thing')).toBeTruthy()
   })
 
   it('shows an em dash rather than a blank when nothing is known', () => {
-    render(<FleetTable rows={[row({ deployedSha: null, deployedSubject: null })]} />)
+    render(<FleetTable rows={[row({ deployedSha: null, deployedSubject: null })]} lastExternalSweep={null} />)
     expect(screen.getAllByText('—').length).toBeGreaterThan(0)
   })
 
   it('labels a stale row as stale, not healthy', () => {
-    render(<FleetTable rows={[row({ state: 'stale' })]} />)
+    render(<FleetTable rows={[row({ state: 'stale' })]} lastExternalSweep={null} />)
     expect(screen.getByText(/stale/i)).toBeTruthy()
     expect(screen.queryByText(/^healthy$/i)).toBeNull()
   })
 
   it('flags drift when the deployed sha is behind', () => {
-    render(<FleetTable rows={[row({ driftCommits: 4 })]} />)
+    render(<FleetTable rows={[row({ driftCommits: 4 })]} lastExternalSweep={null} />)
     expect(screen.getByText(/4 behind/i)).toBeTruthy()
   })
 
   it('renders an empty state rather than an empty table', () => {
-    render(<FleetTable rows={[]} />)
+    render(<FleetTable rows={[]} lastExternalSweep={null} />)
     expect(screen.getByText(/no systems reported/i)).toBeTruthy()
   })
 
@@ -95,7 +95,7 @@ describe('FleetTable', () => {
   // nowhere.
   describe('the link into the vault', () => {
     it('links a system row to the vault, scoped to its host and system key', () => {
-      render(<FleetTable rows={[row({ id: 'host-1:web', hostName: 'host-1', key: 'web', displayName: 'web' })]} />)
+      render(<FleetTable rows={[row({ id: 'host-1:web', hostName: 'host-1', key: 'web', displayName: 'web' })]} lastExternalSweep={null} />)
       const link = screen.getByRole('link', { name: 'web' })
       expect(link.getAttribute('href')).toBe('/vault?host=host-1&system=web')
     })
@@ -103,7 +103,7 @@ describe('FleetTable', () => {
     it('links even when a real system key would need URL-encoding', () => {
       render(
         <FleetTable
-          rows={[row({ id: 'host-1:my system', hostName: 'host-1', key: 'my system', displayName: 'my system' })]}
+          rows={[row({ id: 'host-1:my system', hostName: 'host-1', key: 'my system', displayName: 'my system' })]} lastExternalSweep={null}
         />,
       )
       const link = screen.getByRole('link', { name: 'my system' })
@@ -121,7 +121,7 @@ describe('FleetTable', () => {
   describe('the Containers column', () => {
     it('renders a real zero-container count as 0/0, not a dash', () => {
       const { container } = render(
-        <FleetTable rows={[row({ containersRunning: 0, containersTotal: 0 })]} />,
+        <FleetTable rows={[row({ containersRunning: 0, containersTotal: 0 })]} lastExternalSweep={null} />,
       )
       const cell = container.querySelector('.col-containers')
       expect(cell?.textContent).toBe('0/0')
@@ -130,7 +130,7 @@ describe('FleetTable', () => {
 
     it('renders an em dash, not a fabricated 0/0, for a system that has never reported', () => {
       const { container } = render(
-        <FleetTable rows={[row({ containersRunning: null, containersTotal: null })]} />,
+        <FleetTable rows={[row({ containersRunning: null, containersTotal: null })]} lastExternalSweep={null} />,
       )
       const cell = container.querySelector('.col-containers')
       expect(cell?.textContent).toBe('—')
@@ -139,21 +139,21 @@ describe('FleetTable', () => {
 
     it('renders a genuine non-zero count plainly', () => {
       const { container } = render(
-        <FleetTable rows={[row({ containersRunning: 2, containersTotal: 3 })]} />,
+        <FleetTable rows={[row({ containersRunning: 2, containersTotal: 3 })]} lastExternalSweep={null} />,
       )
       expect(container.querySelector('.col-containers')?.textContent).toBe('2/3')
     })
 
     it('marks the never-reported dash as muted, distinct from a real count', () => {
       const { container } = render(
-        <FleetTable rows={[row({ containersRunning: null, containersTotal: null })]} />,
+        <FleetTable rows={[row({ containersRunning: null, containersTotal: null })]} lastExternalSweep={null} />,
       )
       expect(container.querySelector('.col-containers')?.classList.contains('col-containers--unknown')).toBe(true)
     })
 
     it('does not mark a genuine 0/0 as the muted unknown state', () => {
       const { container } = render(
-        <FleetTable rows={[row({ containersRunning: 0, containersTotal: 0 })]} />,
+        <FleetTable rows={[row({ containersRunning: 0, containersTotal: 0 })]} lastExternalSweep={null} />,
       )
       expect(container.querySelector('.col-containers')?.classList.contains('col-containers--unknown')).toBe(false)
     })
@@ -168,26 +168,26 @@ describe('FleetTable', () => {
     // legend's one swatch per state.
     it('renders a visible gap for a silent slot, not just a colour', () => {
       const beats: Beat[] = [...goodBeats(39), { state: 'absent' }]
-      const { container } = render(<FleetTable rows={[row({ beats })]} />)
+      const { container } = render(<FleetTable rows={[row({ beats })]} lastExternalSweep={null} />)
       expect(container.querySelectorAll('.beat-trace [data-beat="absent"]')).toHaveLength(1)
     })
 
     it('renders no gaps at all for a fully-reporting system', () => {
-      const { container } = render(<FleetTable rows={[row({ beats: goodBeats() })]} />)
+      const { container } = render(<FleetTable rows={[row({ beats: goodBeats() })]} lastExternalSweep={null} />)
       expect(container.querySelectorAll('.beat-trace [data-beat="absent"]')).toHaveLength(0)
       expect(container.querySelectorAll('.beat-trace [data-beat="good"]')).toHaveLength(40)
     })
 
     it('colours a beat that reported a fault distinctly from a merely missed one', () => {
       const beats: Beat[] = [...goodBeats(38), { state: 'absent' }, { state: 'alarm' }]
-      const { container } = render(<FleetTable rows={[row({ beats })]} />)
+      const { container } = render(<FleetTable rows={[row({ beats })]} lastExternalSweep={null} />)
       expect(container.querySelectorAll('.beat-trace [data-beat="alarm"]')).toHaveLength(1)
       expect(container.querySelectorAll('.beat-trace [data-beat="absent"]')).toHaveLength(1)
     })
 
     it('gives the trace a text alternative naming how many beats were missed -- not colour-only', () => {
       const beats: Beat[] = [...goodBeats(38), { state: 'absent' }, { state: 'absent' }]
-      render(<FleetTable rows={[row({ beats })]} />)
+      render(<FleetTable rows={[row({ beats })]} lastExternalSweep={null} />)
       // A screen-reader user gets the same fact ("2 missed") a sighted user
       // reads off the grey gaps in the strip -- this must be real text, not
       // conveyed by colour/CSS alone.
@@ -195,7 +195,7 @@ describe('FleetTable', () => {
     })
 
     it('renders an em dash rather than a fabricated full trace when there is no beat data at all', () => {
-      render(<FleetTable rows={[row({ beats: [] })]} />)
+      render(<FleetTable rows={[row({ beats: [] })]} lastExternalSweep={null} />)
       // Every other field on this fixture is non-empty, so this dash can
       // only be coming from the trace column.
       expect(screen.getAllByText('—').length).toBeGreaterThan(0)
@@ -207,7 +207,7 @@ describe('FleetTable', () => {
     })
 
     it('is keyboard-focusable, so the trace can carry a visible focus state', () => {
-      const { container } = render(<FleetTable rows={[row()]} />)
+      const { container } = render(<FleetTable rows={[row()]} lastExternalSweep={null} />)
       const trace = container.querySelector('.beat-trace')
       expect(trace).not.toBeNull()
       expect(trace?.getAttribute('tabindex')).toBe('0')
@@ -224,7 +224,7 @@ describe('FleetTable', () => {
           rows={[
             row({ id: 'host-1:web', hostName: 'host-1', key: 'web', displayName: 'web' }),
             row({ id: 'host-2:web', hostName: 'host-2', key: 'web', displayName: 'web' }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       expect(container.querySelectorAll('tbody tr')).toHaveLength(2)
@@ -255,7 +255,7 @@ describe('FleetTable', () => {
             rows={[
               row({ id: 'host-1:web', hostName: 'host-1', key: 'web', deployedSubject: 'change on host-1' }),
               row({ id: 'host-2:web', hostName: 'host-2', key: 'web', deployedSubject: 'change on host-2' }),
-            ]}
+            ]} lastExternalSweep={null}
           />,
         )
         const complaints = spy.mock.calls.map((c) => c.map(String).join(' ')).join('\n')
@@ -276,7 +276,7 @@ describe('FleetTable', () => {
   // requirement was not delivered at all.
   describe('last seen (spec §9)', () => {
     it('tells an operator when a stale row was last any good', () => {
-      render(<FleetTable rows={[row({ state: 'stale', receivedAt: new Date('2026-08-01T10:07:00Z') })]} />)
+      render(<FleetTable rows={[row({ state: 'stale', receivedAt: new Date('2026-08-01T10:07:00Z') })]} lastExternalSweep={null} />)
       expect(screen.getByText(/agent unreachable/i)).toBeTruthy()
       expect(screen.getByText(/last seen 10:07 UTC/i)).toBeTruthy()
     })
@@ -284,19 +284,19 @@ describe('FleetTable', () => {
     it('falls back to the host last-seen time when the row has no observation of its own', () => {
       render(
         <FleetTable
-          rows={[row({ state: 'unknown', receivedAt: null, lastSeenAt: new Date('2026-08-01T09:30:00Z') })]}
+          rows={[row({ state: 'unknown', receivedAt: null, lastSeenAt: new Date('2026-08-01T09:30:00Z') })]} lastExternalSweep={null}
         />,
       )
       expect(screen.getByText(/last seen 09:30 UTC/i)).toBeTruthy()
     })
 
     it('says "never seen" rather than inventing a time for a host that has never reported', () => {
-      render(<FleetTable rows={[row({ state: 'unknown', receivedAt: null, lastSeenAt: null })]} />)
+      render(<FleetTable rows={[row({ state: 'unknown', receivedAt: null, lastSeenAt: null })]} lastExternalSweep={null} />)
       expect(screen.getByText(/never seen/i)).toBeTruthy()
     })
 
     it('does not clutter a live row with a last-seen time', () => {
-      render(<FleetTable rows={[row({ state: 'healthy' })]} />)
+      render(<FleetTable rows={[row({ state: 'healthy' })]} lastExternalSweep={null} />)
       expect(screen.queryByText(/last seen/i)).toBeNull()
       expect(screen.queryByText(/agent unreachable/i)).toBeNull()
     })
@@ -309,7 +309,7 @@ describe('FleetTable', () => {
   describe('the URL column (spec §8)', () => {
     it('renders "no HTTP surface" for a system with confirmed zero hostnames, never a dash', () => {
       const { container } = render(
-        <FleetTable rows={[row({ hostnames: [], primaryHostname: null, hostnameAnswers: [] })]} />,
+        <FleetTable rows={[row({ hostnames: [], primaryHostname: null, hostnameAnswers: [] })]} lastExternalSweep={null} />,
       )
       const cell = container.querySelector<HTMLElement>('.col-url-cell')!
       expect(within(cell).getByText(/no http surface/i)).toBeTruthy()
@@ -318,7 +318,7 @@ describe('FleetTable', () => {
 
     it('renders a DIFFERENT sentence, still never a dash, when hostnames is null (no opinion this tick)', () => {
       const { container } = render(
-        <FleetTable rows={[row({ hostnames: null, primaryHostname: null, hostnameAnswers: [] })]} />,
+        <FleetTable rows={[row({ hostnames: null, primaryHostname: null, hostnameAnswers: [] })]} lastExternalSweep={null} />,
       )
       const cell = container.querySelector<HTMLElement>('.col-url-cell')!
       expect(cell.textContent).not.toContain('—')
@@ -335,7 +335,7 @@ describe('FleetTable', () => {
               primaryHostname: 'alpha.example.invalid',
               hostnameAnswers: [healthyHostnameAnswer()],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const link = screen.getByRole('link', { name: 'alpha.example.invalid' })
@@ -354,7 +354,7 @@ describe('FleetTable', () => {
               primaryHostname: 'alpha.example.invalid',
               hostnameAnswers: [healthyHostnameAnswer({ listensTls: false })],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const link = screen.getByRole('link', { name: 'alpha.example.invalid' })
@@ -370,7 +370,7 @@ describe('FleetTable', () => {
               primaryHostname: 'alpha.example.invalid',
               hostnameAnswers: [healthyHostnameAnswer({ listensTls: null })],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const link = screen.getByRole('link', { name: 'alpha.example.invalid' })
@@ -392,7 +392,7 @@ describe('FleetTable', () => {
                 healthyHostnameAnswer({ hostname: 'beta.example.invalid' }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = container.querySelector<HTMLElement>('.col-url-cell')!
@@ -428,7 +428,7 @@ describe('FleetTable', () => {
                 healthyHostnameAnswer({ hostname: 'beta.example.invalid' }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = document.querySelector<HTMLElement>('.col-url-cell')!
@@ -444,17 +444,17 @@ describe('FleetTable', () => {
   // side failed. The wording names the fault, not a colour."
   describe('the Answers column (spec §8)', () => {
     it('says the route is broken, in words, not just a colour', () => {
-      render(<FleetTable rows={[row({ verdict: 'route-broken' })]} />)
+      render(<FleetTable rows={[row({ verdict: 'route-broken' })]} lastExternalSweep={null} />)
       expect(within(screen.getByTestId('answers-cell')).getByText(/route broken/i)).toBeTruthy()
     })
 
     it('says the app itself is down', () => {
-      render(<FleetTable rows={[row({ verdict: 'app-down' })]} />)
+      render(<FleetTable rows={[row({ verdict: 'app-down' })]} lastExternalSweep={null} />)
       expect(within(screen.getByTestId('answers-cell')).getByText(/app down/i)).toBeTruthy()
     })
 
     it('names a contradiction rather than silently picking a side', () => {
-      render(<FleetTable rows={[row({ verdict: 'contradiction' })]} />)
+      render(<FleetTable rows={[row({ verdict: 'contradiction' })]} lastExternalSweep={null} />)
       expect(within(screen.getByTestId('answers-cell')).getByText(/contradiction/i)).toBeTruthy()
     })
 
@@ -463,7 +463,7 @@ describe('FleetTable', () => {
     // be the MOST COMMON verdict on first deploy, before the external
     // axis's first five-minute cycle completes.
     it('reads "unconfirmed" as a neutral "we do not know yet", never as healthy or as an alarm', () => {
-      render(<FleetTable rows={[row({ verdict: 'unconfirmed' })]} />)
+      render(<FleetTable rows={[row({ verdict: 'unconfirmed' })]} lastExternalSweep={null} />)
       const cell = screen.getByTestId('answers-cell')
       expect(cell.getAttribute('data-verdict')).toBe('unconfirmed')
       // POSITIVE presence check, not just the two negatives below --
@@ -480,7 +480,7 @@ describe('FleetTable', () => {
     // from `unconfirmed` ("exactly one axis has an opinion") -- they are
     // different facts, per answers.ts's own docstring.
     it('reads "unprobed" distinctly from "unconfirmed" -- different facts, different words', () => {
-      render(<FleetTable rows={[row({ verdict: 'unprobed' })]} />)
+      render(<FleetTable rows={[row({ verdict: 'unprobed' })]} lastExternalSweep={null} />)
       const cell = screen.getByTestId('answers-cell')
       expect(within(cell).getByText(/not probed/i)).toBeTruthy()
       expect(within(cell).queryByText(/not yet confirmed/i)).toBeNull()
@@ -497,7 +497,7 @@ describe('FleetTable', () => {
               hostnameAnswers: [answer],
               leadHostnameAnswer: answer,
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       expect(within(screen.getByTestId('answers-cell')).getByText(/proxy up, app not responding/i)).toBeTruthy()
@@ -514,7 +514,7 @@ describe('FleetTable', () => {
               hostnameAnswers: [answer],
               leadHostnameAnswer: answer,
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       expect(within(screen.getByTestId('answers-cell')).getByText(/tls handshake failed/i)).toBeTruthy()
@@ -531,7 +531,7 @@ describe('FleetTable', () => {
               hostnameAnswers: [answer],
               leadHostnameAnswer: answer,
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       expect(within(screen.getByTestId('answers-cell')).getByText(/7m ago/)).toBeTruthy()
@@ -547,7 +547,7 @@ describe('FleetTable', () => {
               hostnameAnswers: [],
               unnamedOnBoxProbes: [{ hostname: null, outcome: 'answering', status: 200 }],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       expect(within(screen.getByTestId('answers-cell')).getByText(/a port with no name answered/i)).toBeTruthy()
@@ -579,7 +579,7 @@ describe('FleetTable', () => {
               hostnameAnswers: [healthyHostnameAnswer(), failing],
               verdict: 'app-down', // the row's own worst-of, as fleet-query.ts computes it
               leadHostnameAnswer: failing, // the hostname that actually produced that verdict
-            })]}
+            })]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('answers-cell')
@@ -624,7 +624,7 @@ describe('FleetTable', () => {
               verdict: 'route-broken',
               leadHostnameAnswer: lead,
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('answers-cell')
@@ -661,7 +661,7 @@ describe('FleetTable', () => {
               verdict: 'healthy',
               leadHostnameAnswer: healthyHostnameAnswer({ externalAgeMs: 2 * 60_000 }),
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const expansion = screen.getByTestId('answers-cell').querySelector<HTMLElement>('.answer-expand')!
@@ -695,7 +695,7 @@ describe('FleetTable', () => {
               hostnameAnswers: [healthyHostnameAnswer({ verdict: 'unconfirmed', externalOutcome: null, externalAgeMs: null })],
               leadHostnameAnswer: healthyHostnameAnswer({ verdict: 'unconfirmed', externalOutcome: null, externalAgeMs: null }),
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('answers-cell')
@@ -729,7 +729,7 @@ describe('FleetTable', () => {
               certDaysRemaining: 3,
               hostnameAnswers: [healthyHostnameAnswer({ certDaysRemaining: 3 })],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       expect(screen.getByTestId('cert-cell').getAttribute('data-severity')).toBe('red')
@@ -746,7 +746,7 @@ describe('FleetTable', () => {
               certDaysRemaining: 15,
               hostnameAnswers: [healthyHostnameAnswer({ certDaysRemaining: 15 })],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       expect(screen.getByTestId('cert-cell').getAttribute('data-severity')).toBe('amber')
@@ -763,7 +763,7 @@ describe('FleetTable', () => {
               certDaysRemaining: 21,
               hostnameAnswers: [healthyHostnameAnswer({ certDaysRemaining: 21 })],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       expect(screen.getByTestId('cert-cell').getAttribute('data-severity')).toBe('ok')
@@ -787,7 +787,7 @@ describe('FleetTable', () => {
                 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -814,7 +814,7 @@ describe('FleetTable', () => {
                 healthyHostnameAnswer({ certDaysRemaining: null, certExpiresAt: null, externalOutcome: null, externalAgeMs: null }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -839,7 +839,7 @@ describe('FleetTable', () => {
                 healthyHostnameAnswer({ certDaysRemaining: null, certExpiresAt: null, externalOutcome: 'not-answering' }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -859,7 +859,7 @@ describe('FleetTable', () => {
               certDaysRemaining: null,
               hostnameAnswers: [healthyHostnameAnswer({ listensTls: false, certDaysRemaining: null, certExpiresAt: null })],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -882,7 +882,7 @@ describe('FleetTable', () => {
               certDaysRemaining: null,
               hostnameAnswers: [healthyHostnameAnswer({ listensTls: null, certDaysRemaining: null, certExpiresAt: null })],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -893,7 +893,7 @@ describe('FleetTable', () => {
     })
 
     it('shows "no HTTP surface" in the Cert column too, when there is no hostname to have a certificate at all', () => {
-      render(<FleetTable rows={[row({ hostnames: [], primaryHostname: null, hostnameAnswers: [] })]} />)
+      render(<FleetTable rows={[row({ hostnames: [], primaryHostname: null, hostnameAnswers: [] })]} lastExternalSweep={null} />)
       expect(within(screen.getByTestId('cert-cell')).getByText(/no http surface/i)).toBeTruthy()
     })
 
@@ -905,7 +905,7 @@ describe('FleetTable', () => {
     // BOTH cases, destroying the distinction Task 5 spent two fix rounds
     // preserving in the URL column.
     it('does NOT say "no HTTP surface" in the Cert column when hostnames is null (never checked), unlike confirmed-empty', () => {
-      render(<FleetTable rows={[row({ hostnames: null, primaryHostname: null, hostnameAnswers: [] })]} />)
+      render(<FleetTable rows={[row({ hostnames: null, primaryHostname: null, hostnameAnswers: [] })]} lastExternalSweep={null} />)
       const cell = screen.getByTestId('cert-cell')
       expect(within(cell).queryByText(/no http surface/i)).toBeNull()
       expect(cell.textContent?.toLowerCase()).toContain('not available')
@@ -944,7 +944,7 @@ describe('FleetTable', () => {
                 healthyHostnameAnswer({ hostname: 'beta.example.invalid', certDaysRemaining: 2 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -983,7 +983,7 @@ describe('FleetTable', () => {
                 healthyHostnameAnswer({ hostname: 'beta.example.invalid', certDaysRemaining: 15 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -1004,7 +1004,7 @@ describe('FleetTable', () => {
               primaryHostname: 'alpha.example.invalid',
               hostnameAnswers: [healthyHostnameAnswer({ certDaysRemaining: 3 })],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -1032,7 +1032,7 @@ describe('FleetTable', () => {
                 healthyHostnameAnswer({ hostname: 'gamma.example.invalid', certDaysRemaining: 2 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const collapsedText = screen.getByTestId('cert-cell').childNodes[0]?.textContent
@@ -1056,7 +1056,7 @@ describe('FleetTable', () => {
                 healthyHostnameAnswer({ hostname: 'beta.example.invalid', certDaysRemaining: 45 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -1097,7 +1097,7 @@ describe('FleetTable', () => {
                 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       expect(screen.getByTestId('cert-cell').getAttribute('data-severity')).toBe('unknown')
@@ -1144,7 +1144,7 @@ describe('FleetTable', () => {
                 healthyHostnameAnswer({ hostname: 'beta.example.invalid', certDaysRemaining: 60 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -1188,7 +1188,7 @@ describe('FleetTable', () => {
                 healthyHostnameAnswer({ hostname: 'beta.example.invalid', certDaysRemaining: 2 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const expansion = screen.getByTestId('cert-cell').querySelector<HTMLElement>('details.cert-expand')!
@@ -1225,7 +1225,7 @@ describe('FleetTable', () => {
                 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -1256,7 +1256,7 @@ describe('FleetTable', () => {
                 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -1279,7 +1279,7 @@ describe('FleetTable', () => {
               certDaysRemaining: 60,
               hostnameAnswers: [healthyHostnameAnswer({ certDaysRemaining: 60 })],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       expect(screen.getByTestId('cert-cell').childNodes[0]?.textContent).toBe('60d remaining')
@@ -1311,7 +1311,7 @@ describe('FleetTable', () => {
                 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -1346,7 +1346,7 @@ describe('FleetTable', () => {
                 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -1372,7 +1372,7 @@ describe('FleetTable', () => {
                 }),
               ],
             }),
-          ]}
+          ]} lastExternalSweep={null}
         />,
       )
       const cell = screen.getByTestId('cert-cell')
@@ -1420,10 +1420,18 @@ describe('FleetTable', () => {
       expect(screen.queryByText(/reached nothing/i)).toBeNull()
     })
 
-    it('shows no banner when the prop is simply omitted', () => {
-      render(<FleetTable rows={[row({ verdict: 'healthy' })]} />)
-      expect(screen.queryByText(/reached nothing/i)).toBeNull()
-    })
+    // Final whole-branch review, I1: this test USED TO render `<FleetTable
+    // rows={...} />` with `lastExternalSweep` genuinely omitted -- which is
+    // exactly the seam that let `page.tsx`, the board's only production
+    // render, drop the prop entirely with `tsc -b` staying clean and every
+    // test passing. `lastExternalSweep` is now a REQUIRED prop (still typed
+    // `| null`, so "no sweep has ever run" stays expressible), which makes
+    // that omission a compile error rather than a silently-passing runtime
+    // case -- see `FleetTable`'s own docstring on the prop, and
+    // `web/src/app/page.test.ts`'s governance test below, which pins the
+    // production call site actually supplying it. There is nothing left
+    // for a RUNTIME test to discriminate here: the guarantee this test used
+    // to assert is now enforced by the type checker, not by this file.
 
     // Minor 2 (Task 8 review): the banner must survive the empty-board
     // early return, since it is a fact about the DASHBOARD's own probing,
