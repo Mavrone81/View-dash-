@@ -121,15 +121,60 @@ RUN_COUNT="$(docker compose exec -T "$DB_SERVICE" \
 check "the external probe scheduler has run recently, within the last 15 minutes (found: ${RUN_COUNT:-<unreadable>} sweep(s))" \
   '[ -n "$RUN_COUNT" ] && [ "$RUN_COUNT" -gt 0 ]'
 
+# --- Did those recent sweeps actually attempt to probe anything? ---
+#
+# Final whole-branch review, I2 -- THE FOURTH VERIFICATION SCRIPT IN THIS
+# PROJECT THAT COULD NOT FAIL, and the data to catch it was added LAST ROUND
+# (`ExternalProbeRun.targetCount`, fix round 1's M4). The check above only
+# proves the SCHEDULER is alive -- `runExternalProbes` (external-probe-runner.ts)
+# writes a run row UNCONDITIONALLY, including one that swept zero targets, so
+# `count(*)` on its own cannot tell "hostname discovery is broken on every
+# monitored host, and this deployment has never made one outbound probe" apart
+# from "the scheduler is healthy and sweeping normally". Reproduced: a
+# deployment where every vhost file fails to parse still prints
+# `PASS ... found: 3 sweep(s)) / All 3 checks passed. EXIT=0` forever.
+#
+# `targetCount` (summed over the SAME 15-minute window as the check above, so
+# the two agree about what "recent" means) is exactly the column that
+# distinguishes the two. Read alone it cannot fail on a genuinely healthy but
+# brand-new deployment either -- see schema.prisma's own note that a
+# zero-target sweep is "a legitimate, common state, not a failing scheduler"
+# for a SINGLE fresh cycle -- but that read only applies before ANY sweep has
+# run; the check below only fires once a sweep is already known to have run
+# recently (the PASS above), which is why the header comment's usual "wait
+# five minutes and re-run" grace period is the same one that applies here too.
+TARGET_SUM="$(docker compose exec -T "$DB_SERVICE" \
+  psql -U "$DB_USER" -d "$DB_NAME" -tAc \
+  "SELECT COALESCE(SUM(\"targetCount\"), 0) FROM \"ExternalProbeRun\" WHERE \"ranAt\" > now() - interval '15 minutes'" \
+  2>/dev/null | tr -d '[:space:]')"
+
+check "recent sweeps actually attempted to probe something, not just ran (found: ${TARGET_SUM:-<unreadable>} target(s) across the same window)" \
+  '[ -n "$TARGET_SUM" ] && [ "$TARGET_SUM" -gt 0 ]'
+
 RESULT_COUNT="$(docker compose exec -T "$DB_SERVICE" \
   psql -U "$DB_USER" -d "$DB_NAME" -tAc \
   'SELECT count(*) FROM "ExternalProbeResult"' \
   2>/dev/null | tr -d '[:space:]')"
-echo "INFO  ExternalProbeResult currently holds ${RESULT_COUNT:-<unreadable>} row(s) -- not asserted on: a"
-echo "      persistent fleet-wide network fault correctly leaves this at 0 forever (Task 7a's guard), so a"
-echo "      hard PASS/FAIL here would contradict that design rather than verify it. Zero here alongside a"
-echo "      non-zero sweep count above means every recent sweep reached nothing -- check this HOST's own"
-echo "      egress, not the monitored fleet."
+if [ -n "$TARGET_SUM" ] && [ "$TARGET_SUM" -eq 0 ]; then
+  # Branched on targetCount = 0 (final whole-branch review, I2): the OLD,
+  # single-branch version of this INFO text always blamed "this host's own
+  # egress" for a zero `ExternalProbeResult` count -- which is actively
+  # WRONG here, because zero targets means no outbound request was ever
+  # attempted at all. There is no egress to have failed; the fault is
+  # upstream, in hostname discovery/config, not in reachability.
+  echo "INFO  ExternalProbeResult currently holds ${RESULT_COUNT:-<unreadable>} row(s) -- and the check just"
+  echo "      above already failed for the same reason: recent sweeps found ZERO targets to probe. Do NOT"
+  echo "      look at this host's egress -- nothing left it. Check hostname discovery instead: is the"
+  echo "      reverse-proxy config directory reachable, and does every enrolled system's latest observation"
+  echo "      genuinely carry hostnames: null or []?"
+else
+  echo "INFO  ExternalProbeResult currently holds ${RESULT_COUNT:-<unreadable>} row(s) -- not asserted on: a"
+  echo "      persistent fleet-wide network fault correctly leaves this at 0 forever (Task 7a's guard), so a"
+  echo "      hard PASS/FAIL here would contradict that design rather than verify it. Zero here alongside a"
+  echo "      non-zero sweep count and a non-zero target count above means every recent sweep DID attempt to"
+  echo "      probe real hostnames and reached nothing -- check this HOST's own egress, not the monitored"
+  echo "      fleet's."
+fi
 
 echo
 if [ "$failures" -eq 0 ]; then
