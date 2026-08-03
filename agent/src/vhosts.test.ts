@@ -180,6 +180,46 @@ server {
     expect(byPort.get(9400)).toEqual(['blockone.example.invalid'])
     expect(byPort.get(9401)).toEqual(['blocktwo.example.invalid'])
   })
+
+  // A directive value carrying ONE unbalanced literal brace inside a quoted
+  // string -- here, "{oops" -- makes a naive (non-quote-aware) depth counter
+  // run one level short. It then consumes the SECOND block's own closing
+  // brace to rebalance, silently merging two blocks into one: server_name
+  // matching sees both hostnames in one blob, and the first `location /`
+  // wins for both. Two blocks must still come back, and each hostname must
+  // stay on its own block's port.
+  const UNBALANCED_QUOTE = `
+server {
+    listen 443 ssl;
+    server_name quoteone.example.invalid;
+    add_header X-Test "{oops";
+    location / {
+        proxy_pass http://127.0.0.1:9700;
+    }
+}
+server {
+    listen 443 ssl;
+    server_name quotetwo.example.invalid;
+    location / {
+        proxy_pass http://127.0.0.1:9701;
+    }
+}
+`
+
+  it('does not let a literal brace inside a quoted directive value merge two server blocks', () => {
+    const blocks = parseServerBlocks(UNBALANCED_QUOTE, NONE)
+    expect(blocks).toHaveLength(2)
+    expect(blocks[0]?.hostnames).toEqual(['quoteone.example.invalid'])
+    expect(blocks[0]?.upstreamPort).toBe(9700)
+    expect(blocks[1]?.hostnames).toEqual(['quotetwo.example.invalid'])
+    expect(blocks[1]?.upstreamPort).toBe(9701)
+  })
+
+  it('keeps a quoted unbalanced brace from cross-attributing hostnames when discovering by port', () => {
+    const byPort = discoverHostnamesByPort([{ text: UNBALANCED_QUOTE }])
+    expect(byPort.get(9700)).toEqual(['quoteone.example.invalid'])
+    expect(byPort.get(9701)).toEqual(['quotetwo.example.invalid'])
+  })
 })
 
 describe('parseUpstreams', () => {

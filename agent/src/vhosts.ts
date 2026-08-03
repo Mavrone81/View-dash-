@@ -60,13 +60,44 @@ function stripComments(text: string): string {
  * `{ }` -- an `if` or a second `location` inside a location, a second
  * `server` block inside a file -- that a non-greedy match would stop at
  * prematurely.
+ *
+ * Quote-aware in the same way `stripComments` is above: a directive value
+ * can carry a literal, UNBALANCED brace inside a quoted string (e.g.
+ * `add_header X-Test "{oops";`), and counting that brace as structural
+ * makes the depth run one level short -- the scanner then consumes the
+ * *next* `server { }` block's own closing brace to rebalance, silently
+ * merging two blocks into one. `server_name` matching then sees both
+ * blocks' hostnames in a single blob and the first `location /` wins, so
+ * the second block's hostname gets attributed to the first block's port --
+ * the exact cross-block mis-attribution the server-block split exists to
+ * prevent, reopened through a brace hidden inside a string instead of a
+ * missing split. A brace inside an open quote is therefore never counted.
+ *
+ * Malformed input -- an unterminated `server`/`location` block missing its
+ * final `}` -- is NOT detected here: the loop simply runs to the end of
+ * `text` with `depth` still above 0, and the returned body is silently
+ * missing its last character (the slice assumes a closing brace exists at
+ * `i - 1`). This is deliberately left undetected rather than guarded: a
+ * config the host is actually running was necessarily accepted by nginx,
+ * which itself refuses to (re)load an unbalanced file, so truncated input
+ * can only occur on a config nothing has read successfully -- input this
+ * module was never handed the job of validating. Guarding it here would
+ * mean this module doing nginx's own syntax-checking job for a case its
+ * caller (a currently-loaded config on a running host) cannot produce.
  */
 function balancedBody(text: string, bodyStart: number): { body: string; end: number } {
   let depth = 1
   let i = bodyStart
+  let inSingle = false
+  let inDouble = false
   while (i < text.length && depth > 0) {
-    if (text[i] === '{') depth++
-    else if (text[i] === '}') depth--
+    const ch = text[i]
+    if (ch === "'" && !inDouble) inSingle = !inSingle
+    else if (ch === '"' && !inSingle) inDouble = !inDouble
+    else if (!inSingle && !inDouble) {
+      if (ch === '{') depth++
+      else if (ch === '}') depth--
+    }
     i++
   }
   return { body: text.slice(bodyStart, i - 1), end: i }
@@ -198,6 +229,18 @@ function parseBlockEntry(clean: string, upstreams: ReadonlyMap<string, number>):
   // A server block with no root location at all proxies nothing a plain
   // probe can reach, which is the same faithful null as a vhost with no
   // proxy_pass -- there is no fallback to the first location either.
+  //
+  // `loc.selector === '/'` matches only a PLAIN root declaration
+  // (`location / { ... }`). A modifier form -- `location = /`,
+  // `location ~ /`, `location ^~ /` -- captures as `'= /'`, `'~ /'`,
+  // `'^~ /'` etc., none of which equals `'/'`, so a root declared with a
+  // modifier is silently read as "no root location" and reports null, the
+  // same as a genuinely rootless vhost. Measured live: 29 `location /`
+  // declarations, zero of any modifier form, and none among the six
+  // multi-port vhosts that made the root-vs-first distinction matter in
+  // the first place -- inert today, and silently wrong the day someone
+  // adds one. Recorded here rather than only in the slice's design doc,
+  // because a report nobody opens does not stop a modifier from shipping.
   const root = extractLocations(clean).find((loc) => loc.selector === '/')
   const upstreamPort = root ? resolveProxyPort(root.body, upstreams) : null
 
