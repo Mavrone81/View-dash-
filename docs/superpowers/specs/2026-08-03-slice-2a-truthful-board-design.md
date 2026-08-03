@@ -36,6 +36,21 @@ The second row is the reason for the design. Neither probe alone can produce it,
 
 The on-box probe also survives the case the external one cannot diagnose: when public DNS or the route is broken, it still reports that the application itself is healthy. The external probe earns its keep permanently the moment any system moves to another host.
 
+### 3.1 What "on-box" has to mean, corrected during implementation
+
+The on-box probe requests **`http://127.0.0.1:<published container port>/` with an explicit `Host` header** naming the vhost. It does not resolve the hostname, does not use TLS, and does not pass through the reverse proxy.
+
+This corrects the original design, which said the probe would reach each hostname "through loopback" but was implemented as an ordinary `https://<hostname>/` request. That version resolved through public DNS and traversed exactly the path a real visitor takes. Two things followed, and the second is fatal to the design rather than merely wrong:
+
+- One egress rule, resolver hiccup or CDN error would turn **every row on the board red at once** while every application was fine.
+- **Both probes measured the same path, so they could never disagree** — and their disagreement is the only thing the two-probe design buys. The table above would have been decorative.
+
+Addressing the container port directly also removes a second fault: the scheme no longer has to be guessed. The earlier version hardcoded `https://`, so a vhost serving plain HTTP — a stack deployed before its certificate exists, precisely the "probed the day it deploys" case §4 promises — collected a certificate mismatch from whichever server block owns 443 and rendered red while working perfectly.
+
+The `Host` header is required, not cosmetic: an application behind a name-based vhost may redirect or refuse a request that arrives without the name it expects.
+
+One consequence worth stating plainly, because it changes what the second row of the table means: the on-box axis no longer exercises the reverse proxy at all. That makes the diagnosis **sharper**, not weaker. "App port answers, external fails" now isolates the fault to everything between the application and the visitor — the proxy, its configuration, TLS, DNS, the firewall — which is what that row was always trying to say.
+
 ## 4 · Discovery, not a maintained list
 
 The agent derives each system's hostnames by parsing the host's reverse-proxy configuration:
