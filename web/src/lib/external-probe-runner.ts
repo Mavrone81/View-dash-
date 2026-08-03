@@ -1,4 +1,5 @@
 import type { PrismaClient } from '@prisma/client'
+import type { HostnameConfig } from '@bevora-ops/shared'
 import { prisma } from './db.js'
 import { probeExternally, type ExternalDeps, type ExternalResult } from './external-probe.js'
 import { isFleetWideExternalFailure } from './answers.js'
@@ -64,13 +65,23 @@ export type ExternalProbeRunResult = {
  * route-broken finding for one hostname while the rest of the fleet is
  * fine is the entire signal this design exists to produce, and the
  * fleet-wide guard must never swallow it.
+ *
+ * Takes `targets: HostnameConfig[]`, not a bare `string[]`, so that each
+ * hostname's own `listensTls` (Task 5's wire fact, nullable) travels
+ * alongside it all the way to `probeExternally` -- see that function's
+ * `listensTls` parameter for why: without it, every hostname is probed over
+ * HTTPS regardless of how it is actually served, which is Task 8's deferred
+ * false-green risk (a plain-HTTP vhost's probe silently lands on whichever
+ * server block owns port 443 instead). `web/src/lib/external-probe-targets.ts`
+ * (Task 9) is what PRODUCES this list from the fleet's latest observations;
+ * this function only consumes it.
  */
 export async function runExternalProbes(
-  hostnames: string[],
+  targets: HostnameConfig[],
   deps: ExternalDeps,
   client: PrismaClient = prisma,
 ): Promise<ExternalProbeRunResult> {
-  const results = await Promise.all(hostnames.map((hostname) => probeExternally(hostname, deps)))
+  const results = await Promise.all(targets.map((t) => probeExternally(t.hostname, deps, t.listensTls)))
   const fleetWide = isFleetWideExternalFailure(results)
 
   // Task 8 fix round 1 (C2b): a run-level record, written EVERY time this
@@ -88,7 +99,7 @@ export async function runExternalProbes(
   // is a different fact from "attempted and reached nothing" -- recording
   // a run here would let a board with no hostnames yet (nothing configured,
   // not a fault) read as a sweep that failed.
-  if (hostnames.length > 0) {
+  if (targets.length > 0) {
     await client.externalProbeRun.create({ data: { reachedAnything: !fleetWide } })
   }
 

@@ -1,8 +1,11 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { createServer as createHttpsServer } from 'node:https'
+import { createServer as createHttpServer } from 'node:http'
 import { createServer as createTlsServer, type Server as TlsServer, type TLSSocket } from 'node:tls'
 import { Socket, type Server } from 'node:net'
-import { probeExternally, httpsExternalRequest, type ExternalDeps } from './external-probe.js'
+import { probeExternally, httpsExternalRequest, type ExternalDeps, type ExternalScheme } from './external-probe.js'
 
 // `_getActiveHandles` is a real, long-standing Node internal (not in
 // @types/node), used here for exactly what it's for: detecting a socket
@@ -583,5 +586,171 @@ describe('the real external transport (httpsExternalRequest), against real liste
     // leaks per cycle, so growth tracks N. A bound well below N
     // discriminates cleanly either way.
     expect(after - before).toBeLessThan(N / 2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 9's substantive fix, deferred from Task 8: the scheme `probeExternally`
+// asks for must come from `listensTls`, never be assumed. Pure decision-table
+// tests first (no network), then the real transport proving the two schemes
+// actually reach different servers.
+// ---------------------------------------------------------------------------
+describe('probeExternally chooses its scheme from listensTls, never assumes https', () => {
+  function capturingDeps(): { deps: ExternalDeps; seen: ExternalScheme[] } {
+    const seen: ExternalScheme[] = []
+    return {
+      deps: {
+        request: async (_hostname, _signal, scheme) => {
+          seen.push(scheme)
+          return { status: 200, certExpiresAt: null }
+        },
+      },
+      seen,
+    }
+  }
+
+  it('dials https when listensTls is true (confirmed TLS)', async () => {
+    const { deps, seen } = capturingDeps()
+    await probeExternally('alpha.example.invalid', deps, true)
+    expect(seen).toEqual(['https'])
+  })
+
+  it('dials http when listensTls is false (confirmed no TLS)', async () => {
+    const { deps, seen } = capturingDeps()
+    await probeExternally('alpha.example.invalid', deps, false)
+    expect(seen).toEqual(['http'])
+  })
+
+  it('dials https when listensTls is null (undetermined) -- the safe default, not a guess of "no TLS"', async () => {
+    const { deps, seen } = capturingDeps()
+    await probeExternally('alpha.example.invalid', deps, null)
+    expect(seen).toEqual(['https'])
+  })
+
+  it('dials https when listensTls is omitted entirely -- every caller written before this parameter existed', async () => {
+    const { deps, seen } = capturingDeps()
+    await probeExternally('alpha.example.invalid', deps)
+    expect(seen).toEqual(['https'])
+  })
+})
+
+describe('httpsExternalRequest, real transport: scheme selects http vs https, not just a header', () => {
+  it('reaches a real plain-HTTP listener when scheme is "http", with no TLS handshake and no certificate', async () => {
+    const server = createHttpServer((_req, res) => {
+      res.writeHead(200)
+      res.end('plain-http-ok')
+    })
+    const port = await listenEphemeral(server)
+    try {
+      const controller = new AbortController()
+      const r = await httpsExternalRequest('127.0.0.1', controller.signal, { scheme: 'http', port })
+      expect(r.status).toBe(200)
+      expect(r.certExpiresAt).toBeNull()
+    } finally {
+      server.close()
+    }
+  })
+
+  // A genuinely live version of this test (bind a real listener on port 80,
+  // dial with NO port override, confirm it's reached) would need root to
+  // BIND under 1024 -- confirmed directly in this sandbox (a plain
+  // `http.Server.listen(80, ...)` here raises `EACCES`), and the same is
+  // true of most CI runners, so that version cannot run portably. A version
+  // that instead dials the real default port with nothing listening there
+  // does NOT discriminate: a connection refused at the TCP layer happens
+  // before any HTTP or TLS exchange either way, so "wrongly defaulted to
+  // 443 instead of 80" and "correctly defaulted to 80" are BOTH
+  // `not-answering` against an empty sandbox network -- checked directly by
+  // mutating the default to 443 and confirming this exact shape of
+  // assertion still passed. This is a source check instead: a real
+  // regression test for the literal, paired with the tests above and below,
+  // which already prove (against real listeners) that the `http` scheme
+  // reaches a real server end-to-end and reports no certificate -- what
+  // those tests cannot prove, without root, is the specific default PORT
+  // number.
+  it('the http branch defaults its port to 80, distinct from the https branch\'s 443', () => {
+    const path = fileURLToPath(new URL('./external-probe.ts', import.meta.url))
+    const source = readFileSync(path, 'utf8')
+    expect(source).toMatch(/port:\s*overrides\.port\s*\?\?\s*80,/)
+    expect(source).toMatch(/port:\s*overrides\.port\s*\?\?\s*443,/)
+  })
+
+  it('identifies itself with the same distinct User-Agent over plain HTTP as it does over HTTPS', async () => {
+    const seenAgents: Array<string | undefined> = []
+    const server = createHttpServer((req, res) => {
+      seenAgents.push(req.headers['user-agent'])
+      res.writeHead(200)
+      res.end()
+    })
+    const port = await listenEphemeral(server)
+    try {
+      const controller = new AbortController()
+      await httpsExternalRequest('127.0.0.1', controller.signal, { scheme: 'http', port })
+      expect(seenAgents).toEqual(['bevora-ops-external-probe/1'])
+    } finally {
+      server.close()
+    }
+  })
+
+  // The central proof: the exact false-green scenario Task 9's brief
+  // describes, reproduced with two REAL listeners. `httpsServer` stands in
+  // for "whatever server block actually owns port 443 on a multi-tenant
+  // host" -- it answers ANY TLS connection that reaches it, for a hostname
+  // it was never configured for. `httpServer` stands in for the real,
+  // deliberately-plain-HTTP vhost. A hostname with `listensTls: false` must
+  // reach ONLY the plain-HTTP server -- never the TLS one -- and a hostname
+  // with `listensTls: true` must reach ONLY the TLS one.
+  //
+  // Each server counts its OWN hits, inside its own request handler -- this
+  // is what makes the assertion discriminate: an EARLIER draft of this test
+  // instead made a second, independent request to each port after the fact
+  // and compared bodies, which cannot fail no matter which server
+  // `probeExternally` actually dialled, because it never observes that call
+  // at all. Counting hits INSIDE the handler that `probeExternally`'s own
+  // request either does or does not reach is what ties the assertion to the
+  // real call.
+  it('a plain-HTTP-only hostname never reaches the TLS listener standing in for "a different tenant on port 443"', async () => {
+    let httpsHits = 0
+    let httpHits = 0
+    const httpsServer = createHttpsServer({ key: KEY_A, cert: CERT_A }, (_req, res) => {
+      httpsHits += 1
+      res.writeHead(200)
+      res.end()
+    })
+    const httpServer = createHttpServer((_req, res) => {
+      httpHits += 1
+      res.writeHead(200)
+      res.end()
+    })
+    const httpsPort = await listenEphemeral(httpsServer)
+    const httpPort = await listenEphemeral(httpServer)
+
+    // Stands in for the real production wiring
+    // (`probe-scheduler.ts`'s `productionDeps`): the scheme
+    // `probeExternally` decides from `listensTls` is the ONLY thing that
+    // picks which real port gets dialled.
+    const deps: ExternalDeps = {
+      request: (hostname, signal, scheme) =>
+        httpsExternalRequest(hostname, signal, {
+          scheme,
+          port: scheme === 'http' ? httpPort : httpsPort,
+          ca: CERT_A,
+        }),
+    }
+
+    try {
+      const plainResult = await probeExternally('127.0.0.1', deps, false)
+      expect(plainResult.outcome).toBe('answering')
+      expect(httpHits).toBe(1)
+      expect(httpsHits).toBe(0) // never touched the "wrong tenant" listener
+
+      const tlsResult = await probeExternally('127.0.0.1', deps, true)
+      expect(tlsResult.outcome).toBe('answering')
+      expect(httpsHits).toBe(1)
+      expect(httpHits).toBe(1) // unchanged from the first call
+    } finally {
+      httpsServer.close()
+      httpServer.close()
+    }
   })
 })

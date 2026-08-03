@@ -1,4 +1,5 @@
 import { request as httpsRequest } from 'node:https'
+import { request as httpRequest } from 'node:http'
 import type { TLSSocket } from 'node:tls'
 import { classifyHttpStatus, classifyProbeFailure, type ProbeOutcome } from '@bevora-ops/shared'
 
@@ -22,11 +23,27 @@ export type ExternalResult = {
 }
 
 /**
+ * Which transport `probeExternally` asks the real request function to use
+ * for one hostname -- see that function's own docstring, and Task 9's
+ * report, for why this exists at all: a vhost deliberately served over
+ * plain HTTP (`listensTls === false`) must be reached over PLAIN HTTP, not
+ * TLS. Dialling it over TLS anyway does not fail safely -- whichever
+ * server block actually owns port 443 (a different hostname's, possibly a
+ * different TENANT's, on a multi-tenant host) answers instead, and the
+ * external axis then records `answering` for a hostname it never actually
+ * reached. That is a false GREEN, not a false red, and it is silent: the
+ * board would show this system healthy on the strength of a different
+ * system's response.
+ */
+export type ExternalScheme = 'http' | 'https'
+
+/**
  * The external probe's transport contract, injected so `probeExternally`
  * can be tested with no network and no real TLS at all. The real
  * implementation is `httpsExternalRequest` below; production wires it in
  * directly (it satisfies this narrower shape -- see its own docstring for
- * why it takes a third, test-only parameter).
+ * why it takes a third `overrides` parameter this type has no equivalent
+ * of).
  *
  * `status` and `certExpiresAt` travel together, resolved by the SAME
  * handshake, on purpose: they are not two independently observable facts.
@@ -35,9 +52,22 @@ export type ExternalResult = {
  * represents -- there is no shape in which a caller could report a
  * certificate expiry without a status, or vice versa, because both come
  * from the one TLS connection this type models.
+ *
+ * `scheme` is the THIRD parameter, deliberately after `signal` rather than
+ * between `hostname` and `signal`: every existing caller (this file's own
+ * tests, `external-probe-runner.ts`) already destructures this function's
+ * first two parameters positionally as `(hostname, signal)`, and JavaScript
+ * lets an implementation declare fewer parameters than its type allows --
+ * appending `scheme` here means every one of those callers keeps compiling
+ * and behaving exactly as before (defaulting, via `probeExternally`, to
+ * `https`) with no edit required, while a caller that DOES care can read it.
  */
 export type ExternalDeps = {
-  request(hostname: string, signal: AbortSignal): Promise<{ status: number; certExpiresAt: Date | null }>
+  request(
+    hostname: string,
+    signal: AbortSignal,
+    scheme: ExternalScheme,
+  ): Promise<{ status: number; certExpiresAt: Date | null }>
   timeoutMs?: number
 }
 
@@ -143,12 +173,39 @@ function isTlsError(err: unknown): boolean {
  * that eventually schedules these (Task 9) must also run them concurrently
  * rather than in a sequential loop, or 42 individually-bounded probes still
  * sum to a slow cycle.
+ *
+ * `listensTls` -- Task 5's config-time fact about THIS hostname
+ * (`HostnameConfig.listensTls`, nullable) -- decides the SCHEME this probe
+ * dials, not whether it dials at all:
+ *
+ *   - `false` (the agent positively confirmed no TLS server block) -> plain
+ *     HTTP. This is the substantive half of the fix Task 8 deferred: dialling
+ *     TLS anyway for a deliberately-plain-HTTP vhost either fails permanently
+ *     against a certificate that was never meant to exist (a false RED for a
+ *     working application), or -- worse, and silent -- lands on whichever
+ *     server block actually answers port 443 on that host, which can be a
+ *     different hostname or tenant entirely, recording `answering` for a
+ *     hostname this probe never truly reached (a false GREEN on someone
+ *     else's response).
+ *   - `true` or `null` (confirmed TLS, or undetermined this tick) -> HTTPS,
+ *     the existing, safe default. An undetermined reading must not be
+ *     treated as "confirmed plain HTTP" -- that would be inventing the exact
+ *     positive fact `listensTls: null` says nobody has established yet.
+ *
+ * Defaults to `null` so every existing caller that has no opinion (this
+ * file's own tests, anything written before this parameter existed) keeps
+ * probing over HTTPS exactly as it always has.
  */
-export async function probeExternally(hostname: string, deps: ExternalDeps): Promise<ExternalResult> {
+export async function probeExternally(
+  hostname: string,
+  deps: ExternalDeps,
+  listensTls: boolean | null = null,
+): Promise<ExternalResult> {
+  const scheme: ExternalScheme = listensTls === false ? 'http' : 'https'
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? DEFAULT_EXTERNAL_TIMEOUT_MS)
   try {
-    const { status, certExpiresAt } = await deps.request(hostname, controller.signal)
+    const { status, certExpiresAt } = await deps.request(hostname, controller.signal, scheme)
     return { hostname, outcome: classifyHttpStatus(status), status, certExpiresAt }
   } catch (err) {
     return {
@@ -168,56 +225,114 @@ export async function probeExternally(hostname: string, deps: ExternalDeps): Pro
 }
 
 /**
- * Overrides that exist ONLY so a test can point `httpsExternalRequest` at
- * an ephemeral local listener and trust a test-only self-signed
- * certificate, instead of the real internet on port 443 under the system's
- * real trust store.
- *
- * Production's one call site (wherever `ExternalDeps.request` is wired to
- * this function -- Task 9's scheduler) never constructs one of these, so
- * every live probe runs under exactly Node's default trust store and port
- * 443, the same as any real browser. `httpsExternalRequest` still satisfies
- * `ExternalDeps['request']` with this third parameter present, because
- * TypeScript permits a function with extra OPTIONAL parameters to stand in
- * for a narrower function type.
+ * Overrides `httpsExternalRequest` accepts beyond the plain `(hostname,
+ * signal)` pair. Unlike the name this type used to carry, `scheme` is NOT
+ * test-only -- it is Task 9's real production input (see `probeExternally`'s
+ * `listensTls` parameter above), threaded through by the scheduler's own
+ * `ExternalDeps.request` on every live probe. `port` and `ca` remain exactly
+ * what they always were: test-only, so a test can point this function at an
+ * ephemeral local listener and trust a test-only self-signed certificate,
+ * instead of the real internet on the scheme's default port under the
+ * system's real trust store. Production's one call site (Task 9's
+ * `probe-scheduler.ts`) sets `scheme` and never sets `port` or `ca`, so every
+ * live probe runs on the scheme's real default port, under Node's default
+ * trust store, the same as any real browser.
  */
-export type ExternalTestOverrides = {
+export type ExternalRequestOverrides = {
+  /** `'https'` (the default, matching this function's historical behaviour
+   * when omitted) or `'http'` -- see `ExternalScheme` and `probeExternally`'s
+   * `listensTls` parameter for why a plain-HTTP vhost must be reached this
+   * way and not by attempting -- and failing, or worse, silently
+   * mis-landing on -- a TLS handshake it was never configured to answer. */
+  scheme?: ExternalScheme
+  /** Test-only. Defaults to the scheme's real port (443 for https, 80 for
+   * http) -- never set by the one production call site. */
   port?: number
+  /** Test-only, and meaningful only when `scheme` is `'https'`: a plain HTTP
+   * request has no TLS handshake and therefore nothing for a trusted CA to
+   * verify. Never set by the one production call site. */
   ca?: string | Buffer | Array<string | Buffer>
 }
 
 /**
- * The real external transport: a genuine DNS resolution, a genuine TLS
- * handshake, and one HTTP request against the given hostname, over
- * `node:https`.
+ * The real external transport: a genuine DNS resolution and one HTTP
+ * request against the given hostname, over `node:https` (the default, and
+ * the only scheme this function had before Task 9) or `node:http` when
+ * `overrides.scheme` is `'http'` -- see `ExternalScheme` and
+ * `probeExternally`'s `listensTls` parameter for why the CALLER, never this
+ * function, decides which.
  *
  * Certificate expiry is read from `res.socket.getPeerCertificate()` -- the
  * TLS socket THIS request just negotiated -- never from a file, a cache,
  * or a prior observation. If the handshake fails, this promise REJECTS
  * before any certificate is ever read; `probeExternally` above is what
  * turns that rejection into `certExpiresAt: null`, this function never
- * invents a fallback value of its own.
+ * invents a fallback value of its own. Under the `http` scheme there is no
+ * TLS socket to negotiate at all, so `certExpiresAt` is unconditionally
+ * `null` -- not a gap in this function, but the correct fact: a plain-HTTP
+ * request has no certificate to report, ever.
  *
- * No redirect is ever followed. `node:https.request`, like `node:http`,
- * has no concept of following one in the first place (unlike `fetch`), so
- * a 3xx is simply returned as the status it is -- not a workaround, simply
- * what this transport does by construction. This matches spec §5's
- * explicit rule for the whole design ("one request per hostname, no
- * chasing a redirect off the host"), and it is also the right call
- * specifically for THIS probe: an apex-to-www or HTTP-to-HTTPS redirect is
- * frequently the entire point of a hostname's configuration, and following
- * it would silently start probing a different hostname than the one this
- * result claims to describe, filing that hostname's evidence under the
- * wrong name.
+ * No redirect is ever followed, on either scheme. `node:https.request` and
+ * `node:http.request` both have no concept of following one in the first
+ * place (unlike `fetch`), so a 3xx is simply returned as the status it is --
+ * not a workaround, simply what this transport does by construction. This
+ * matches spec §5's explicit rule for the whole design ("one request per
+ * hostname, no chasing a redirect off the host"), and it is also the right
+ * call specifically for THIS probe: an apex-to-www or HTTP-to-HTTPS redirect
+ * is frequently the entire point of a hostname's configuration, and
+ * following it would silently start probing a different hostname than the
+ * one this result claims to describe, filing that hostname's evidence under
+ * the wrong name.
  *
- * `overrides` is described on `ExternalTestOverrides` above -- test-only,
- * never passed at the real call site.
+ * `overrides` is described on `ExternalRequestOverrides` above -- `scheme`
+ * is real production input; `port`/`ca` remain test-only, never passed at
+ * the real call site.
  */
 export function httpsExternalRequest(
   hostname: string,
   signal: AbortSignal,
-  overrides: ExternalTestOverrides = {},
+  overrides: ExternalRequestOverrides = {},
 ): Promise<{ status: number; certExpiresAt: Date | null }> {
+  const scheme = overrides.scheme ?? 'https'
+
+  // Two full branches, deliberately, rather than one shared options object
+  // fed to a chosen `requestFn`: `http.request`'s options type has no `ca`
+  // key at all, so building one shared literal that could carry it (even
+  // conditionally) would either widen the http branch's options to accept a
+  // key it can never use, or need an `as` cast to force the two SDKs'
+  // incompatible `RequestOptions` shapes together -- this repo's own rule
+  // against `any`/`@ts-ignore` reads the same way for a cast that exists
+  // only to paper over a type mismatch the two branches don't actually
+  // share. The response handler below (reading the socket, resolving,
+  // `res.resume()`) still cannot usefully be factored out either: an
+  // `http.IncomingMessage`'s `.socket` is a plain `net.Socket` with no
+  // `getPeerCertificate`, so the shared `typeof socket.getPeerCertificate
+  // === 'function'` guard already does the right thing (falls through to
+  // `certExpiresAt: null`) without needing a second code path -- it is only
+  // the REQUEST construction that has to branch.
+  if (scheme === 'http') {
+    return new Promise((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: hostname,
+          port: overrides.port ?? 80,
+          path: '/',
+          method: 'GET',
+          headers: {
+            'User-Agent': 'bevora-ops-external-probe/1',
+          },
+          signal,
+        },
+        (res) => {
+          resolve({ status: res.statusCode ?? 0, certExpiresAt: null })
+          res.resume()
+        },
+      )
+      req.on('error', reject)
+      req.end()
+    })
+  }
+
   return new Promise((resolve, reject) => {
     const req = httpsRequest(
       {

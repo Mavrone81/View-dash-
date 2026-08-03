@@ -588,3 +588,94 @@ scaled to multiple workers, an unlock in one worker will not unlock another
 and the symptom is a vault that appears to re-lock at random. Moving the key
 to a shared store would fix that symptom by removing the property the whole
 design rests on — so treat it as a constraint on scaling, not a bug to patch.
+
+## The external probe
+
+Slice 2a's board has two axes per hostname: the agent's own **on-box**
+probe (already live), and an **external** probe that reaches each hostname
+the way a real visitor does — public DNS, the real reverse proxy, real TLS
+— from the dashboard host itself. Until this section's migrations are
+applied and `ingest` is redeployed, the board's Answers column reads *"not
+yet confirmed"* and Cert reads *"certificate not checked yet"* on every
+row: honest, but useless. That is the state this deploy fixes.
+
+**Where it runs, and how often.** The external prober has no page or
+button of its own — nothing decides when to run it except
+`web/src/lib/probe-scheduler.ts`, and its one production caller is
+`web/src/server/ingest-server.ts`'s self-start block. `ingest` is already
+the long-running, standalone process on this host (it holds the agent
+WebSocket listener open and imports the database client directly), so it
+is what starts the scheduler — not `web`'s Next.js request server, which
+has no equivalent long-lived hook. This is also *why* the deploy commands
+below restart **both** `web` and `ingest`, exactly as the vault section
+above does: there would be no reason to touch `ingest` at all if it had
+nothing new to pick up here. The scheduler probes every hostname the fleet
+currently reports on a fixed 5-minute cadence
+(`EXTERNAL_PROBE_INTERVAL_MS` in `web/src/lib/fleet-query.ts`) — this is
+real internet traffic against real applications, three of which belong to
+another business, so it is deliberately not run on every 30-second agent
+tick.
+
+**Certificate checks are scheme-aware, not just TLS-by-default.** A
+hostname the agent has confirmed is served over plain HTTP
+(`listensTls: false`) is probed over plain HTTP, on its own port — never
+TLS on 443. Dialling TLS anyway does not fail safely on a multi-tenant
+host: whichever server block actually answers port 443 for a *different*
+hostname can complete the handshake and answer, and the board would then
+read that system as healthy on the strength of a different system's
+response. A hostname that is confirmed TLS, or whose TLS status is not yet
+determined this tick, is probed over HTTPS — undetermined must never be
+read as "confirmed no TLS".
+
+### Deploying it
+
+This slice adds two migrations (`ExternalProbeResult`, `ExternalProbeRun`).
+Same rule as every other migration in this repo, and the same defect this
+runbook has already documented once for the vault: **`pull` before
+`migrate`**, never the reverse.
+
+```bash
+cd /opt/bevora-ops && git fetch origin && git reset --hard origin/main
+export GHCR_OWNER=<owner> TAG=latest INGEST_BIND_ADDR=<this host's private address>
+docker compose pull web ingest
+docker compose run --rm --pull always web /deploy/with-database-url.sh \
+  npx prisma migrate deploy --schema web/prisma/schema.prisma
+docker compose up -d web ingest
+bash deploy/verify-board.sh
+```
+
+`docker compose run` defaults to a pull policy of `missing`, and migrations
+are baked into the image with no other bind mount carrying them — so a
+`latest` tag already cached from a previous deploy means "nothing missing",
+the migrate step runs inside the **stale** image, reports "No pending
+migrations to apply", and `ingest` starts against new code with an old
+schema. `--pull always` on the migrate step is the belt-and-braces fix if
+this order is ever disturbed again.
+
+Run `verify-board.sh` **before** deploying too, and expect it to fail: its
+schema check has nothing to find yet, which is the proof it can tell a
+working deployment from a broken one rather than merely looking like it
+can — this project has already shipped two verification scripts that could
+not fail (one whose counter never incremented, one whose regex could never
+match real output), and both looked authoritative right up until they
+were needed.
+
+**What "empty" looks like right after this deploy, and why it is correct.**
+`ExternalProbeRun` (proof the scheduler has run at all) and
+`ExternalProbeResult` (its actual findings) are both empty tables the
+moment `ingest` restarts — there has been no sweep yet. `verify-board.sh`'s
+"the external probe scheduler has run at least once" check is EXPECTED to
+fail for up to one cadence interval (five minutes) after `docker compose up
+-d web ingest`, and the board itself keeps showing *"not yet confirmed"* /
+*"certificate not checked yet"* on every row for that same window. Wait
+five minutes and re-run the script before treating either as a fault — an
+operator watching a fresh deploy who does not know this will read a
+perfectly healthy rollout as broken.
+
+Once at least one sweep has completed, confirm on the live board that a
+hostname with **no certificate** reads **TLS fails**, never **app down** —
+that distinction (a route/certificate problem named separately from the
+application itself, spec's core claim for this whole slice) is the one
+thing `verify-board.sh` cannot check for you, since doing so would mean
+hardcoding which real hostnames on this host are in that state, and this
+repository is public.

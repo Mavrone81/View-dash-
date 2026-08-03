@@ -5,6 +5,7 @@ import { authenticateAgent } from './auth-agent.js'
 import { handleSnapshotMessage } from './agent-socket.js'
 import { prisma } from '../lib/db.js'
 import { loadIngestServerConfig, type IngestServerConfig } from './ingest-server-config.js'
+import { startExternalProbeScheduler } from '../lib/probe-scheduler.js'
 
 const BEARER_PREFIX = 'Bearer '
 
@@ -208,4 +209,18 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   wss.once('listening', () => {
     console.log(`[ingest-server] listening on ${cfg.host}:${cfg.port}`)
   })
+
+  // The external prober (Task 6-8) had no production caller until this line:
+  // nothing else in this codebase decides WHEN to run it or WHAT to probe.
+  // This process is the natural home for that decision, not `web`'s
+  // Next.js request server: it is already the long-running, standalone
+  // Node process on the dashboard host (see this file's own top-of-file
+  // docstring), it already imports `prisma` directly, and
+  // `deploy/README.md`'s deploy runbook already restarts BOTH `web` and
+  // `ingest` together on every deploy of this repo -- there would be no
+  // reason for that if `ingest` had nothing new to pick up here. See
+  // `web/src/lib/probe-scheduler.ts` for the cadence and overlap-guard
+  // reasoning; this is its one production call site.
+  startExternalProbeScheduler()
+  console.log('[ingest-server] external probe scheduler started')
 }
