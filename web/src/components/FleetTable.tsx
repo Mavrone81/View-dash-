@@ -70,6 +70,25 @@ export type HostnameAnswer = {
    */
   certExpiresAt: Date | null
   certDaysRemaining: number | null
+  /**
+   * Fix round 5 (Task 8 review): the OTHER half of C2 -- `externalOutcome`
+   * still nulls under staleness/fleet-wide failure, which is right for
+   * every outcome EXCEPT `'tls-failed'`. A completed handshake that failed
+   * verification shares `certExpiresAt`'s own monotone property: it cannot
+   * silently become a working one without an operator acting (installing a
+   * valid certificate), so a stale `tls-failed` reading can only ever
+   * OVER-alarm (the operator may since have fixed it), never under-alarm
+   * (a cert that failed verification 9 days ago cannot have spontaneously
+   * started passing on its own). `true` here means the RAW, most-recently
+   * STORED result -- regardless of `fleetWideFailure` or the staleness
+   * ceiling -- was `'tls-failed'`. Spec §7's three-hostnames-with-no-cert
+   * finding is meant to stay visible "permanently"; without this, it
+   * disappeared to grey after 15 minutes of scheduler silence or for the
+   * whole duration of a fleet-wide failure -- precisely when it could
+   * least be re-checked, and precisely the window an operator might
+   * mistake for "someone already fixed it" instead of "we stopped looking".
+   */
+  certHandshakeFailed: boolean
 }
 
 export type FleetRow = {
@@ -346,6 +365,20 @@ function formatAge(ms: number): string {
  * through storage, which is more than this evidence-only fix justifies;
  * the case is exotic (a real, currently-valid TLS certificate with no
  * `notAfter` field) and has never been observed on the monitored estate.
+ *
+ * Fix round 5 (Task 8 review): red is now driven by `certHandshakeFailed`,
+ * NOT `externalOutcome === 'tls-failed'` -- see `HostnameAnswer`'s own
+ * docstring. Round 4's C2 fix carried `certExpiresAt`/`certDaysRemaining`
+ * through staleness/fleet-wide suppression because expiry can only ever
+ * move LATER; a completed, failed handshake shares that same monotone
+ * property (it cannot silently become a PASSING handshake without an
+ * operator acting), so `externalOutcome === 'tls-failed'` was the wrong
+ * field to gate this on -- it still nulled under exactly the same
+ * suppression `certExpiresAt` was freed from, so a `tls-failed` reading one
+ * minute old rendered red while the SAME fact nine days old rendered grey
+ * "no longer current". Spec §7's three-hostnames-with-no-certificate
+ * finding is meant to stay visible "permanently"; this is the fix that
+ * actually delivers that.
  */
 export type CertSeverity = 'red' | 'amber' | 'ok' | 'unknown' | 'none'
 
@@ -384,7 +417,10 @@ const CERT_SEVERITY_RANK: Record<CertSeverity, number> = {
   red: 4,
 }
 
-type CertEvidence = Pick<HostnameAnswer, 'listensTls' | 'certDaysRemaining' | 'externalOutcome' | 'externalAgeMs'>
+type CertEvidence = Pick<
+  HostnameAnswer,
+  'listensTls' | 'certDaysRemaining' | 'externalOutcome' | 'externalAgeMs' | 'certHandshakeFailed'
+>
 
 function certSeverity(h: CertEvidence | null): CertSeverity {
   if (h === null) return 'unknown'
@@ -395,10 +431,13 @@ function certSeverity(h: CertEvidence | null): CertSeverity {
     if (h.certDaysRemaining < 21) return 'amber'
     return 'ok'
   }
-  // No days-remaining figure. Red only when the evidence says the
-  // handshake itself was reached and failed -- everything else is "we
+  // No days-remaining figure. Red when the evidence says the handshake
+  // itself was reached and failed -- fix round 5: this now reads
+  // `certHandshakeFailed`, the UNGATED fact, not `externalOutcome`, so a
+  // stale `tls-failed` reading still shows red rather than fading to grey
+  // exactly when it is least able to be re-checked. Everything else is "we
   // have not observed this", not "it is missing".
-  return h.externalOutcome === 'tls-failed' ? 'red' : 'unknown'
+  return h.certHandshakeFailed ? 'red' : 'unknown'
 }
 
 /**
@@ -500,7 +539,22 @@ function certLabel(h: CertEvidence | null): string {
       ? `${h.certDaysRemaining}d remaining`
       : `${h.certDaysRemaining}d remaining, from a check ${formatAge(h.externalAgeMs)}`
   }
-  if (h.externalOutcome === 'tls-failed') return 'no certificate'
+  if (h.certHandshakeFailed) {
+    // Fix round 5 (Task 8 review): the SAME provenance treatment as the
+    // days-remaining branch above, for the same reason -- a completed,
+    // failed handshake cannot silently become a passing one, so it must
+    // not fade to "not checked"/"no longer current" the moment staleness or
+    // a fleet-wide failure would otherwise null `externalOutcome`. Checked
+    // BEFORE the generic `externalOutcome === null` branch below, since
+    // `certHandshakeFailed` is the ungated fact and must win when the two
+    // disagree (a stale `tls-failed` reading has `externalOutcome: null`
+    // but `certHandshakeFailed: true`).
+    return h.externalOutcome === 'tls-failed'
+      ? 'no certificate'
+      : h.externalAgeMs === null
+        ? 'no certificate'
+        : `no certificate, from a check ${formatAge(h.externalAgeMs)}`
+  }
   if (h.externalOutcome === null) {
     return h.externalAgeMs === null
       ? 'certificate not checked yet'

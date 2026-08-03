@@ -1164,6 +1164,82 @@ describe('the Answers/Cert join (Task 8)', () => {
       expect(answer.certDaysRemaining).toBe(3)
       expect(answer.externalAgeMs).toBeGreaterThan(EXTERNAL_RESULT_STALE_AFTER_MS)
     })
+
+    // THE DENIAL TEST for fix round 5: the review's exact reproduction --
+    // a `tls-failed` reading (spec §7's three hostnames configured for TLS
+    // with no certificate) must not fade to `unknown` past the staleness
+    // ceiling. `certExpiresAt`'s own monotone argument applies verbatim: a
+    // completed, failed handshake cannot silently become a passing one
+    // without an operator acting, so a stale reading of it can only ever
+    // over-alarm, never under-alarm.
+    it('does not let the staleness ceiling erase a `tls-failed` reading -- it can only over-alarm, same as a stale expiry', async () => {
+      const { system } = await makeSystem('sys-stale-tls-failed', 'host-stale-tls-failed')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const nineDaysAgo = new Date(now.getTime() - 9 * 24 * 60 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: { hostname: HOSTNAME_A, outcome: 'tls-failed', status: null, certExpiresAt: null, observedAt: nineDaysAgo },
+      })
+
+      const { rows } = await latestPerSystem(now)
+
+      const answer = rows[0]!.hostnameAnswers[0]!
+      // Reachability no longer counts as current -- correct, unchanged.
+      expect(answer.externalOutcome).toBeNull()
+      // The handshake-failure fact survives, ungated by the same ceiling.
+      expect(answer.certHandshakeFailed).toBe(true)
+      expect(answer.externalAgeMs).toBeGreaterThan(EXTERNAL_RESULT_STALE_AFTER_MS)
+    })
+  })
+
+  // Query-layer sibling to the staleness-ceiling test above: the SAME
+  // `tls-failed` fact must ALSO survive a fleet-wide failure, not just the
+  // passage of time -- both are gates on `externalOutcome` that
+  // `certHandshakeFailed` is deliberately exempt from.
+  describe('a `tls-failed` reading under a fleet-wide failure (fix round 5)', () => {
+    it('keeps certHandshakeFailed true even while the fleet-wide guard nulls externalOutcome', async () => {
+      const { system } = await makeSystem('sys-fleet-wide-tls-failed', 'host-fleet-wide-tls-failed')
+      const now = new Date('2026-08-03T12:00:00Z')
+      const fourMinutesAgo = new Date(now.getTime() - 4 * 60_000)
+      await prisma.systemObservation.create({
+        data: {
+          systemId: system.id,
+          receivedAt: now,
+          health: 'healthy',
+          containersTotal: 1,
+          containersRunning: 1,
+          hostnames: [{ hostname: HOSTNAME_A, listensTls: true }],
+          onBoxProbes: [{ hostname: HOSTNAME_A, outcome: 'answering', status: 200 }],
+        },
+      })
+      await prisma.externalProbeResult.create({
+        data: {
+          hostname: HOSTNAME_A,
+          outcome: 'tls-failed',
+          status: null,
+          certExpiresAt: null,
+          observedAt: fourMinutesAgo,
+        },
+      })
+      await prisma.externalProbeRun.create({ data: { ranAt: now, reachedAnything: false } })
+
+      const { rows } = await latestPerSystem(now)
+
+      const answer = rows[0]!.hostnameAnswers[0]!
+      expect(answer.externalOutcome).toBeNull() // suppressed by the fleet-wide guard, correctly
+      expect(answer.certHandshakeFailed).toBe(true) // NOT suppressed
+      expect(answer.externalAgeMs).not.toBeNull()
+    })
   })
 
   it('computes days-remaining from the external probe\'s own handshake, and flags a configured-but-missing certificate', async () => {

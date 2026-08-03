@@ -472,6 +472,22 @@ function neverReportedRow(hostId: string, hostName: string, lastSeenAt: Date | n
  * the reading's provenance explicitly whenever it is not current, so an
  * old figure is never presented as a fresh one -- it is presented as
  * exactly what it is: real, and possibly out of date.
+ *
+ * Fix round 5 (Task 8 review): round 4 named `certExpiresAt` specifically
+ * instead of stating the general rule, and missed the OTHER field sharing
+ * its property -- `externalOutcome === 'tls-failed'` (spec §7's three
+ * hostnames configured for TLS whose handshake fails) is EQUALLY
+ * monotone: a completed, failed handshake cannot silently become a
+ * passing one without an operator installing a valid certificate, so a
+ * stale `tls-failed` reading can only ever over-alarm, never under-alarm,
+ * for the identical reason expiry can. `certHandshakeFailed` below carries
+ * that one fact through ungated, the same way `certExpiresAt` is. Every
+ * OTHER value `externalOutcome` can take (`answering`, `not-answering`,
+ * `proxy-no-upstream`, `answering-oddly`) genuinely CAN flip in either
+ * direction between two checks and stays correctly gated -- `tls-failed`
+ * and `certExpiresAt`/`certDaysRemaining` are the ONLY two facts reached
+ * through this function that have the "cannot silently improve" property;
+ * this was a deliberate sweep for a third one, not an assumption.
  */
 function buildHostnameAnswers(
   hostnames: HostnameConfig[],
@@ -511,6 +527,20 @@ function buildHostnameAnswers(
     const certExpiresAt = rawExternal?.certExpiresAt ?? null
     const certDaysRemaining = certExpiresAt ? Math.floor((certExpiresAt.getTime() - now.getTime()) / 86_400_000) : null
 
+    // Fix round 5 (Task 8 review): the OTHER monotone fact this gate was
+    // still hiding. `externalOutcome` (below) correctly nulls under
+    // staleness/fleet-wide failure for every OTHER outcome -- reachability
+    // can flip in either direction between checks, so a stale `answering`,
+    // `not-answering`, or `proxy-no-upstream` reading genuinely cannot be
+    // trusted either way. But `'tls-failed'` shares `certExpiresAt`'s own
+    // property: a completed handshake that failed verification cannot
+    // silently become a PASSING one without an operator installing a valid
+    // certificate, so a stale `tls-failed` reading can only ever
+    // OVER-alarm (the operator may since have fixed it), never
+    // under-alarm. Read from `rawExternal`, same as `certExpiresAt`, so it
+    // survives exactly the same suppression.
+    const certHandshakeFailed = rawExternal?.outcome === 'tls-failed'
+
     return {
       hostname: h.hostname,
       verdict: combine(onBoxAxis, externalAxis),
@@ -520,6 +550,7 @@ function buildHostnameAnswers(
       listensTls: h.listensTls,
       certExpiresAt,
       certDaysRemaining,
+      certHandshakeFailed,
     }
   })
 }

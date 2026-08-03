@@ -49,6 +49,15 @@ const healthyHostnameAnswer = (over = {}) => ({
   listensTls: true,
   certExpiresAt: new Date('2026-10-01T00:00:00Z'),
   certDaysRemaining: 60,
+  // Fix round 5 (Task 8 review): the UNGATED "was the last stored result a
+  // failed handshake" fact -- see `HostnameAnswer.certHandshakeFailed`'s
+  // own docstring. Defaults `false` to match this fixture's "healthy"
+  // baseline; a scenario testing a TLS failure must set this explicitly
+  // (setting `externalOutcome: 'tls-failed'` alone is no longer enough,
+  // since `certSeverity`/`certLabel` now read this field instead so that a
+  // STALE `tls-failed` reading -- `externalOutcome: null`,
+  // `certHandshakeFailed: true` -- still renders red).
+  certHandshakeFailed: false,
   ...over,
 })
 
@@ -770,7 +779,12 @@ describe('FleetTable', () => {
               tlsConfigured: true,
               certDaysRemaining: null,
               hostnameAnswers: [
-                healthyHostnameAnswer({ certDaysRemaining: null, certExpiresAt: null, externalOutcome: 'tls-failed' }),
+                healthyHostnameAnswer({
+                  certDaysRemaining: null,
+                  certExpiresAt: null,
+                  externalOutcome: 'tls-failed',
+                  certHandshakeFailed: true,
+                }),
               ],
             }),
           ]}
@@ -1269,6 +1283,75 @@ describe('FleetTable', () => {
         />,
       )
       expect(screen.getByTestId('cert-cell').childNodes[0]?.textContent).toBe('60d remaining')
+    })
+
+    // THE DENIAL TEST for fix round 5: the review's exact reproduction --
+    // a `tls-failed` reading 9 days old must stay RED with its provenance
+    // stated, never fade to `unknown`/"no longer current" the way a stale
+    // reading of every OTHER outcome correctly does. Spec §7's three
+    // hostnames configured for TLS with no certificate are meant to stay
+    // visible "permanently"; before this fix they disappeared to grey
+    // after 15 minutes of scheduler silence.
+    it('keeps a stale `tls-failed` reading red, with its own provenance stated, rather than fading to unknown', () => {
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: oneHostname,
+              primaryHostname: 'alpha.example.invalid',
+              tlsConfigured: true,
+              certDaysRemaining: null,
+              hostnameAnswers: [
+                healthyHostnameAnswer({
+                  certDaysRemaining: null,
+                  certExpiresAt: null,
+                  externalOutcome: null, // gated null, exactly as staleness/fleet-wide failure produces
+                  externalAgeMs: 9 * 24 * 60 * 60_000,
+                  certHandshakeFailed: true, // the UNGATED fact: the raw stored result WAS tls-failed
+                }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('cert-cell')
+      expect(cell.getAttribute('data-severity')).toBe('red')
+      expect(within(cell).getByText(/no certificate, from a check 9d ago/i)).toBeTruthy()
+      expect(within(cell).queryByText(/no longer current/i)).toBeNull()
+      expect(within(cell).queryByText(/not checked yet/i)).toBeNull()
+    })
+
+    it('keeps a `tls-failed` reading red under a fleet-wide failure too, not just past the staleness ceiling', () => {
+      // Component-level equivalent of the query-layer fleet-wide test --
+      // `certHandshakeFailed` is computed the SAME way regardless of
+      // WHICH gate (staleness or fleetWideFailure) nulled `externalOutcome`,
+      // so a fresh age (unlike the 9-day case above) still renders
+      // correctly: the fact survived a fleet-wide suppression, not simply
+      // the passage of time.
+      render(
+        <FleetTable
+          rows={[
+            row({
+              hostnames: oneHostname,
+              primaryHostname: 'alpha.example.invalid',
+              tlsConfigured: true,
+              certDaysRemaining: null,
+              hostnameAnswers: [
+                healthyHostnameAnswer({
+                  certDaysRemaining: null,
+                  certExpiresAt: null,
+                  externalOutcome: null, // nulled by the fleet-wide guard, not staleness
+                  externalAgeMs: 4 * 60_000,
+                  certHandshakeFailed: true,
+                }),
+              ],
+            }),
+          ]}
+        />,
+      )
+      const cell = screen.getByTestId('cert-cell')
+      expect(cell.getAttribute('data-severity')).toBe('red')
+      expect(within(cell).getByText(/no certificate, from a check 4m ago/i)).toBeTruthy()
     })
 
     it('still says "not checked yet" when there is truly no age at all -- distinct from the stale case above', () => {
